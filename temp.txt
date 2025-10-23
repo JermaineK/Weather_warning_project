@@ -1,0 +1,46 @@
+# α in {0.3, 0.5, 0.7}, thr in {0.05..0.09}, 48h lead
+foreach ($a in 0.3,0.5,0.7) {
+  foreach ($t in 0.05,0.06,0.07,0.08,0.09) {
+    python blend_apply_norm.py --labelled "data\grid_labelled_FMA_phasecols.csv.gz" `
+      --build "models\phase_build_pregen.pkl" --relax "models\phase_relax_pregen.pkl" `
+      --target pregen --alpha $a --build-window 48 --lead-hours 48 --thr $t `
+      --persist-hours 1 --quantile 0.90 `
+      --out "results\alerts_blend24_a$($a)_thr$($t.ToString('0.00')).csv.gz"
+  }
+}
+
+(.venv) PS C:\Weather warning project> python - << 'PY'
+import cdsapi
+c = cdsapi.Client()  # will read ~/.cdsapirc
+print("CDS client OK")
+PY
+
+url: https://cds.climate.copernicus.eu/api
+key: <UID>:<API-KEY>
+
+$env:CDSAPI_URL = "https://cds.climate.copernicus.eu/api"
+$env:CDSAPI_KEY = "8a9dbcf8-0574-4740-aaf1-bf2e000727d1"
+
+import cdsapi
+
+c = cdsapi.Client(
+    url="https://cds.climate.copernicus.eu/api",
+    key="8a9dbcf8-0574-4740-aaf1-bf2e000727d1",
+    timeout=300,
+    verify=1,
+)
+
+(.venv) PS C:\Weather warning project> python - << 'PY'
+import cdsapi
+c = cdsapi.Client()
+print("cdsapi OK; url:", c.url)
+PY
+
+# 0) Activate venv (if not already)
+.\.venv\Scripts\Activate.ps1
+
+# 1) Sanity check the module is importable
+python -c "import cdsapi, sys; print('cdsapi', cdsapi.__version__, 'python', sys.version)"
+
+# 2) Make sure you don’t have a local file that shadows cdsapi
+Get-ChildItem -Name | Select-String -Pattern '^cdsapi(\.py|\\)$'

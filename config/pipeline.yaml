@@ -1,0 +1,70 @@
+# config/pipeline.yaml
+
+run_name: gka_fma_demo
+labelled_csv: data/grid_labelled_FMA_gka.csv.gz
+model_out: models/grid_logit.pkl
+model_out_cal: models/grid_logit_cal.pkl
+leads: [24, 48, 72, 120, 240]
+
+pipeline:
+  run_eval_progress: true
+  run_threshold_search: true
+  run_alert_chain: true
+  run_slowtick_diagnostics: true
+
+features:
+  enabled: false
+  # ...
+
+era5:
+  enabled: true
+  nc_glob: data_era5/extracted/**/data_stream-oper_stepType-*.nc
+  out_csv: data/grid_labelled_FMA_gka_realthermo.parquet
+  nearest: true
+  nearest_maxdeg: 0.4
+
+tracks:                      # <-- NEW
+  enabled: true
+  ibtracs_csv: data/tracks/ibtracs.ALL.list.v04r01.csv
+  out_csv:    data/besttrack_intensity.csv
+  # Optional filters (safe defaults if omitted)
+  start: 2025-02-01
+  end:   2025-05-01
+  # Use the same lon frame you use for alerts; if unsure, keep -180..180
+  normalize_lon: "-180..180"
+  # If you want to crop later, uncomment and set:
+  # area: "-10,135,-25,155"    # latN,lonW,latS,lonE  (quotes required on Windows)
+  wind_source: auto            # or USA / WMO
+  time_offset_hours: 0
+  min_wind: 25                 # knots threshold to include records
+
+intensity:
+  enabled: true
+  # omit 'tracks' and the pipeline will auto-point to tracks.out_csv
+  radius_deg: 1.0
+  time_tolerance_hours: 3.0
+  agg: max
+  out_dir: results/intensity
+
+alerts:
+  out_dir: results/alerts
+  flag_col: alert_final
+  denoise:
+    persist_hours: 1
+    min_neighbors: 3
+    connectivity: 4
+    min_area: 0
+  throttle:
+    per_lead_keep_quantile:
+      "24": 0.90
+      "48": 0.90
+      "72": 0.90
+      "120": 0.90
+      "240": 0.90
+
+constraints:
+  out_csv: results/best_fbeta_thresholds.csv
+  min_precision: 0.12
+  max_coverage: 0.12
+  fbeta: 0.5
+  save_curve: results/threshold_curve_last_lead.csv

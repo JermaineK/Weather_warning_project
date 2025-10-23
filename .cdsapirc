@@ -1,0 +1,4 @@
+cds-url: https://cds.climate.copernicus.eu/api
+cds-key: 8a9dbcf8-0574-4740-aaf1-bf2e000727d1
+timeout: 300
+verify: 1

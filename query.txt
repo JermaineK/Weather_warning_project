@@ -1,0 +1,7 @@
+python harvest_era5.py --out data\era5_au_2025-02.nc `
+  --date-start 2025-02-01 --date-end 2025-02-28 `
+  --north -10 --south -25 --west 135 --east 155 `
+  --cds-url https://cds.climate.copernicus.eu/api `
+  --cds-key 8a9dbcf8-0574-4740-aaf1-bf2e000727d1
+
+

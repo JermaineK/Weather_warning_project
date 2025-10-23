@@ -1,0 +1,10 @@
+numpy
+pandas
+xarray
+pyarrow
+lightgbm
+scikit-learn
+matplotlib
+cartopy
+scipy
+joblib
