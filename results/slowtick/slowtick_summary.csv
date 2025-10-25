@@ -1,0 +1,6 @@
+lead_h,hours,mean_cov,file,flag_col
+24,2160,0.08921833187164091,alerts_gka_fma_demo_lead24_thr0.0435_throttled.csv.gz,alert_final
+48,2160,0.08921833187164091,alerts_gka_fma_demo_lead48_thr0.0435_throttled.csv.gz,alert_final
+72,2160,0.08921833187164091,alerts_gka_fma_demo_lead72_thr0.0435_throttled.csv.gz,alert_final
+120,2160,0.08921833187164091,alerts_gka_fma_demo_lead120_thr0.0435_throttled.csv.gz,alert_final
+240,2160,0.08921833187164091,alerts_gka_fma_demo_lead240_thr0.0435_throttled.csv.gz,alert_final

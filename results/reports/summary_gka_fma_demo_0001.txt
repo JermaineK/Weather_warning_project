@@ -1,0 +1,21 @@
+Pipeline summary - gka_fma_demo (run 0001)
+
+Labelled: data/grid_labelled_FMA_gka_realthermo.parquet
+Model: models/grid_logit_cal.pkl
+
+Leads: 24, 48, 72, 120, 240
+Thresholds file: results/best_fbeta_thresholds.csv (col=thr_Fbeta)
+
+Coverage (post-throttle):
+  Lead 24h  thr=0.0435  hours=2160  active=952,188/10,672,560  cov=0.089
+  Lead 48h  thr=0.0435  hours=2160  active=952,188/10,672,560  cov=0.089
+  Lead 72h  thr=0.0435  hours=2160  active=952,188/10,672,560  cov=0.089
+  Lead 120h  thr=0.0435  hours=2160  active=952,188/10,672,560  cov=0.089
+  Lead 240h  thr=0.0435  hours=2160  active=952,188/10,672,560  cov=0.089
+
+Diagnostics:
+  Lead 24h thr=0.0435 | base_rows=10672560, base_bad_time=0, base_cov=0.098, den_cov=0.099, thr_cov=0.089, keep_denoise=1.006, keep_throttle=0.901 | flags: 
+  Lead 48h thr=0.0435 | base_rows=10672560, base_bad_time=0, base_cov=0.098, den_cov=0.099, thr_cov=0.089, keep_denoise=1.006, keep_throttle=0.901 | flags: 
+  Lead 72h thr=0.0435 | base_rows=10672560, base_bad_time=0, base_cov=0.098, den_cov=0.099, thr_cov=0.089, keep_denoise=1.006, keep_throttle=0.901 | flags: 
+  Lead 120h thr=0.0435 | base_rows=10672560, base_bad_time=0, base_cov=0.098, den_cov=0.099, thr_cov=0.089, keep_denoise=1.006, keep_throttle=0.901 | flags: 
+  Lead 240h thr=0.0435 | base_rows=10672560, base_bad_time=0, base_cov=0.098, den_cov=0.099, thr_cov=0.089, keep_denoise=1.006, keep_throttle=0.901 | flags: 
