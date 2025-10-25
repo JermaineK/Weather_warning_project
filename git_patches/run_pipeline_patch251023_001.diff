@@ -1,0 +1,68 @@
+@@
+     # ---------------- C) (Optional) ERA5 thermo integration ----------------
+@@
+         labelled = integrate_out  # downstream uses integrated file
+ 
++    # ---------------- C2) Prepare storm tracks (IBTrACS → besttrack_intensity.csv) [optional] ----------------
++    trcfg = cfg.get("tracks", {})
++    prepared_tracks = None
++    if trcfg.get("enabled", False):
++        ib_in  = trcfg.get("ibtracs_csv")
++        tr_out = trcfg.get("out_csv", "data/besttrack_intensity.csv")
++        if not ib_in or not os.path.exists(ib_in):
++            print(f"[tracks] Skipping: IBTrACS file not found or not set: {ib_in}")
++        else:
++            prep_cmd = [
++                sys.executable, "prepare_besttrack_intensity.py",
++                "--ibtracs", ib_in,
++                "--out", tr_out,
++            ]
++            # optional args
++            if "start" in trcfg: prep_cmd += ["--start", str(trcfg["start"])]
++            if "end"   in trcfg: prep_cmd += ["--end",   str(trcfg["end"])]
++            if "normalize_lon" in trcfg:
++                # Match alerts lon frame; allow values beginning with '-' to avoid argparse confusion
++                val = str(trcfg["normalize_lon"])
++                prep_cmd += [f"--normalize-lon={val}"] if val.startswith("-") else ["--normalize-lon", val]
++            if "area" in trcfg and trcfg["area"]:
++                # area must be a single, quoted string: "latN,lonW,latS,lonE"
++                prep_cmd += ["--area", str(trcfg["area"])]
++            if "wind_source" in trcfg:
++                prep_cmd += ["--wind-source", str(trcfg["wind_source"])]
++            if "time_offset_hours" in trcfg:
++                prep_cmd += ["--time-offset-hours", str(trcfg["time_offset_hours"])]
++            if "min_wind" in trcfg:
++                prep_cmd += ["--min-wind", str(trcfg["min_wind"])]
++
++            maybe_run("Prepare storm tracks (IBTrACS → besttrack)", tr_out, prep_cmd)
++            if os.path.exists(tr_out):
++                prepared_tracks = tr_out
+@@
+     # ---------------- H) Alerts chain (apply → intensity → denoise → throttle → eval) ----------------
+@@
+-            int_cfg = cfg.get("intensity", {})
++            int_cfg = cfg.get("intensity", {})
+             if int_cfg.get("enabled", False) and int_cfg.get("tracks"):
+                 int_out_dir = Path(int_cfg.get("out_dir", "results/intensity"))
+                 int_out_dir.mkdir(parents=True, exist_ok=True)
+                 int_out = int_out_dir / f"intensity_{run_name}_lead{lead}.csv"
+ 
+                 int_cmd = [
+                     sys.executable, "intensity_analysis.py",
+                     "--alerts", str(base_out),
+-                    "--tracks", str(int_cfg["tracks"]),
++                    "--tracks", str(int_cfg.get("tracks", prepared_tracks or "")),
+                     "--radius-deg", str(int_cfg.get("radius_deg", 1.0)),
+                     "--time-tol-hours", str(int_cfg.get("time_tolerance_hours", 3.0)),
+-                    "--agg", int_cfg.get("agg", "max")),
++                    "--agg", int_cfg.get("agg", "max"),
+                     "--out-csv", str(int_out),
+                 ]
+                 if "prob_col" in int_cfg:
+                     int_cmd += ["--prob-col", str(int_cfg.get("prob_col", "prob"))]
+-                maybe_run(f"Intensity match (lead={lead})", int_out, int_cmd)
++                # Only run if we have a valid tracks file (configured or prepared)
++                if int_cmd[int_cmd.index("--tracks")+1]:
++                    maybe_run(f"Intensity match (lead={lead})", int_out, int_cmd)
++                else:
++                    print(f"[intensity] Skipped: no tracks file set and no prepared_tracks found.")
