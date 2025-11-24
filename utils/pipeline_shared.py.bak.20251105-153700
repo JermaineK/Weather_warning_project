@@ -1,0 +1,36 @@
+# pipeline_shared.py
+from pathlib import Path
+import pandas as pd
+import subprocess, sys
+
+def sh(cmd, check=True):
+    print("$ " + " ".join(map(str, cmd)))
+    return subprocess.run(cmd, check=check)
+
+def exists(p): return Path(p).exists()
+
+def sanitize_time_file(path, time_col="time"):
+    df = pd.read_csv(path, compression="infer")
+    if time_col not in df.columns:
+        bom = "\ufeff" + time_col
+        if bom in df.columns:
+            df = df.rename(columns={bom: time_col})
+        else:
+            raise ValueError(f"{path}: missing '{time_col}'")
+    t = pd.to_datetime(df[time_col], utc=True, errors="coerce").dt.tz_localize(None)
+    df = df.loc[t.notna()].copy()
+    df[time_col] = t[t.notna()]
+    df.to_csv(path, index=False,
+              compression="gzip" if str(path).lower().endswith(".csv.gz") else "infer",
+              date_format="%Y-%m-%d %H:%M:%S")
+    return len(df)
+
+def add_area_arg(cmd_list, val):
+    if val not in (None, ""): cmd_list += [f"--area={val}"]
+
+def add_norm_lon_arg(cmd_list, val):
+    if val is None: return
+    if isinstance(val, str) and val.startswith('-'):
+        cmd_list += [f"--normalize-lon={val}"]
+    else:
+        cmd_list += ["--normalize-lon", val]

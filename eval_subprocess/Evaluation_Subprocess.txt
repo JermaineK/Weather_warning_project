@@ -1,0 +1,209 @@
+---
+Evaluation Subprocess — Mini README
+This directory contains the evaluation and diagnostic tools for the weather/seed/track pipeline. Everything here answers the single question:
+“How good is this model/alert/seed signal across time, space, lead-time, and storms?”
+Each script is a standalone CLI, but the preferred entry point is the unified eval_manager.py wrapper.
+
+Contents
+The directory includes:
+eval_alert_hits.py
+eval_leadtime_grid.py
+eval_leadtime_grid_progress.py
+eval_leadtime_motion.py
+hourly_metrics.py
+hourly_rollup.py
+per_storm_overlays.py
+plot_skill_vs_tracks.py
+eval_manager.py   ← master launcher
+
+1. eval_alert_hits.py
+Lead-aware hit/miss evaluator for alert CSVs.
+Purpose:
+Checks whether alerts at time t correctly predict ground-truth at t + lead_hours.
+Requires:
+
+Alerts file with: time, lat, lon, alert_flag
+Labelled grid with: time, lat, lon, truth_col
+
+Key arguments:
+--labelled <file>
+--alerts <file>
+--lead-hours <int>
+--flag-col alert_final
+--truth-col storm_window
+--time-col time
+--normalize-lon {-180..180, 0..360, none}
+--out-csv <path>
+
+Output:
+
+Console precision/recall/F1/coverage
+A tiny metrics CSV for that lead
+
+Use this when testing thresholding and early pipeline steps.
+
+2. eval_leadtime_grid.py
+Model-based skill across strict future windows.
+Purpose:
+Evaluates a trained GKA model at multiple leads using the “strict future max” definition of targets.
+Requires:
+
+Labelled grid with features + target
+Joblib model bundle: {model, scaler, features}
+
+Key arguments:
+--labelled <file>
+--model <joblib>
+--target {storm, near_storm, pregen}
+--lead-hours 6 12 24 48
+
+Output:
+
+AUC, PRAUC, Brier for each lead
+Coincident metrics (informational only)
+
+Use this for “scientific baseline” model evaluation.
+
+3. eval_leadtime_grid_progress.py
+Chunked, checkpointed, per-lead model evaluation.
+Purpose:
+Same semantics as eval_leadtime_grid.py, but supports:
+
+Huge datasets
+Checkpointing
+Per-lead models inside one bundle
+Exact time-aware windowing
+Clipped/scaled/imputed feature reconstruction
+
+Requires:
+Same as above.
+Key arguments:
+--checkpoint-dir <folder>
+--window-mode {time, samples}
+--chunk-rows <int>
+--lead-hours ...
+
+Use for production-scale lead-time sweeps or multi-day runs.
+
+4. eval_leadtime_motion.py
+Motion-aware evaluation with spatial dilation + drift.
+Purpose:
+Same core idea as the grid lead-time evaluators, but adds:
+
+Per-hour spatial dilation (neighborhood growth)
+Optional "advect-cells" drift inflation
+Wrapped longitudes
+Optional plot-friendly metrics
+
+Requires:
+Labelled grid + GKA model bundle.
+Key arguments:
+--neighbor-radius <cells>
+--advect-cells <cells>
+--wrap-lon
+--include-current
+
+Use when testing “storm moves but grid doesn’t” artifacts.
+
+5. hourly_metrics.py
+Hourly alert KPIs (coverage, clusters, prob stats).
+Purpose:
+Answer: “How noisy are alerts per hour and how spatially clustered are they?”
+Requires:
+Alerts with: time, lat, lon, <flag_col> (and optionally prob)
+Outputs:
+Columns include:
+
+rows
+active
+coverage
+n_clusters
+mean_cluster_area_km2
+mean_prob_active
+max_prob_hour
+
+Key arguments:
+--alerts <glob>
+--flag-col alert_final
+--prob-col prob
+--normalize-lon ...
+--area ...
+--tag <label>
+--out <csv>
+
+
+6. hourly_rollup.py
+Roll up arbitrary risk columns by hour.
+Purpose:
+Collapse a large alert file into stable hourly aggregates of risk signals.
+Requires:
+
+Alerts with time
+Any risk* numeric columns or those passed explicitly
+
+Key arguments:
+--alerts <file>
+--flag-col alert_final
+--risk-cols risk_final,risk_geom
+--out <csv/parquet>
+
+Useful before long-range time-series plots.
+
+7. per_storm_overlays.py
+Storm-by-storm maps: IBTrACS + seed starts.
+Purpose:
+Generates per-storm figures showing:
+
+Seed start points
+Corresponding IBTrACS track
+Optional overlay color (e.g., seed probability)
+
+Robust column detection handles messy or varied inputs.
+Key arguments:
+--matches seed_track_matches.csv
+--ibtracs ibtracs.ALL.list.v04r01.csv
+--normalize-lon ...
+--area ...
+--overlay-prob <col>
+--save-per-storm-csv
+
+Output:
+One PNG per storm into --out-dir.
+
+8. plot_skill_vs_tracks.py
+Overlay per-hour skill (coverage/F1) with storm presence.
+Purpose:
+Show how skill behaves around active storms in time.
+Requires:
+
+Per-hour metrics file
+IBTrACS tracks
+
+Key arguments:
+--lead-hours <int>
+--metrics-file <file>   # or auto-detect with --dir
+--tracks <ibtracs>
+--normalize-lon ...
+--smooth-k <window>
+--out-dir <dir>
+
+Outputs an annotated PNG and (optional) aligned CSV/Parquet.
+
+9. eval_manager.py (recommended entry point)
+Launch all tools above under a consistent interface.
+Usage:
+python eval_manager.py <tool> [tool-args...]
+
+Tools:
+hits
+leadtime
+leadtime-progress
+motion
+hourly-metrics
+hourly-rollup
+plot-skill
+per-storm
+
+Supports:
+--dry-run
+--quiet

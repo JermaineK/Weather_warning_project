@@ -1,10 +1,31 @@
+# Core numeric + data
 numpy
 pandas
 xarray
-pyarrow
-lightgbm
+scipy
 scikit-learn
+lightgbm
+joblib
+pyarrow
+
+# Plotting + mapping
 matplotlib
 cartopy
-scipy
-joblib
+shapely
+pyproj
+
+# I/O + config
+pyyaml
+requests
+tqdm
+dask
+zstandard     # faster parquet/csv.gz support if available
+
+# Optional extras used in pipeline scripts
+netCDF4       # for direct .nc access (build_features_grid.py / ERA5)
+cfgrib        # allows reading GRIB files via xarray if ERA5 switches format
+bottleneck    # speeds up rolling ops in pandas/xarray
+seaborn       # optional diagnostic plots
+
+# Testing / notebooks (optional but recommended)
+jupyter

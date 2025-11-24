@@ -1,0 +1,153 @@
+---
+Reports & Maps Subprocess — Mini README
+This subsystem produces post-run artifacts: maps, overlays, summaries, and sanity checks.
+Everything is coordinated by reports_and_maps_manager.py, which creates a new timestamped run folder:
+results/reports/20251122_run001/
+results/reports/20251122_run002/
+… (never overwritten)
+
+Each run folder contains:
+
+high-level summary text
+seed/track maps (cartopy & quick-QA)
+seed–IBTrACS overlays
+seed–track match visualisations
+sanity check log
+any extra CSV/plots you decide to add later
+
+The subsystem is fire-and-forget: one command generates the full bundle.
+
+1. Manager: reports_and_maps_manager.py
+This is the entry point.
+It builds a new run folder, calls all relevant report/map scripts, and ensures nothing gets overwritten.
+Example:
+python reports_and_maps_manager.py \
+  --run-name coral_sea_demo_lead72 \
+  --union-csv results/seedmaps/seed_union_byhour.csv \
+  --patches-csv results/seedmaps/seed_patches.csv \
+  --matches-csv results/seedmaps/seed_track_matches.csv \
+  --seed-summary  results/seedmaps/seed_summary.txt \
+  --seed-analysis results/seedmaps/seed_analysis.txt \
+  --alerts-dir results/alerts \
+  --conversion-csv results/seedmaps/conversion_rates.csv \
+  --ibtracs data/ibtracs/ibtracs.ALL.list.v04r01.csv
+
+After completion, you'll find everything under:
+results/reports/YYYYMMDD_runNNN/
+
+Manager flags (common):
+--run-name <string>              # Required. Appears in summary file.
+--run-root <dir>                 # Folder where runNNN folders are created.
+--run-date YYYYMMDD              # Optional override; default = today UTC.
+--union-csv <file>               # Seed union-by-hour.
+--patches-csv <file>             # Seed patches.
+--matches-csv <file>             # Seed–track matched pairs.
+--seed-summary <file>            # Plain-text summary from seed stage.
+--seed-analysis <file>           # Optional extra analysis text.
+--alerts-dir <directory>         # Alerts used for sanity checks.
+--conversion-csv <file>          # Optional proto-outcome rates.
+--ibtracs <file>                 # If provided, includes storm overlays.
+--ibtracs-area "latN,lonW,latS,lonE"
+--ibtracs-normalize-lon <mode>   # none | -180..180 | 0..360
+--strict                         # Stop immediately on any failed step.
+--skip-*                         # Skip specific map/report steps.
+
+
+2. Script: report_generate_summary.py
+Builds the main text summary in the run folder.
+Inputs:
+
+--run-name
+--seed-summary (txt)
+--seed-analysis (optional txt)
+--alerts-dir (presence snapshot)
+--include-conversion (optional CSV)
+
+Output:
+
+<run>_report.txt inside the run folder
+(never overwritten; manager ensures unique folder)
+
+
+3. Script: report_make_maps.py
+Creates quick QA scatter maps without requiring Cartopy.
+Inputs:
+
+--union-csv        (lat/lon + probability)
+--patches-csv      (centroids)
+--out-dir          (manager assigns run/maps/quick/)
+
+Outputs:
+
+union_points.png
+patch_centroids.png
+
+Lightweight and fast. Good for headless runs or sanity checking.
+
+4. Script: plot_seed_map_cartopy.py
+High-quality cartopy map of all seed points.
+Inputs:
+
+--seeds (union-by-hour file)
+--out-png
+--title
+--normalize-lon
+--area (optional AOI)
+
+Output:
+
+Detailed map seeds_union_cartopy.png
+
+
+5. Script: plot_seeds_with_ibtracs.py
+Overlay IBTrACS storm tracks with seed points or seed-start matches.
+Inputs:
+
+--ibtracs <csv>
+either:
+
+--matches <csv>   (preferred)
+OR
+--seeds <csv>
+
+
+--normalize-lon
+--area
+--out-png
+
+Outputs:
+
+seeds_with_ibtracs.png
+(cartopy if available; fallback scatter if not)
+
+
+6. Script: plot_seed_track_map_cartopy.py
+Visualises seed–track match pairs with connecting lines.
+Inputs:
+
+--matches <csv or parquet>
+--out
+--overlay-prob <col> (optional)
+--use-tiles (if online)
+--lon-range, --lat-range
+
+Output:
+
+seed_track_map.png into the run/maps/ folder
+
+
+7. Script: report_sanity_checks.py
+Verifies that required artifacts exist and are non-empty.
+Inputs:
+
+--must-exist <files...>
+--alerts-dir
+--require-alerts
+--strict
+
+Outputs:
+
+Stdout report
+Non-zero exit if strict and issues found
+
+

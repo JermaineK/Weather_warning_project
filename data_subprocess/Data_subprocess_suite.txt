@@ -1,0 +1,166 @@
+---
+Mini README — Data Subprocess Suite
+This directory contains all the “data-stage” plumbing for the cyclone early-warning pipeline.
+Each script does one job well and is callable individually, but they’re typically orchestrated through:
+python data_subprocess/data_stage_manager.py <mode> [args...]
+
+Everything streams in chunks, works with CSV(.gz)/Parquet, and keeps memory bounded.
+
+1. data_stage_manager.py — The Front Door
+A thin router that selects the correct script based on the mode keyword.
+Allows the pipeline to treat the entire data stage as one conceptual block.
+Usage
+python data_subprocess/data_stage_manager.py <mode> [args...]
+
+Supported Modes
+
+
+
+Mode
+Script
+Purpose
+
+
+
+
+stage-data
+stage_data.py
+Clean & normalise CSVs; optional ID tables.
+
+
+score-heuristic
+thresholds_and_alerts.py
+Weighted score + alert flag.
+
+
+ibtracs-match
+ibtracs_match.py
+Space–time matching between alerts & IBTrACS.
+
+
+thresholds-scan
+thresholds_scan.py
+Mine high-score alerts, join to rich grid, summarise features.
+
+
+predict-prob
+predict_storm_probability.py
+Convert raw features → probability via softmax¹.
+
+
+
+¹ Softmax here is a placeholder for the “probability lens” defined by your Spiral/Feedback model.
+Aliases work too: stage, score, ibtracs, scan, predict.
+
+2. stage_data.py — Normalisation + Manifest + ID Tables
+The “foundation pour."
+Cleans CSVs in-place, normalises timestamps, longitude, optional AOI cropping, and writes a manifest.
+Can also build:
+
+key table (row_id, time, lat, lon)
+full table (row_id + all columns)
+slim scoring table (row_id + selected features)
+
+Row IDs are stable 64-bit hashes: (time_floor_H, lat_round3, lon_round3).
+Typical CLI
+python stage_data.py \
+  --sanitize data/*.csv.gz \
+  --normalize-lon -180..180 \
+  --area "-5,125,-35,175" \
+  --manifest staged/manifest.json
+
+# With ID build
+python stage_data.py \
+  --id-build-enable \
+  --id-src data/grid_labelled_FMA_gka_realthermo.parquet \
+  --id-extra-src data/grid_labelled_FMA_gka_realthermo_sph.csv.gz \
+  --id-key-out data/grid_key_table.csv.gz \
+  --id-full-out data/grid_full_with_id.csv.gz \
+  --id-slim-out data/grid_scoring_start.csv.gz \
+  --id-slim-cols SFI SFI2 shear_low shear_deep gka_F ...
+
+
+3. thresholds_and_alerts.py — Heuristic Scorer
+Turns the slim table into:
+
+a score via score = ∑ wᵢ xᵢ
+an alert_final bit via a threshold
+optional carry-through of feature columns
+
+This is intentionally transparent: your theory logic is nearest to the metal here.
+Typical CLI
+python thresholds_and_alerts.py \
+  --scoring-src data/grid_scoring_start.csv.gz \
+  --out results/alerts_scored.csv.gz \
+  --default-weight 50 \
+  --score-thr 500 \
+  --id-col row_id \
+  --keep-features
+
+
+4. ibtracs_match.py — Space–Time Storm Linking
+Attaches storm metadata and “ground truth” signals to each alert:
+
+storm_hit (0/1)
+lead_h
+min_dist_km
+storm time / name / vmax / pmin, etc.
+
+Uses merge-as-of for nearest point in time and haversine for distance.
+Typical CLI
+python ibtracs_match.py \
+  --alerts results/alerts_scored.csv.gz \
+  --alerts-score-col score \
+  --tracks data/tracks/tracks_subset.csv \
+  --storms-list data/tracks/storms_list.csv \
+  --max-time-h 120 \
+  --max-lead-h 240 \
+  --max-dist-km 300 \
+  --out results/alerts_with_targets.csv.gz
+
+
+5. thresholds_scan.py — Feature Mining for High Alerts
+Selects only high-alert rows (either via threshold or quantile), re-joins them to the rich grid, and computes summary stats for any chosen candidate columns.
+This is your “find the differentiators” tool.
+Typical CLI
+python thresholds_scan.py \
+  --alerts-with-targets results/alerts_with_targets.csv.gz \
+  --rich data/grid_labelled_FMA_gka_realthermo_sph.csv.gz \
+  --score-quantile 0.99 \
+  --candidate-cols SFI SFI2 gka_knee_ratio thermo_shear \
+  --out-enriched results/high_score_enriched.csv.gz \
+  --out-summary results/feature_candidate_summary.csv
+
+Works equally well with:
+
+heuristic scores (score)
+probabilities (prob_storm)
+
+Just set --alerts-score-col.
+
+6. predict_storm_probability.py — Probability Lens
+Takes the same slim table (or any feature table), applies a temperature-scaled transformation to convert your spiral-weighted geometry into a probability of storm-formation.
+This is the bridge between exploratory scoring and deployment-style output.
+Typical CLI
+python predict_storm_probability.py \
+  --scoring-src data/grid_scoring_start.csv.gz \
+  --feature-cols msl shear_low shear_deep SFI SFI2 gka_F ... \
+  --weights-json weights.json \
+  --temp 200 \
+  --shift 0 \
+  --out results/alerts_predicted.csv.gz
+
+Outputs:
+
+prob_storm
+optionally: score_raw, normed_score, features (if --keep-features).
+
+
+7. Pipeline Flow (Quick Reference)
+stage_data.py
+    ↓
+thresholds_and_alerts.py        OR        predict_storm_probability.py
+    ↓                                      ↓
+ibtracs_match.py                       (optional)
+    ↓
+thresholds_scan.py

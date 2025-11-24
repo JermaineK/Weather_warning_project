@@ -1,0 +1,142 @@
+---
+Alerts Logic Subprocess — Mini README
+This directory holds all the alert-shaping steps: turning raw model scores + rules into usable alert grids (thresholded, throttled, denoised).
+Everything is fronted by:
+python alerts_logic_manager.py <tool> [args...]
+
+The manager only chooses the right script and forwards arguments.
+
+Overview table
+
+
+
+Tool (manager tool)
+Script file
+Main job
+Typical input
+Typical output
+
+
+
+
+apply, apply-rules
+apply_rules.py
+Apply simple rule strings to labelled grid to create flags
+labelled grid (--labelled)
+alerts / rule flags CSV/Parquet
+
+
+rule-applier
+rule_applier.py
+More advanced rule bundles / configs
+labelled grid, rule config
+alerts with rule columns
+
+
+rule-miner
+rule_miner.py
+Mine candidate rules from labelled data
+labelled grid, target column
+CSV of candidate rules + metrics
+
+
+leadband-mine
+leadband_rule_miner.py
+Mine rules split by lead bands (e.g. 0–24h, 24–48h)
+labelled grid, lead metadata
+per-lead rule tables
+
+
+phase-rules
+phase_rules.py
+Compare phases (build vs relax) and surface rule candidates
+labelled grid + 2 model bundles
+rule panels, CSVs, small plots
+
+
+apply-thresholds, apply-thr
+apply_thresholds.py
+Apply trained model bundle + threshold(s) to produce base alerts
+labelled grid + joblib model bundle
+base alerts grid with scores + alert flags
+
+
+blend-apply-norm
+blend_apply_norm.py
+Experimental blending of multiple alert sources
+multiple alert/risk inputs
+blended scores/flags
+
+
+blend-sweep
+blend_sweep.py
+Sweep blend weights / thresholds for optimal metrics
+blended candidates + truth
+sweep table: metrics vs weights/thr
+
+
+throttle
+throttle_by_percentile.py
+Per-hour / per-region throttling by quantile
+alerts grid with prob/risk
+throttled alerts (e.g. alert_throttled)
+
+
+denoise
+denoise_alerts.py
+Spatial/temporal cleanup of alert flags
+alerts (base or throttled)
+denoised alerts (e.g. alert_final)
+
+
+
+
+Manager usage
+Manager script: alerts_logic_manager.py
+python alerts_logic_manager.py <tool> [--dry-run] [tool-specific args...]
+
+
+tool can be any key in the table above (dash/underscore variants accepted).
+--dry-run prints the resolved command without executing it.
+
+Examples:
+1) Apply quick inline rules
+python alerts_logic_manager.py apply-rules \
+  --labelled data/grid_labelled.parquet \
+  --rules "gka_knee_ratio|>=|1.2; cape|>=|50" \
+  --out results/alerts/alerts_rules_demo.csv.gz
+
+2) Mine lead-band rules
+python alerts_logic_manager.py leadband-mine \
+  --labelled data/grid_labelled.parquet \
+  --target pregen \
+  --out results/alerts/leadband_rules.csv
+
+3) Base alerts from trained bundle + threshold
+python alerts_logic_manager.py apply-thr \
+  --labelled data/grid_labelled_FMA_gka.parquet \
+  --model models/grid_logit_perlead.pkl \
+  --lead-hours 72 \
+  --thr 0.08 \
+  --out results/alerts/alerts_FMA_lead72_thr0.08.parquet
+
+4) Throttle by percentile
+python alerts_logic_manager.py throttle \
+  --alerts results/alerts/alerts_FMA_lead72_thr0.08.parquet \
+  --keep-quantile 0.90 \
+  --group-by-hour \
+  --out results/alerts/alerts_FMA_lead72_thr0.08_thr90.csv.gz
+
+5) Denoise to produce final flags
+python alerts_logic_manager.py denoise \
+  --alerts results/alerts/alerts_FMA_lead72_thr0.08_thr90.csv.gz \
+  --flag-col alert_throttled \
+  --persist-hours 3 \
+  --min-neighbors 3 \
+  --out results/alerts/alerts_FMA_lead72_final.csv.gz
+
+In the full pipeline, the rough flow is:
+
+model bundle → apply-thresholds → throttle → denoise → eval + reports
+
+and the rule-miners / phase tools sit beside that flow as structure-hunters and diagnostics.

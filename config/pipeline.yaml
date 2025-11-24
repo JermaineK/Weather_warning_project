@@ -1,70 +1,590 @@
-# config/pipeline.yaml
+# Orchestrated full run with ERA5 harvest (IBTrACS unchanged)
+run_name: coral_sea_demo
+workdir: .
+reports_dir: results/reports
+report:
+  enabled: true
+  out_md: results/reports/summary_auto.md
+report_pdf: true
 
-run_name: gka_fma_demo
-labelled_csv: data/grid_labelled_FMA_gka.csv.gz
-model_out: models/grid_logit.pkl
-model_out_cal: models/grid_logit_cal.pkl
-leads: [24, 48, 72, 120, 240]
+# -------- Global defaults (use anchors so everything is controlled here) --------
+defaults:
+  start: &start "2025-02-01"
+  end:   &end   "2025-05-01"
+  hours: &hours "0..23"
+  normalize_lon: &norm " -180..180"
+  area: &area " -5,125,-35,175"   # widened Coral Sea + surroundings
+  time_format:
 
-pipeline:
-  run_eval_progress: true
-  run_threshold_search: true
-  run_alert_chain: true
-  run_slowtick_diagnostics: true
-
-features:
+# =====================================================================
+# 0) Fetch — DISABLED (assumes ERA5 already harvested)
+# =====================================================================
+fetch:
   enabled: false
-  # ...
+  steps:
+    - mode: era5-merge-single
+      in_glob: "data_era5/extracted/**/era5_*.nc"
+      out_dir: "data_era5/extracted"
+      suffix: "oper"
+      overwrite: true
 
-era5:
+    - mode: era5
+      start: *start
+      end: *end
+      hours: *hours
+      area: *area
+      vars: "u10 v10 msl t2m"
+      target_dir: data_era5/extracted
+      suffix: oper
+      overwrite: true
+
+# =====================================================================
+# 1) Features (NC → Parquet/CSV)
+# =====================================================================
+features:
   enabled: true
-  nc_glob: data_era5/extracted/**/data_stream-oper_stepType-*.nc
-  out_csv: data/grid_labelled_FMA_gka_realthermo.parquet
-  nearest: true
-  nearest_maxdeg: 0.4
+  steps:
+    - mode: build
+      enabled: false
+      nc_glob: data_era5/extracted/**/era5_single_*_*.nc
+      out: data/features_eoi.parquet
+      normalize_lon: *norm
+      area: *area
+      export_uv: true
+      with_vortdiv: true
+      require_vars: ["u10","v10","msl","t2m"]
+      dedup: time_lat_lon
+      emit_grid_index: true
 
-tracks:                      # <-- NEW
+    - mode: bulk-shear
+      enabled: false
+      pl_glob: data_era5/extracted/**/era5_pl_*_uv.nc
+      out: data/features_bulk_shear.parquet
+      low_pair: 1000,925
+      deep_pair: 1000,500
+      overwrite: true
+
+    - mode: join-features
+      enabled: false
+      left:  data/features_eoi.parquet
+      right: data/features_bulk_shear.parquet
+      "on": "time, lat, lon"
+      out: data/features_merged.parquet
+      overwrite: true
+
+    - mode: patch
+      enabled: false
+      in:  data/features_merged.parquet
+      out: data/features_merged_patched.parquet
+      neighbor_step: 0.0
+      radius_cells: 1
+      prefer_shear: shear_06km
+      s3_window: 3
+      overwrite: true
+
+    # Optional legacy join-to-labels; not required for the GKA+thermo chain
+    - mode: join
+      enabled: false
+      features: data/features_merged.parquet
+      labels:   data/tracks/tracks_subset.csv
+      out:      data/grid_labelled_base.csv.gz
+
+    - mode: gka
+      enabled: false
+      infile:  data/features_merged_patched.parquet
+      outfile: data/grid_labelled_FMA_gka.parquet
+      overwrite: true
+
+    - mode: integrate-thermo
+      enabled: false
+      features: data/grid_labelled_FMA_gka.parquet
+      thermo_glob: data_era5/extracted/**/era5_single_*_*.nc
+      out: data/grid_labelled_FMA_gka_realthermo.parquet
+      nearest: true
+      nearest_maxdeg: 0.4
+      normalize_lon: *norm
+      nc_glob: false       # this is a glob, not a single file
+      overwrite: true
+
+    - mode: spherical-feedback
+      enabled: false
+      infile:  data/grid_labelled_FMA_gka_realthermo.parquet
+      out:     data/grid_labelled_FMA_gka_realthermo_sph.csv.gz
+
+      neighbor_step: 0.0
+      radius_cells: 2
+      normalize_lon: *norm
+      area: *area
+
+      lead_hours: 24
+
+      # SFI2 weights
+      w_center: 0.40
+      w_radial: 0.25
+      w_vdrstd: 0.20
+      w_pdrop:  0.10
+      w_thermo: 0.05
+
+
+# =====================================================================
+# 2) Data stage (staging; heuristic scoring; IBTrACS; thresholds; packaging)
+# =====================================================================
+data_stage:
   enabled: true
-  ibtracs_csv: data/tracks/ibtracs.ALL.list.v04r01.csv
-  out_csv:    data/besttrack_intensity.csv
-  # Optional filters (safe defaults if omitted)
-  start: 2025-02-01
-  end:   2025-05-01
-  # Use the same lon frame you use for alerts; if unsure, keep -180..180
-  normalize_lon: "-180..180"
-  # If you want to crop later, uncomment and set:
-  # area: "-10,135,-25,155"    # latN,lonW,latS,lonE  (quotes required on Windows)
-  wind_source: auto            # or USA / WMO
-  time_offset_hours: 0
-  min_wind: 25                 # knots threshold to include records
+  steps:
+    # 1) Stage: sanitize any CSVs + scan the rich label table(s),
+    #    then build IDs + a slim scoring table for downstream scripts.
+    - mode: stage-data
+      id_build_enable: false
+      id_src: data/grid_labelled_FMA_gka_realthermo.parquet
+      id_extra_src: data/grid_labelled_FMA_gka_realthermo_sph.csv.gz
+      id_key_out: data/grid_key_table.csv.gz
+      id_full_out: data/grid_labelled_FMA_gka_realthermo_merged_with_id.csv.gz
+      id_slim_out: data/grid_scoring_start.csv.gz
+      id_slim_cols:
+        - time
+        - lat
+        - lon
+        - msl
+        - msl_d1h
+        - msl_d3h
+        - zeta
+        - div
+        - S
+        - zeta_mean3h
+        - zeta_std3h
+        - div_mean3h
+        - div_std3h
+        - S_mean3h
+        - S_std3h
+        - shear10_def
+        - shear_proxy
+        - S3
+        - S3_src
+        - dS_dt
+        - drelax_dt
+        - dagree_dt
+        - msl_grad
+        - u10
+        - v10
+        - wspd
+        - agree
+        - t2m
+        - shear_low
+        - shear_deep
+        - gka_kappa
+        - gka_tau
+        - gka_parity_eta
+        - gka_A_overlap
+        - gka_F
+        - gka_msl_nd
+        - gka_knee_ratio
+        - gka_chirality
+        - gka_Q
+        - gka_vortdiv_ratio
+        - gka_dir_var
+        - sph_center
+        - sph_radial_signed
+        - sph_radial_abs
+        - sph_vdr_std
+        - t2m_anom_local
+        - pdrop_nd
+        - thermo_shear
+        - SFI
+        - SFI2 
 
-intensity:
+    # 2) Heuristic scoring from slim table → scored alerts
+    - mode: score-heuristic
+      enabled: true
+      scoring_src: "data/grid_scoring_start.csv.gz"
+      out: "results/alerts_scored.csv.gz"
+      id_col: "row_id"
+      feature_cols:
+        - time
+        - lat
+        - lon
+        - msl
+        - msl_d1h
+        - msl_d3h
+        - zeta
+        - div
+        - S
+        - zeta_mean3h
+        - zeta_std3h
+        - div_mean3h
+        - div_std3h
+        - S_mean3h
+        - S_std3h
+        - shear10_def
+        - shear_proxy
+        - S3
+        - S3_src
+        - dS_dt
+        - drelax_dt
+        - dagree_dt
+        - msl_grad
+        - u10
+        - v10
+        - wspd
+        - agree
+        - t2m
+        - shear_low
+        - shear_deep
+        - gka_kappa
+        - gka_tau
+        - gka_parity_eta
+        - gka_A_overlap
+        - gka_F
+        - gka_msl_nd
+        - gka_knee_ratio
+        - gka_chirality
+        - gka_Q
+        - gka_vortdiv_ratio
+        - gka_dir_var
+        - sph_center
+        - sph_radial_signed
+        - sph_radial_abs
+        - sph_vdr_std
+        - t2m_anom_local
+        - pdrop_nd
+        - thermo_shear
+
+      # Optional: external weights JSON; omit to use defaults in thresholds_and_alerts.py
+      weights_json:
+      default_weight: 50.0
+      score_thr: 600.0
+      score_col: "score"
+      alert_col: "alert_flag"
+      chunk_rows: 500000
+      keep_features: true
+
+    # 3) Match scored alerts to IBTrACS tracks → add storm_hit
+    - mode: ibtracs-match
+      enabled: true
+      alerts: "results/alerts_scored.csv.gz"
+      tracks: "data/tracks/tracks_subset.csv"
+      storms_list: "data/tracks/storms_list.csv"   # optional; drop if you don't have it
+      out: "results/alerts_with_targets.csv.gz"
+      chunk_rows: 200000
+      alerts_time_col: "time"
+      alerts_lat_col: "lat"
+      alerts_lon_col: "lon"
+      alerts_score_col: "score"
+      max_time_h: 120
+      max_lead_h: 240
+      max_dist_km: 300
+
+    # 4) Threshold scan on heuristic scores using slim grid for enrichment
+    - mode: thresholds-scan
+      enabled: true
+      alerts_with_targets: "results/alerts_with_targets.csv.gz"
+      rich: "data/grid_labelled_FMA_gka_realthermo_merged_with_id.csv.gz"
+      out_enriched: "results/alerts_with_targets_enriched.csv.gz"
+      out_summary: "results/thresholds_summary.csv"
+
+      alerts_time_col: "time"
+      alerts_lat_col: "lat"
+      alerts_lon_col: "lon"
+      alerts_score_col: "score"
+      alerts_target_col: "storm_hit"
+
+      rich_time_col: "time"
+      rich_lat_col: "lat"
+      rich_lon_col: "lon"
+
+      # If thresholds_scan.py supports scanning quantiles, you can set score_quantile here;
+      # otherwise leave both None and let the script's defaults do their thing.
+      score_threshold:
+      score_quantile:
+
+      candidate_cols:
+
+      chunk_rows: 500000
+
+    # 5) Predict probability (softmax-style squashing of weighted sum)
+    - mode: predict-prob
+      enabled: true
+      scoring_src: "data/grid_scoring_start.csv.gz"
+      out: "results/alerts_predicted.csv.gz"
+      id_col: "row_id"
+      feature_cols:
+        - time
+        - lat
+        - lon
+        - msl
+        - msl_d1h
+        - msl_d3h
+        - zeta
+        - div
+        - S
+        - zeta_mean3h
+        - zeta_std3h
+        - div_mean3h
+        - div_std3h
+        - S_mean3h
+        - S_std3h
+        - shear10_def
+        - shear_proxy
+        - S3
+        - S3_src
+        - dS_dt
+        - drelax_dt
+        - dagree_dt
+        - msl_grad
+        - u10
+        - v10
+        - wspd
+        - agree
+        - t2m
+        - shear_low
+        - shear_deep
+        - gka_kappa
+        - gka_tau
+        - gka_parity_eta
+        - gka_A_overlap
+        - gka_F
+        - gka_msl_nd
+        - gka_knee_ratio
+        - gka_chirality
+        - gka_Q
+        - gka_vortdiv_ratio
+        - gka_dir_var
+        - t2m_anom_local
+        - pdrop_nd
+        - thermo_shear
+
+      weights_json:
+      default_weight: 40.0
+      shift: 0.0
+      temp: 200.0
+      keep_features: false
+      chunk_rows: 400000
+
+
+# =====================================================================
+# 3) Sweep manager — now ON (can be tuned)
+# =====================================================================
+sweep:
   enabled: true
-  # omit 'tracks' and the pipeline will auto-point to tracks.out_csv
-  radius_deg: 1.0
-  time_tolerance_hours: 3.0
-  agg: max
-  out_dir: results/intensity
+  steps:
+    - {mode: run, out: results/sweeps/demo}
+    - {mode: pick, sweep_dir: results/sweeps/demo, metric: F1, out: results/sweeps/demo/best.csv}
 
-alerts:
-  out_dir: results/alerts
-  flag_col: alert_final
-  denoise:
-    persist_hours: 1
-    min_neighbors: 3
-    connectivity: 4
-    min_area: 0
-  throttle:
-    per_lead_keep_quantile:
-      "24": 0.90
-      "48": 0.90
-      "72": 0.90
-      "120": 0.90
-      "240": 0.90
+# =====================================================================
+# 4) Scoring (legacy ML scorer — may be bypassed if using heuristic-only)
+# =====================================================================
+score:
+  enabled: false
+  jobs:
+    - in: data/grid_labelled_FMA_gka_realthermo.parquet
+      features: predict_raw
+      bundle: models/grid_logit_perlead.pkl
+      leads: "1..240"
+      out_dir: results/alerts
+      run_name: coral_sea_demo
+      normalize_lon: *norm
+      area: *area
+      thresholds_csv: results/best_fbeta_thresholds.csv
+      thr_col: thr_Fbeta
 
-constraints:
-  out_csv: results/best_fbeta_thresholds.csv
-  min_precision: 0.12
-  max_coverage: 0.12
-  fbeta: 0.5
-  save_curve: results/threshold_curve_last_lead.csv
+# =====================================================================
+# 5) Alerts logic
+# =====================================================================
+alerts_logic:
+  enabled: true
+  steps:
+    - mode: denoise
+      in: results/alerts
+      out: results/alerts_denoised
+      persist_hours: 1
+      min_neighbors: 3
+      connectivity: 4
+      min_area: 0
+      sparse_output: false
+      normalize_lon: *norm
+
+    - mode: throttle
+      in: results/alerts_denoised
+      out: results/alerts_throttled
+      per_lead_keep_quantile:
+        "24": 0.90
+        "48": 0.90
+        "72": 0.90
+        "120": 0.90
+        "240": 0.90
+
+# =====================================================================
+# 6) Evaluation & plots
+# =====================================================================
+eval:
+  enabled: true
+  steps:
+    - mode: hourly-rollup
+      alerts_dir: results/alerts_throttled
+      out_csv: results/metrics/hourly_rollup.csv
+
+    - mode: leadtime-progress
+      alerts_dir: results/alerts_throttled
+      truth: data/tracks/tracks_subset.csv
+      out_png: figures/leadtime_progress.png
+      normalize_lon: *norm
+
+    - mode: plot-skill-vs-tracks
+      alerts_dir: results/alerts_throttled
+      tracks_csv: data/tracks/tracks_subset.csv
+      out_png: figures/skill_vs_tracks.png
+      normalize_lon: *norm
+
+
+# =====================================================================
+# 8) Seeds & Tracks bundle
+# =====================================================================
+seeds:
+  enabled: true
+  from_alerts:
+    alerts: results/alerts/alerts_*_thr*.csv.gz
+    out_dir: results/seedmaps
+    run_name: coral_sea_demo
+    flag_col: alert_final
+    time_floor: H
+    normalize_lon: *norm
+    area: *area
+    chunk_rows: 300000
+    write_parquet: false
+    overwrite: true
+
+  outcomes:
+    overwrite: true
+    ibtracs: data/tracks/tracks_subset.csv
+    normalize_lon: *norm
+    aoi: *area
+    link_radius_km: 75
+    max_gap_hours: 1
+    storm_radius_km: 150
+    lookahead_hours: 120
+    min_track_hours: 2
+    out_dir: results/seedmaps
+    run_name: coral_sea_demo
+    write_parquet: true
+
+  starts:
+    overwrite: true
+    tracks_csv: data/tracks/tracks_subset.csv
+    out_dir: results/seedmaps
+    time_col: time_h
+    flag_col: any_alert
+    min_run_hours: 24
+    connectivity: 8
+    radius_deg: 2.5
+    time_tol_hours: 18
+    normalize_lon: *norm
+    area: *area
+    track_time_offset_hours: 0.0
+    save_parquet: true
+
+  analyze:
+    overwrite: true
+    seeds: results/seedmaps/coral_sea_demo_union_byhour.csv
+    out_dir: results/seedmaps
+    out_prefix: coral_sea_demo
+    time_col: time_h
+    prob_col: prob_max
+    flag_col: any_alert
+    prob_thr: 0.0
+    normalize_lon: *norm
+    area: *area
+    topk: 50
+    bins: 60
+    save_parquet: true
+    quiet: false
+
+  map:
+    enabled: true
+    overwrite: true
+    script: map_seeds_cartopy.py
+    seeds_csv: results/seedmaps/coral_sea_demo_union_byhour.csv
+    out_png: results/maps/seeds_union_map.png
+    value_col: prob_max
+    time_col: time_h
+    per_hour: false
+    title: "Seed Union (by hour)"
+    normalize_lon: *norm
+    area: *area
+
+
+# =====================================================================
+# 9) Column dictionary (grid_labelled_FMA_gka_realthermo[ _sph ])
+# =====================================================================
+#
+# Base grid columns (47 total)
+#
+# | name              | type / units              | role / intuition                                               |
+# |-------------------|---------------------------|----------------------------------------------------------------|
+# | time              | datetime (UTC)            | Valid time of gridpoint (hourly ERA5 time)                    |
+# | lat               | degrees north             | Gridpoint latitude                                            |
+# | lon               | degrees east              | Gridpoint longitude (later normalised to *norm)              |
+# | msl               | Pa                        | Mean sea-level pressure                                       |
+# | msl_d1h           | Pa                        | 1-hour pressure tendency (msl(t) - msl(t-1h))                 |
+# | msl_d3h           | Pa                        | 3-hour pressure tendency (msl(t) - msl(t-3h))                 |
+# | zeta              | s^-1                      | 10 m relative vorticity (cyclonic vs anticyclonic spin)       |
+# | div               | s^-1                      | 10 m horizontal divergence (convergence vs divergence)        |
+# | S                 | s^-1 (diagnostic)         | Strain / Okubo–Weiss–style shear magnitude                    |
+# | zeta_mean3h       | s^-1                      | 3-hour running mean of zeta                                   |
+# | zeta_std3h        | s^-1                      | 3-hour running std dev of zeta (vorticity variability)        |
+# | div_mean3h        | s^-1                      | 3-hour running mean of divergence                             |
+# | div_std3h         | s^-1                      | 3-hour running std dev of divergence                          |
+# | S_mean3h          | s^-1                      | 3-hour running mean of S (background shear)                   |
+# | S_std3h           | s^-1                      | 3-hour running std dev of S (shear variability)               |
+# | shear10_def       | s^-1 or m/s per km        | Default 10 m bulk shear magnitude (local wind shear proxy)    |
+# | shear_proxy       | s^-1 or m/s per km        | Simplified shear proxy (e.g. |∇u10| or combined u10/v10)      |
+# | S3                | dimensionless/diagnostic  | Third-order shear / strain composite (strong-shear flag)      |
+# | S3_src            | string/int code           | Source encoding for S3 (which fields/window built it)         |
+# | dS_dt             | s^-2 (numerical tendency) | Time derivative of S (shear ramp-up / decay rate)             |
+# | drelax_dt         | 1/s or 1/h                | Tendency of “relaxation” metric (how fast fields calm/relax)  |
+# | dagree_dt         | 1/s or 1/h                | Tendency of “agreement” metric (pattern coherence over time)  |
+# | msl_grad          | Pa/km (approx)            | Horizontal gradient magnitude of MSLP (pressure steepness)    |
+# | ilat              | integer index             | Discrete latitude index (grid row ID)                         |
+# | ilon              | integer index             | Discrete longitude index (grid column ID)                     |
+# | u10               | m/s                       | 10 m zonal wind (positive eastward)                           |
+# | v10               | m/s                       | 10 m meridional wind (positive northward)                     |
+# | wspd              | m/s                       | 10 m wind speed = sqrt(u10² + v10²)                           |
+# | agree             | dimensionless [0–1]       | Agreement / coherence score (e.g. vort–shear alignment)       |
+# | t2m               | K                         | 2 m air temperature                                           |
+# | number            | int                       | ERA5 ensemble member number (if present)                      |
+# | expver            | int                       | ERA5 experiment version code                                  |
+# | number_r          | int                       | Ensemble member for reanalysis / auxiliary run                |
+# | expver_r          | int                       | Experiment version for reanalysis / auxiliary run             |
+# | shear_low         | m/s per km or s^-1        | Low-level bulk shear (e.g. 1000–925 hPa)                      |
+# | shear_deep        | m/s per km or s^-1        | Deep-layer bulk shear (e.g. 1000–500 hPa)                     |
+# | gka_kappa         | dimensionless             | GKA curvature/compactness metric of vorticity patch           |
+# | gka_tau           | hours or dimensionless    | GKA “timescale” / persistence score                           |
+# | gka_parity_eta    | dimensionless [-1..1]     | GKA parity / asymmetry indicator (mirror-odd preference)      |
+# | gka_A_overlap     | fraction [0–1]            | Overlap of active area with template (spiral/track mask)      |
+# | gka_F             | dimensionless             | Main GKA composite “fitness” / strength score                 |
+# | gka_msl_nd        | dimensionless             | Normalised MSLP anomaly (pressure deficit in GKA scaling)     |
+# | gka_knee_ratio    | dimensionless             | Ratio of “knee” scale vs background (size-law break)          |
+# | gka_chirality     | sign or code              | Cyclonic vs anticyclonic chirality flag                       |
+# | gka_Q             | dimensionless             | Secondary GKA quality / curvature–shear consistency metric    |
+# | gka_vortdiv_ratio | dimensionless             | |vorticity| / (|divergence| + ε) — spin vs outflow balance    |
+# | gka_dir_var       | dimensionless             | Directional variance of flow (how isotropic the winds are)    |
+#
+# Spherical / feedback augmentation (from *_sph.csv.gz)
+#
+# The spherical feedback table repeats time/lat/lon and adds radial / composite
+# fields used to build SFI and SFI2.  These are also the main columns fed into
+# the slim scoring table via data_stage.id_slim_cols.
+#
+# | name               | type / units              | role / intuition                                            |
+# |--------------------|---------------------------|-------------------------------------------------------------|
+# | time               | datetime (UTC)            | Same gridpoint time as base table                          |
+# | lat                | degrees north             | Same gridpoint latitude                                    |
+# | lon                | degrees east              | Same gridpoint longitude                                   |
+# | sph_center         | dimensionless             | Central-cell weight / intensity in spherical kernel        |
+# | sph_radial_signed  | dimensionless             | Signed radial bias (inward vs outward pattern)             |
+# | sph_radial_abs     | dimensionless             | Absolute radial strength (overall radial contrast)         |
+# | sph_vdr_std        | dimensionless             | Std dev of local vorticity/divergence ratio in neighbourhood |
+# | t2m_anom_local     | K                         | Local 2 m temperature anomaly vs neighbourhood mean        |
+# | pdrop_nd           | dimensionless             | Normalised pressure drop (central msl deficit vs ring)     |
+# | thermo_shear       | dimensionless             | Coupled thermo–shear composite (warm-moist + shear)        |
+# | SFI                | dimensionless             | Spiral Feedback Index v1 (lighter spherical weighting)     |
+# | SFI2               | dimensionless             | Spiral Feedback Index v2 (heavier spherical/feedback blend)|

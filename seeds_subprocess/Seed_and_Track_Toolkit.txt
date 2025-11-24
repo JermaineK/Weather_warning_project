@@ -1,0 +1,347 @@
+---
+
+Seed & Track Toolkit — Mini README
+
+This folder contains a modular set of CLI tools for turning raw alert grids into structured seed-maps, proto-tracks, and track–storm outcome diagnostics. A lightweight launcher (seeds_tracks.py) provides a stable front-end, while each sub-script remains independent and focused.
+
+The tools operate on a common idea:
+hourly grid cells → proto-seeds → clusters → linked tracks → storm outcomes.
+
+Use these utilities when you want to explore which storms your alerts are hinting at, track persistence, identify seed clusters, or inspect spatial/temporal patterns in the raw alert field.
+
+
+---
+
+1. Top-Level Launcher
+
+python seeds_tracks.py <subcommand> [args...]
+
+Available subcommands:
+
+analyze
+
+from-alerts
+
+proto-outcomes
+
+starts-vs-tracks
+
+
+Optional global flags:
+
+--scripts-dir <dir>   Override location of sub-scripts
+--dry-run             Print resolved command but do not run
+
+The launcher resolves the matching script inside seeds_subprocess/ (or same directory) using alias rules.
+
+
+---
+
+2. Subcommands and Subprocess Scripts
+
+Each subcommand corresponds to a script in seeds_subprocess/.
+Below are the CLI signatures, expected columns, and what each tool produces.
+
+
+---
+
+analyze
+
+File: analyze_seeds.py
+
+Purpose:
+Inspect any seed/alert-like file and generate quick diagnostics: hotspots, persistence runs, hourly counts, spatial histograms, and a human-readable report.
+
+Typical usage:
+
+python seeds_tracks.py analyze \
+    --seeds results/seedmaps/run_union_byhour.csv \
+    --out-dir results/seedmaps
+
+Required inputs:
+
+CSV/Parquet containing:
+
+lat
+
+lon
+
+time column (auto-detected from: time, issue_time, valid_time, datetime)
+
+optional: prob or flag column; if missing, you can generate flags via --prob-thr
+
+
+
+Key arguments:
+
+--seeds <glob>              Input files (CSV/Parquet)
+--out-dir <dir>             Output directory
+--out-prefix <str>          Prefix for output filenames
+--time-col <col>            Force time column
+--flag-col <col>            Force flag column
+--prob-col <col>            Force probability column
+--prob-thr <float>          Convert prob > thr → flag when no flag exists
+--time-format <strptime>    Manual time parsing format
+--normalize-lon <frame>     none|-180..180|0..360
+--area latN,lonW,latS,lonE   Spatial crop
+--topk <int>                Top hotspot count
+--bins <int>                Heatmap bins
+--save-parquet               Write parquet alongside CSVs
+--quiet                      Reduce logging
+
+Outputs:
+
+*_analysis.txt – human-readable summary
+
+seeds_hourly.csv – hourly stats
+
+seeds_per_day.csv
+
+seeds_hotspots.csv
+
+seeds_runs.csv – persistence run lengths
+
+seeds_spatial_bins.csv
+
+
+
+---
+
+from-alerts
+
+File: from_alerts.py
+
+Purpose:
+Convert raw alert files (CSV/Parquet) into hourly seed grids:
+
+collapse to (time,lat,lon) cells
+
+compute prob_max, any_alert, n_hits
+
+detect first-appearance “starts”
+
+
+This is the canonical tool for producing clean *_union_byhour.csv.
+
+Typical usage:
+
+python seeds_tracks.py from-alerts \
+    --alerts "results/alerts/alerts_*_thr*.csv.gz" \
+    --out-dir results/seedmaps \
+    --run-name coral
+
+Required inputs:
+
+Alert files containing:
+
+time column (time, valid_time, datetime, t)
+
+lat
+
+lon
+
+optional: prob column (auto-detected)
+
+optional: alert flag column (alert, alert_final, etc.)
+
+
+Key arguments:
+
+--alerts <glob>         Glob pattern for alert files (CSV/Parquet)
+--prob-col <col>        Force probability column
+--flag-col <col>        Force flag column
+--thr <float>           Keep only prob>=thr or alert>0
+--time-floor <str>      Floor time to H (default)
+--normalize-lon <frame> none|-180..180|0..360
+--area latN,lonW,latS,lonE
+--chunk-rows <n>        Chunked read for large CSVs
+--out-dir <dir>
+--run-name <name>
+--time-format <fmt>
+--write-parquet
+
+Outputs:
+
+{run_name}_union_byhour.csv
+Columns:
+
+time, lat, lon, prob_max, any_alert, n_hits
+
+{run_name}_starts_byhour.csv
+Columns:
+
+lat, lon, time_start
+
+
+
+---
+
+proto-outcomes
+
+File: proto_outcomes.py
+
+Purpose:
+Turn hourly seeds into proto-tracks, compute simple structure features, join CAPE/CIN/T2M, then match each proto-track to IBTrACS storms using fast KD-trees.
+
+Provides:
+
+Track point table
+
+Track summaries
+
+Conditional conversion rates (e.g., 24h, 48h, 72h lead time probabilities)
+
+
+Typical usage:
+
+python seeds_tracks.py proto-outcomes \
+    --seeds results/seedmaps/run_union_byhour.csv \
+    --ibtracs data/tracks/ibtracs.csv \
+    --out-dir results/seedmaps \
+    --run-name coral
+
+Required seed columns:
+
+time
+
+lat
+
+lon
+
+optional: probability (prob, p, score, etc.)
+
+will generate per-hour structure feature: nbr_100km
+
+
+Required IBTrACS columns:
+
+Auto-detected from:
+
+time (ISO_TIME, time, etc.)
+
+lat, lon
+
+vmax or any of: wind_wmo, USA_WIND, WMO_WIND
+
+storm ID (sid, usa_atcf_id, identifier, or auto-constructed)
+
+
+Key arguments:
+
+--seeds <file>             Union-by-hour seed file
+--features <file>          Optional CAPE/CIN/T2M source
+--ibtracs <file>           IBTrACS dataset
+--normalize-lon <frame>
+--aoi latN,lonW,latS,lonE
+--time-format <fmt>
+--link-radius-km <km>      Seed→seed linking radius
+--max-gap-hours <h>        Seed linking gap tolerance
+--storm-radius-km <km>     Storm matching radius
+--lookahead-hours <h>      Storm matching window
+--min-track-hours <h>
+--out-dir <dir>
+--run-name <str>
+--write-parquet
+
+Outputs:
+
+{run}_track_points.csv
+
+{run}_tracks.csv
+(Track summary: start_time, end_time, duration_h, mean_prob, mean_nbr, etc.)
+
+{run}_conversion_rates.csv
+(Conversion and severity‐conditional probabilities)
+
+
+
+---
+
+starts-vs-tracks
+
+File: starts_vs_tracks.py
+
+Purpose:
+Detect persistent seed starts (≥N hours per (lat,lon)), cluster them into spatial “patches”, and match patches to best-track storms. Produces clean multi-horizon lead-time diagnostics.
+
+This tool is ideal for checking “earliest detectable signals”.
+
+Typical usage:
+
+python seeds_tracks.py starts-vs-tracks \
+    --seeds results/seedmaps/run_union_byhour.csv \
+    --tracks data/tracks/ibtracs_subset.csv \
+    --out-dir results/seedmaps
+
+Required seed columns:
+
+time or time_h
+
+lat
+
+lon
+
+flag column: auto-detected from (__flag__, alert_final, alert, flag)
+
+if missing, every row is treated as flagged
+
+
+Required track columns:
+
+obs_time or time
+
+lat
+
+lon
+
+vmax
+
+pmin
+
+optional: sid or name
+
+
+Key arguments:
+
+--seeds <file>
+--tracks <file>
+--out-dir <dir>
+--time-col <col>
+--flag-col <col>
+--min-run-hours <h>      Consecutive-hours threshold for a seed start
+--connectivity 4|8
+--radius-deg <deg>       Patch→storm match radius
+--time-tol-hours <h>     Storm match temporal window
+--normalize-lon <frame>
+--area latN,lonW,latS,lonE
+--track-time-offset-hours <h>
+--save-parquet
+
+Outputs:
+
+seed_starts_points.csv
+
+seed_patches.csv
+
+seed_track_matches.csv
+
+seed_summary.txt (human-readable: distances, match rates, medians)
+
+
+
+---
+
+Summary Table
+
+Subcommand	Script	Input	Output	Purpose
+
+analyze	analyze_seeds.py	seed/alert grids	summaries, hotspots, persistence, heatmaps	Diagnosis & debugging
+from-alerts	from_alerts.py	raw alerts	union_byhour, starts_byhour	Clean hourly seed maps
+proto-outcomes	proto_outcomes.py	seed maps	proto-tracks, labelled outcomes	Track building + storm outcomes
+starts-vs-tracks	starts_vs_tracks.py	seed maps	early starts → patches → best-track matches	Lead-time analysis
+
+
+
+---
+
+This README gives you the mental atlas for every tool in the ecosystem, so you can dive in without rediscovering what each script expects or produces.

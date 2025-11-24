@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+# patch_equals_flags.py
+#
+# Force equals-style CLI flags across the repo:
+#   --normalize-lon=VALUE  and  --area=LATN,LONW,LATS,LONE
+#
+# What it does:
+#  1) Rewrites helper functions like _add_norm_lon/_add_area to always emit equals-form.
+#  2) Rewrites any direct list-appends like ["--normalize-lon", val] → ["--normalize-lon=" + str(val)]
+#     and ["--area", aoi] → ["--area=" + str(aoi)].
+#
+# Safe: creates a .bak timestamped backup next to each modified file.
+
+import argparse, re, sys, time
+from pathlib import Path
+
+# Match typical append patterns:
+#   cmd += ["--normalize-lon=" + str(val)]
+#   cmd.append(["--area", something])
+PAIR_FLAG_PATTERNS = [
+    (re.compile(r'(\+\=|\.\s*append)\s*\[\s*"--normalize-lon"\s*,\s*([^\]]+?)\s*\]'),
+     r'\1 ["--normalize-lon=" + str(\2)]'),
+    (re.compile(r'(\+\=|\.\s*append)\s*\[\s*"--area"\s*,\s*([^\]]+?)\s*\]'),
+     r'\1 ["--area=" + str(\2)]'),
+]
+
+# Normalize helper definitions to equals-style appends
+HELPER_FIXES = [
+    # def _add_norm_lon... → always equals-style
+    (re.compile(r'def\s+_add_norm_lon[_a-zA-Z0-9]*\s*\([^\)]*\):([\s\S]*?)(?=^def|\Z)', re.MULTILINE),
+     lambda body: re.sub(
+         r'cmd[_a-zA-Z0-9]*\s*\+\=\s*\[\s*"--normalize-lon"\s*,\s*([^\]]+?)\s*\]',
+         r'cmd += ["--normalize-lon=" + str(\1)]',
+         re.sub(
+             r'cmd[_a-zA-Z0-9]*\.append\(\s*\[\s*"--normalize-lon"\s*,\s*([^\]]+?)\s*\]\s*\)',
+             r'cmd.append(["--normalize-lon=" + str(\1)])',
+             body
+         )
+     )),
+    # def _add_area... → always equals-style
+    (re.compile(r'def\s+_add_area[_a-zA-Z0-9]*\s*\([^\)]*\):([\s\S]*?)(?=^def|\Z)', re.MULTILINE),
+     lambda body: re.sub(
+         r'cmd[_a-zA-Z0-9]*\s*\+\=\s*\[\s*"--area"\s*,\s*([^\]]+?)\s*\]',
+         r'cmd += ["--area=" + str(\1)]',
+         re.sub(
+             r'cmd[_a-zA-Z0-9]*\.append\(\s*\[\s*"--area"\s*,\s*([^\]]+?)\s*\]\s*\)',
+             r'cmd.append(["--area=" + str(\1)])',
+             body
+         )
+     )),
+]
+
+def patch_text(txt: str) -> tuple[str, bool]:
+    original = txt
+
+    # 1) Helper blocks
+    for pattern, fixer in HELPER_FIXES:
+        def _repl(m):
+            body = m.group(1)
+            fixed = fixer(body)
+            return m.group(0).replace(body, fixed)
+        txt = pattern.sub(_repl, txt)
+
+    # 2) Direct list-append pairs
+    for pat, repl in PAIR_FLAG_PATTERNS:
+        txt = pat.sub(repl, txt)
+
+    return txt, (txt != original)
+
+def iter_py_files(root: Path):
+    # scan project tree, skip venv and __pycache__ and archive
+    skip_dirs = {".venv", "__pycache__", ".git", "archive"}
+    for p in root.rglob("*.py"):
+        parts = set(p.parts)
+        if parts & skip_dirs:
+            continue
+        yield p
+
+def main():
+    ap = argparse.ArgumentParser(description="Force equals-style flags for --normalize-lon/--area across repo.")
+    ap.add_argument("--root", default=".", help="Project root (default: current dir)")
+    ap.add_argument("--apply", action="store_true", help="Write changes (default: dry-run)")
+    args = ap.parse_args()
+
+    root = Path(args.root).resolve()
+    if not root.exists():
+        print(f"[fatal] Root not found: {root}", file=sys.stderr); sys.exit(1)
+
+    changed = 0
+    scanned = 0
+    ts = time.strftime("%Y%m%d-%H%M%S")
+
+    for py in iter_py_files(root):
+        scanned += 1
+        try:
+            txt = py.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        new_txt, did = patch_text(txt)
+        if did:
+            changed += 1
+            print(f"[patch] {py}")
+            if args.apply:
+                bak = py.with_suffix(py.suffix + f".bak.{ts}")
+                try:
+                    bak.write_text(txt, encoding="utf-8")
+                    py.write_text(new_txt, encoding="utf-8")
+                except Exception as e:
+                    print(f"  [warn] write failed: {e}")
+            else:
+                print("  (dry-run)")
+
+    print(f"\nScanned: {scanned} files")
+    print(f"Patched: {changed} files{' (written)' if args.apply else ' (dry-run)'}")
+
+if __name__ == "__main__":
+    main()

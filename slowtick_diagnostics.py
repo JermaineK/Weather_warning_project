@@ -2,27 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 slowtick_diagnostics.py
-Post-process throttled alert grids to quantify:
+Post-process throttled/denoised/base alert grids to quantify:
   1) Knee law: coverage vs lead ~ L^(-2p) with bootstrap CI
   2) Hemispheric parity: N vs S coverage asymmetry with CI
   3) Slow-tick ridge: hourly spectrum peak near diurnal/slow band
 
-Inputs:
-  --alerts-dir  directory with throttled/denoised/base alerts
-  --run-name    run name used in alert filenames
-  --leads       list of leads (hours) to include
-  --flag-col    alert flag column (default: alert_final)
-  --out-dir     directory for CSV/plots
-
-Notes:
-  • No geographic restriction: reads *all* lat/lon unless you explicitly pass --area.
-  • Robust to differing flag columns per-file; will fall back to alert_throttled, alert_final, alert (in that order).
-  • Supports lon normalization and optional AOI cropping.
+Upgrades:
+  • Anti-meridian-safe AOI crop
+  • Robust file selection (stage preference + latest mtime)
+  • Tolerant CSV read + consistent tz-naive UTC
+  • Guardrails (--min-hours-per-lead, NaN handling)
+  • Exposed bootstrap reps (--bootstrap-B)
+  • Optional gap-filling for FFT and hemi time-series export
 """
 
-import argparse, os, math
+import argparse, math
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List, Dict
 
 import numpy as np
 import pandas as pd
@@ -33,6 +29,13 @@ import matplotlib.pyplot as plt
 
 
 # ---------- shared helpers ----------
+
+def _read_csv_tolerant(path: Path, usecols=None) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, compression="infer", low_memory=False, usecols=usecols)
+    except Exception:
+        return pd.read_csv(path, compression="infer", low_memory=False, engine="python",
+                           on_bad_lines="warn", usecols=usecols)
 
 def _try_parse_time_raw(s: pd.Series, fmt: Optional[str]) -> pd.Series:
     raw = s.astype(str).str.strip().str.replace("Z", "", regex=False)
@@ -48,8 +51,8 @@ def _try_parse_time_raw(s: pd.Series, fmt: Optional[str]) -> pd.Series:
             pass
     num = pd.to_numeric(raw, errors="coerce")
     if num.notna().any():
-        mid = np.nanmedian(num)
-        unit = "ms" if (mid and mid > 1e11) else "s"
+        mid = float(np.nanmedian(num))
+        unit = "ms" if np.isfinite(mid) and mid > 1e11 else "s"
         t3 = pd.to_datetime(num, unit=unit, utc=True, errors="coerce")
         if t3.notna().mean() > 0.5:
             return t3.dt.tz_localize(None)
@@ -66,14 +69,41 @@ def _norm_lon(series: pd.Series, mode: str) -> pd.Series:
 
 def _parse_area(aoi: Optional[str]):
     if not aoi: return None
-    try:
-        latN, lonW, latS, lonE = [float(x.strip()) for x in aoi.split(",")]
-        return latN, lonW, latS, lonE
-    except Exception:
-        raise ValueError("--area must be 'latN,lonW,latS,lonE' (e.g., -10,135,-30,155)")
+    latN, lonW, latS, lonE = [float(x.strip()) for x in aoi.split(",")]
+    return latN, lonW, latS, lonE
 
+def _crop_aoi(df: pd.DataFrame, aoi, lat_col="lat", lon_col="lon") -> pd.DataFrame:
+    if not aoi: return df
+    latN, lonW, latS, lonE = aoi
+    df = df[(df[lat_col] <= latN) & (df[lat_col] >= latS)]
+    if lonW <= lonE:
+        return df[(df[lon_col] >= lonW) & (df[lon_col] <= lonE)]
+    # wrap across anti-meridian
+    return df[(df[lon_col] >= lonW) | (df[lon_col] <= lonE)]
 
 # ---------- file I/O ----------
+
+def _pick_candidate(paths: List[Path], prefer: str) -> Optional[Path]:
+    # prefer can be 'throttled' | 'denoised' | 'base'
+    def stage_score(p: Path) -> int:
+        n = p.name
+        if n.endswith("_throttled.csv.gz"): return 0
+        if n.endswith("_denoised.csv.gz"):  return 1
+        return 2
+    if not paths: return None
+    # filter by prefer first
+    endings = {
+        "throttled": "_throttled.csv.gz",
+        "denoised":  "_denoised.csv.gz",
+        "base":      ".csv.gz",
+    }
+    wanted = [p for p in paths if p.name.endswith(endings["throttled"] if prefer=="throttled"
+                                                  else endings["denoised"] if prefer=="denoised"
+                                                  else endings["base"])]
+    pool = wanted if wanted else paths
+    # choose latest modified among equal stage priority
+    pool = sorted(pool, key=lambda p: (stage_score(p), -p.stat().st_mtime))
+    return pool[0] if pool else None
 
 def _read_alert_for_lead(alerts_dir: Path,
                          run: str,
@@ -82,6 +112,7 @@ def _read_alert_for_lead(alerts_dir: Path,
                          time_fmt: Optional[str],
                          norm_lon: str,
                          aoi: Optional[str],
+                         prefer: str,
                          debug: bool) -> Tuple[Optional[pd.DataFrame], Optional[Path], Optional[str]]:
     """
     Locate the preferred alerts file for a given lead, load it, normalize time/lat/lon,
@@ -92,54 +123,47 @@ def _read_alert_for_lead(alerts_dir: Path,
     if not cand:
         return None, None, None
 
-    # Preference: throttled → denoised → base
-    prefer = [p for p in cand if p.name.endswith("_throttled.csv.gz")] \
-             or [p for p in cand if p.name.endswith("_denoised.csv.gz")] \
-             or cand
-    path = prefer[0]
+    path = _pick_candidate(cand, prefer)
+    if path is None:
+        return None, None, None
 
-    # Peek to decide effective flag column
+    # Peek columns
     try:
-        head = pd.read_csv(path, nrows=1)
+        head = _read_csv_tolerant(path, nrows=1)
         cols = set(head.columns)
     except Exception:
         cols = set()
 
-    eff_flag = requested_flag
-    if eff_flag not in cols:
+    # Decide effective flag
+    eff_flag = requested_flag if requested_flag in cols else None
+    if eff_flag is None:
         for alt in ("alert_throttled", "alert_final", "alert"):
             if alt in cols:
                 eff_flag = alt
                 break
+    if eff_flag is None:
+        eff_flag = requested_flag or "alert_final"
 
-    # Read minimally-needed columns if possible
-    usecols = None
-    try:
-        possible = {"time", "lat", "lon", eff_flag}
-        usecols = [c for c in possible if c in cols] if cols else None
-    except Exception:
-        pass
+    usecols = [c for c in ("time","lat","lon",eff_flag) if c in cols] or None
+    df = _read_csv_tolerant(path, usecols=usecols)
 
-    df = pd.read_csv(path, compression="infer", usecols=usecols).replace([np.inf, -np.inf], np.nan)
+    # Ensure required columns exist
+    if not {"time","lat","lon"}.issubset(df.columns):
+        df = _read_csv_tolerant(path)  # last resort full read
 
-    # Time/coords/flag normalization
+    # Normalize
     df["time"] = _try_parse_time_raw(df["time"], time_fmt)
     df = df.dropna(subset=["time"]).reset_index(drop=True)
+    df["lat"]  = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"]  = _norm_lon(df["lon"], norm_lon)
+    df = df.dropna(subset=["lat","lon"]).reset_index(drop=True)
 
-    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    df["lon"] = _norm_lon(df["lon"], norm_lon)
     if eff_flag not in df.columns:
-        # synthesize zero column if completely missing (should be rare)
         df[eff_flag] = 0
     df[eff_flag] = pd.to_numeric(df[eff_flag], errors="coerce").fillna(0).astype(int)
-    df = df.dropna(subset=["lat", "lon"]).reset_index(drop=True)
 
-    # Optional AOI crop (default: no crop → global)
-    a = _parse_area(aoi)
-    if a:
-        latN, lonW, latS, lonE = a
-        df = df.loc[(df["lat"] <= latN) & (df["lat"] >= latS) &
-                    (df["lon"] >= lonW) & (df["lon"] <= lonE)].reset_index(drop=True)
+    # AOI crop (anti-meridian safe)
+    df = _crop_aoi(df, _parse_area(aoi), "lat", "lon")
 
     if debug and not df.empty:
         tt = df["time"].dt.floor("h")
@@ -154,22 +178,22 @@ def _read_alert_for_lead(alerts_dir: Path,
 
 def _coverage_by_hour(df: pd.DataFrame, flag_col: str) -> pd.Series:
     tt = df["time"].dt.floor("h")
-    return df.assign(t=tt).groupby("t", sort=True)[flag_col].mean()
-
+    return df.assign(_t=tt).groupby("_t", sort=True)[flag_col].mean()
 
 def _coverage_by_hour_hemi(df: pd.DataFrame, flag_col: str) -> pd.DataFrame:
     tt = df["time"].dt.floor("h")
-    north = df[df["lat"] >= 0].assign(t=tt).groupby("t", sort=True)[flag_col].mean()
-    south = df[df["lat"]  < 0].assign(t=tt).groupby("t", sort=True)[flag_col].mean()
-    both = pd.concat({"north": north, "south": south}, axis=1).fillna(0.0)
-    return both
-
+    north = df[df["lat"] >= 0].assign(_t=tt).groupby("_t", sort=True)[flag_col].mean()
+    south = df[df["lat"]  < 0].assign(_t=tt).groupby("_t", sort=True)[flag_col].mean()
+    both = pd.concat({"north": north, "south": south}, axis=1).astype(float)
+    return both.fillna(0.0)
 
 # ---------- stats helpers ----------
 
 def _bootstrap_ci(values: np.ndarray, stat_fn, B=1000, alpha=0.05, rng=None):
     if rng is None:
         rng = np.random.default_rng(42)
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
     n = len(values)
     if n == 0:
         return math.nan, (math.nan, math.nan)
@@ -189,14 +213,15 @@ def _fit_knee(logL, logCov):
     return float(p), float(a), float(b)
 
 def _knee_fit_with_bootstrap(leads, mean_cov, B=1000):
-    mask = (np.array(leads) > 0) & (np.array(mean_cov) > 0)
-    L = np.array(leads)[mask]
-    C = np.array(mean_cov)[mask]
+    L = np.asarray(leads, dtype=float)
+    C = np.asarray(mean_cov, dtype=float)
+    mask = np.isfinite(L) & np.isfinite(C) & (L > 0) & (C > 0)
+    L, C = L[mask], C[mask]
     if len(L) < 2:
         return dict(p=math.nan, p_lo=math.nan, p_hi=math.nan, used_points=int(mask.sum()))
     logL = np.log(L)
     logC = np.log(C)
-    p_hat, a, b = _fit_knee(logL, logC)
+    p_hat, *_ = _fit_knee(logL, logC)
 
     rng = np.random.default_rng(123)
     ps = []
@@ -204,7 +229,6 @@ def _knee_fit_with_bootstrap(leads, mean_cov, B=1000):
         idx = rng.integers(0, len(L), size=len(L))
         p_b, *_ = _fit_knee(logL[idx], logC[idx])
         ps.append(p_b)
-    ps = np.array(ps)
     lo, hi = np.quantile(ps, [0.025, 0.975])
     return dict(p=float(p_hat), p_lo=float(lo), p_hi=float(hi), used_points=int(mask.sum()))
 
@@ -220,6 +244,23 @@ def _fft_peak(freqs, amps, target_per_h=24, band=0.20):
     a_peak = amps[band_mask][k]
     return float(f_peak), float(a_peak)
 
+def _fill_small_gaps_hourly(series: pd.Series, max_gap_h=3) -> pd.Series:
+    """Fill short NaN runs (≤ max_gap_h) by linear interpolation; leave longer gaps."""
+    s = series.copy()
+    # Interpolate all, then mask out fills across long gaps
+    interp = s.interpolate(limit=max_gap_h, limit_direction="both")
+    # Identify long gaps and restore NaN in their interior
+    is_nan = s.isna().to_numpy()
+    # run-length encode
+    pad = np.r_[False, is_nan, False]
+    edges = np.diff(pad.astype(int))
+    starts = np.where(edges == 1)[0]
+    ends   = np.where(edges == -1)[0]
+    for st, en in zip(starts, ends):
+        run = en - st
+        if run > max_gap_h:
+            interp.iloc[st:en] = np.nan
+    return interp
 
 # ---------- main ----------
 
@@ -228,58 +269,93 @@ def main():
     ap.add_argument("--alerts-dir", required=True, help="Directory with alerts (throttled preferred).")
     ap.add_argument("--run-name", required=True, help="Run name used in filenames.")
     ap.add_argument("--leads", type=int, nargs="+", required=True, help="Lead hours to include.")
-    ap.add_argument("--flag-col", default="alert_final", help="Preferred flag column (tries fallbacks automatically).")
+    ap.add_argument("--flag-col", default="alert_final", help="Preferred flag column (tries fallbacks).")
     ap.add_argument("--out-dir", default="results/slowtick", help="Output directory for CSVs/plots.")
     ap.add_argument("--time-format", default=None, help="Optional strftime for custom time parsing.")
     ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="none",
                     help="Normalize longitudes in input files (default: none).")
     ap.add_argument("--area", default=None, help='Optional crop "latN,lonW,latS,lonE" after lon normalization.')
+    ap.add_argument("--prefer", choices=["throttled","denoised","base"], default="throttled",
+                    help="Which stage to prefer if multiple exist for a lead.")
+    ap.add_argument("--save-timeseries", action="store_true", help="Also save hourly coverage time series (global).")
+    ap.add_argument("--save-hemi-timeseries", action="store_true", help="Also save hourly N/S coverage time series.")
+    ap.add_argument("--bootstrap-B", type=int, default=1000, help="Bootstrap draws for knee/parity CIs.")
+    ap.add_argument("--min-hours-per-lead", type=int, default=8, help="Skip leads with fewer hourly points.")
+    ap.add_argument("--fft-gap-fill", type=int, default=2, help="Fill NaN gaps ≤ this many hours before FFT.")
     ap.add_argument("--debug", action="store_true", help="Print file/range diagnostics.")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     alerts_dir = Path(args.alerts_dir)
 
-    rows = []
-    cov_time = {}
-    cov_hemi_time = {}
+    rows: List[Dict] = []
+    cov_time: Dict[int, pd.Series] = {}
+    cov_hemi_time: Dict[int, pd.DataFrame] = {}
 
     # 1) gather coverage time series per lead (global by default)
     for L in args.leads:
         df, path, eff_flag = _read_alert_for_lead(
             alerts_dir, args.run_name, L, args.flag_col,
-            time_fmt=args.time_format, norm_lon=args.normalize_lon, aoi=args.area, debug=args.debug
+            time_fmt=args.time_format, norm_lon=args.normalize_lon, aoi=args.area,
+            prefer=args.prefer, debug=args.debug
         )
         if df is None or df.empty or eff_flag is None:
-            print(f"[slowtick] missing/empty alerts for lead={L}; skipping.")
+            print(f"[slowtick] lead={L}: no usable alerts file; skipping.")
             continue
 
         cov = _coverage_by_hour(df, eff_flag)
-        hemi = _coverage_by_hour_hemi(df, eff_flag)
-        cov_time[L] = cov
-        cov_hemi_time[L] = hemi
+        if cov.notna().sum() < max(4, args.min_hours_per_lead):
+            print(f"[slowtick] lead={L}: too few hourly points ({cov.notna().sum()}); skipping.")
+            continue
 
-        rows.append(dict(lead_h=L, hours=int(len(cov)), mean_cov=float(cov.mean()), file=Path(path).name,
+        hemi = _coverage_by_hour_hemi(df, eff_flag)
+        cov_time[L] = cov.sort_index()
+        cov_hemi_time[L] = hemi.sort_index()
+
+        rows.append(dict(lead_h=L,
+                         hours=int(cov.notna().sum()),
+                         mean_cov=float(np.nanmean(cov.values)),
+                         file=Path(path).name if path else "",
                          flag_col=eff_flag))
 
     summary = pd.DataFrame(rows).sort_values("lead_h")
     summary.to_csv(out_dir / "slowtick_summary.csv", index=False)
 
+    # also save per-hour time series (optional)
+    if args.save_timeseries and cov_time:
+        long_rows = []
+        for L, s in cov_time.items():
+            for t, v in s.items():
+                long_rows.append({"lead_h": int(L), "time": pd.to_datetime(t), "coverage": float(v)})
+        pd.DataFrame(long_rows).sort_values(["lead_h","time"]).to_csv(out_dir / "coverage_timeseries.csv", index=False)
+
+    if args.save_hemi_timeseries and cov_hemi_time:
+        long_hemi = []
+        for L, dfh in cov_hemi_time.items():
+            for t, r in dfh.iterrows():
+                long_hemi.append({"lead_h": int(L), "time": pd.to_datetime(t),
+                                  "cov_north": float(r.get("north", np.nan)),
+                                  "cov_south": float(r.get("south", np.nan))})
+        pd.DataFrame(long_hemi).sort_values(["lead_h","time"]).to_csv(out_dir / "coverage_timeseries_hemi.csv", index=False)
+
     # 2) knee law fit on mean coverage vs lead (log-log)
-    if not summary.empty:
-        fit = _knee_fit_with_bootstrap(summary["lead_h"].values, summary["mean_cov"].values, B=1000)
+    if not summary.empty and (summary["mean_cov"] > 0).sum() >= 2:
+        fit = _knee_fit_with_bootstrap(summary["lead_h"].values,
+                                       summary["mean_cov"].values,
+                                       B=int(args.bootstrap_B))
         pd.DataFrame([fit]).to_csv(out_dir / "knee_fit.csv", index=False)
 
-        # plot: mean coverage vs lead + power-law fit
-        plt.figure(figsize=(6.5, 4.2))
+        # plot + export fitted curve for the given L set
+        Lx = np.array(summary["lead_h"].values, dtype=float)
+        Cx = summary["mean_cov"].values
+        plt.figure(figsize=(6.6, 4.2))
         plt.title("Knee law: coverage vs lead")
-        plt.loglog(summary["lead_h"], summary["mean_cov"], "o-", label="mean coverage")
-        p = fit["p"]
-        if not math.isnan(p):
-            Lx = np.array(summary["lead_h"].values, dtype=float)
-            Cx = summary["mean_cov"].values
+        plt.loglog(Lx, Cx, "o-", label="mean coverage")
+        p = fit.get("p", math.nan)
+        if np.isfinite(p):
             Lm, Cm = np.median(Lx), np.median(Cx)
             Cfit = Cm * (Lx / Lm) ** (-2*p)
+            pd.DataFrame({"lead_h": Lx, "coverage_fit": Cfit}).sort_values("lead_h").to_csv(out_dir / "knee_fit_curve.csv", index=False)
             plt.loglog(Lx, Cfit, "--", label=f"fit: p={p:.3f} (95% [{fit['p_lo']:.3f},{fit['p_hi']:.3f}])")
         plt.xlabel("Lead L (hours)")
         plt.ylabel("Coverage")
@@ -292,14 +368,15 @@ def main():
     # 3) hemispheric parity (per hour diff, bootstrap CI on mean diff)
     parity_rows = []
     for L, hemi in cov_hemi_time.items():
-        dif = (hemi["north"] - hemi["south"]).dropna().to_numpy()
+        dif = (hemi["north"] - hemi["south"]).astype(float)
+        dif = dif[np.isfinite(dif)]
         if dif.size == 0:
             continue
-        mean_diff, (lo, hi) = _bootstrap_ci(dif, np.mean, B=1000, alpha=0.05)
-        parity_rows.append(dict(lead_h=L, mean_diff=float(mean_diff), ci_lo=float(lo), ci_hi=float(hi),
+        mean_diff, (lo, hi) = _bootstrap_ci(dif.to_numpy(), np.mean, B=int(args.bootstrap_B), alpha=0.05)
+        parity_rows.append(dict(lead_h=int(L), mean_diff=float(mean_diff), ci_lo=float(lo), ci_hi=float(hi),
                                 n_hours=int(dif.size)))
         # quick plot
-        plt.figure(figsize=(6.5, 3.2))
+        plt.figure(figsize=(6.6, 3.2))
         plt.title(f"Hemispheric parity Δcov = cov(N) - cov(S)  (lead {L}h)")
         plt.plot(hemi.index, dif, lw=0.7)
         plt.axhline(0, color="k", lw=0.8)
@@ -314,25 +391,38 @@ def main():
     # 4) slow-tick ridge via FFT of hourly coverage
     ridge_rows = []
     for L, cov in cov_time.items():
-        y = cov.to_numpy(dtype=float)
-        if y.size < 8:
+        y = cov.astype(float)
+        if y.size < max(8, args.min_hours_per_lead):
             continue
-        y = y - y.mean()
-        w = np.hanning(y.size)
-        yf = np.fft.rfft(y * w)
-        freqs = np.fft.rfftfreq(y.size, d=1.0)  # cycles per hour
+        if args.fft_gap_fill and args.fft_gap_fill > 0:
+            y = _fill_small_gaps_hourly(y, max_gap_h=int(args.fft_gap_fill))
+        y = y - np.nanmean(y)
+        yv = np.nan_to_num(y.to_numpy(), nan=0.0)
+        w = np.hanning(yv.size)
+        yf = np.fft.rfft(yv * w)
+        freqs = np.fft.rfftfreq(yv.size, d=1.0)  # cycles per hour
         amps = np.abs(yf)
         f_peak, a_peak = _fft_peak(freqs, amps, target_per_h=24, band=0.20)
-        ridge_rows.append(dict(lead_h=L, peak_freq=f_peak, peak_amp=a_peak, n_hours=int(y.size)))
+        # Diurnal power ratio: power in 24h±20% band / total low-f power (≥5h)
+        f0 = 1/24.0
+        band_mask = (freqs >= f0*(1-0.2)) & (freqs <= f0*(1+0.2))
+        low_mask  = (freqs > 0) & (freqs <= 0.2)
+        diurnal_ratio = (amps[band_mask].sum() / amps[low_mask].sum()) if low_mask.any() and amps[low_mask].sum() > 0 else np.nan
 
-        # spectrum plot (focus 0..0.2 cph ~ up to 5h period)
-        plt.figure(figsize=(6.5, 3.6))
+        ridge_rows.append(dict(lead_h=int(L),
+                               peak_freq=f_peak,
+                               peak_amp=a_peak,
+                               diurnal_ratio=float(diurnal_ratio) if np.isfinite(diurnal_ratio) else np.nan,
+                               n_hours=int(y.size)))
+
+        # spectrum plot (focus 0..0.2 cph ~ periods ≥5h)
+        plt.figure(figsize=(6.6, 3.6))
         plt.title(f"Hourly coverage spectrum (lead {L}h)")
         plt.plot(freqs, amps)
         plt.xlim(0, 0.2)
         plt.xlabel("Frequency (cycles per hour)")
-        plt.ylabel("|FFT|")
-        if not math.isnan(f_peak):
+        plt.ylabel("|FFT| (arbitrary)")
+        if np.isfinite(f_peak):
             plt.axvline(f_peak, ls="--", alpha=0.6)
             plt.text(f_peak, 0.9*amps.max(), f"{f_peak:.3f} cph", ha="left", va="top")
         plt.tight_layout()

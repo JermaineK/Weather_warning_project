@@ -3,15 +3,32 @@
 
 """
 Train a logistic regression storm/pregen classifier from a labelled grid CSV/Parquet.
-Adds robust auto-cleaning to drop duplicate ERA5 merge columns, metadata,
-and low-information features; reports NaNs; supports imputation, clipping,
-and optional class weights.
+- Keeps the classic "global" training (one target column).
+- Optionally trains extra per-lead models if lead-specific target columns exist.
+- Reuses the same imputer/clip/scaler stats for all models to avoid drift.
+
+Outputs (joblib bundle):
+  bundle = {
+    "model": clf_global,                 # global (unchanged API)
+    "scaler": StandardScaler,
+    "features": [col, ...],
+    "target": "pregen" | "storm" | "near_storm",
+    "imputer_stats": {col: value, ...},
+    "impute_kind": "median" | "mean" | "zero",
+    "clip_stats": {"lo": np.ndarray, "hi": np.ndarray} or {},
+    "clip_quantile": float,
+    "class_weight": "none" | "balanced",
+    "C": float,
+    "meta": {...},
+    # New, optional:
+    "per_lead_models": {lead_h: clf, ...},   # only if --per-lead provided and labels found
+  }
 """
 
 import argparse
 import re
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import joblib
 import numpy as np
@@ -31,7 +48,6 @@ def read_any(path: str) -> pd.DataFrame:
     low = path.lower()
     if low.endswith((".parquet", ".parq", ".pq")):
         df = pd.read_parquet(path)
-        # Make sure time is datetime (parquet may already have it right)
         if "time" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["time"]):
             df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True).dt.tz_localize(None)
         return df
@@ -56,9 +72,13 @@ def nan_report(df: pd.DataFrame, top: int = 10) -> None:
     print(f"[DATA] Non-finite -> NaN  | cells with NaN: {cells_with_nan:,}  ({frac:.3%} of all values)")
     if top > 0:
         print("       Top-NaN columns:")
-        for col, n in vals.head(top).items():
+        shown = 0
+        for col, n in vals.items():
             if n > 0:
                 print(f"         - {col:28s} NaNs={n:,}")
+                shown += 1
+                if shown >= top:
+                    break
 
 def quantile_clip_train(Xtr: np.ndarray, Xte: np.ndarray, q: float) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
     """Clip each feature by train-based quantiles to [1-q, q]."""
@@ -68,6 +88,12 @@ def quantile_clip_train(Xtr: np.ndarray, Xte: np.ndarray, q: float) -> Tuple[np.
     hi = np.quantile(Xtr, q, axis=0)
     lo, hi = np.minimum(lo, hi), np.maximum(lo, hi)
     return np.clip(Xtr, lo, hi), np.clip(Xte, lo, hi), {"lo": lo, "hi": hi}
+
+def apply_clip(arr: np.ndarray, clip_stats: Dict[str, np.ndarray]) -> np.ndarray:
+    if not clip_stats:
+        return arr
+    lo, hi = clip_stats["lo"], clip_stats["hi"]
+    return np.clip(arr, lo, hi)
 
 def make_imputer(kind: str, fill_value: float = 0.0):
     """Return a simple columnwise imputer callable."""
@@ -128,9 +154,9 @@ def auto_clean_columns(df: pd.DataFrame,
 
     return df, dropped
 
-def pick_feature_columns(df: pd.DataFrame, target: str) -> List[str]:
+def pick_feature_columns(df: pd.DataFrame, target: str, extra_ignores: Optional[List[str]] = None) -> List[str]:
     meta = {"time", "lat", "lon"}
-    ignore = set([target]) | meta
+    ignore = set([target]) | meta | set(extra_ignores or [])
     feats = [c for c in df.columns if c not in ignore and pd.api.types.is_numeric_dtype(df[c])]
     return feats
 
@@ -142,6 +168,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target", choices=["pregen", "storm", "near_storm"], default="pregen")
     p.add_argument("--test-size", type=float, default=0.1)
     p.add_argument("--model-out", required=True, help="Output .pkl")
+
+    # Per-lead (optional)
+    p.add_argument("--per-lead", type=int, nargs="+", default=None,
+                   help="Optional list of lead hours to train extra models for (requires lead-specific target columns).")
 
     # Preprocess
     p.add_argument("--impute", choices=["median", "mean", "zero"], default="median")
@@ -161,6 +191,50 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--class-weight", choices=["none", "balanced"], default="none",
                    help="Optional class weighting for LogisticRegression.")
     return p.parse_args()
+
+# ----------------------- training helpers -----------------------
+
+def _fit_logit(Xtr_s, ytr, C, class_weight):
+    clf = LogisticRegression(
+        penalty="l2",
+        C=C,
+        solver="lbfgs",
+        max_iter=200,
+        n_jobs=None,
+        class_weight=class_weight,
+        random_state=42,
+    )
+    clf.fit(Xtr_s, ytr)
+    return clf
+
+def _safe_auc(ytrue, p):
+    try:
+        return roc_auc_score(ytrue, p)
+    except Exception:
+        return float("nan")
+
+def _safe_ap(ytrue, p):
+    try:
+        return average_precision_score(ytrue, p)
+    except Exception:
+        return float("nan")
+
+def _find_lead_label_column(df: pd.DataFrame, base: str, lead: int) -> Optional[str]:
+    """
+    Try a few common patterns for lead-specific target columns.
+    Returns the column name if found, else None.
+    """
+    cand = [
+        f"{base}_lead{lead}",
+        f"{base}_L{lead}",
+        f"{base}_{lead}h",
+        f"{base}{lead}",
+        f"{base}_tplus{lead}",
+    ]
+    for c in cand:
+        if c in df.columns:
+            return c
+    return None
 
 # ----------------------- main -----------------------
 
@@ -190,6 +264,7 @@ def main():
             print(f"[CLEAN] auto dropped {len(removed)} cols: {head}{' ...' if len(removed) > 12 else ''}")
 
     # Extra user regex drop AFTER auto-clean
+    extra_ign = []
     if args.drop_cols:
         pat = re.compile(args.drop_cols)
         to_drop = [c for c in df.columns if pat.search(c)]
@@ -197,16 +272,18 @@ def main():
             df = df.drop(columns=to_drop, errors="ignore")
             head = ", ".join(to_drop[:12])
             print(f"[CLEAN] regex dropped {len(to_drop)} cols: {head}{' ...' if len(to_drop) > 12 else ''}")
+        extra_ign.extend(to_drop)
 
-    feats = pick_feature_columns(df, target=args.target)
+    # Feature set (ignore all obvious meta + target + any extra drops)
+    feats = pick_feature_columns(df, target=args.target, extra_ignores=extra_ign)
     if not feats:
         print("[ERROR] No numeric feature columns after cleaning.", file=sys.stderr)
         sys.exit(2)
     print(f"[FEATS] using {len(feats)} features (first 8): {feats[:8]}{' ...' if len(feats) > 8 else ''}")
 
-    # Split
+    # Split GLOBAL
     X = df[feats]
-    y = df[args.target].astype(int).to_numpy()
+    y = pd.to_numeric(df[args.target], errors="coerce").fillna(0).astype(int).to_numpy()
     try:
         Xtr_df, Xte_df, ytr, yte = train_test_split(
             X, y, test_size=args.test_size, random_state=42, stratify=y
@@ -217,67 +294,87 @@ def main():
             X, y, test_size=args.test_size, random_state=42, stratify=None
         )
 
-    # Impute
+    # Impute (fit on GLOBAL train)
     fit_imp, tr_imp = make_imputer(args.impute)
     imp_stats = fit_imp(Xtr_df)
     Xtr = tr_imp(Xtr_df, imp_stats)
     Xte = tr_imp(Xte_df, imp_stats)
 
-    # Clip
+    # Clip (fit on GLOBAL train)
     q = args.clip_quantile
     Xtr, Xte, clip_stats = quantile_clip_train(Xtr, Xte, q) if (q and 0 < q < 1) else (Xtr, Xte, {})
 
-    # Scale
+    # Scale (fit on GLOBAL train)
     scaler = StandardScaler(with_mean=True, with_std=True)
     Xtr_s = scaler.fit_transform(Xtr)
     Xte_s = scaler.transform(Xte)
 
-    # Model
-    cw = None if args.class_weight == "none" else "balanced"
+    # Model hyperparams
+    class_weight = None if args.class_weight == "none" else "balanced"
     C = 1.0 / max(args.warm, 1e-6)
-    clf = LogisticRegression(
-        penalty="l2",
-        C=C,
-        solver="lbfgs",
-        max_iter=200,
-        n_jobs=None,
-        class_weight=cw,
-        random_state=42,  # determinism
-    )
-    clf.fit(Xtr_s, ytr)
 
-    # Metrics (guard degeneracy)
-    ptr = clf.predict_proba(Xtr_s)[:, 1]
-    pte = clf.predict_proba(Xte_s)[:, 1]
-    def _safe_auc(ytrue, p):
-        try:
-            return roc_auc_score(ytrue, p)
-        except Exception:
-            return float("nan")
-    def _safe_ap(ytrue, p):
-        try:
-            return average_precision_score(ytrue, p)
-        except Exception:
-            return float("nan")
-
+    # ---- Train GLOBAL model
+    clf_global = _fit_logit(Xtr_s, ytr, C, class_weight)
+    ptr = clf_global.predict_proba(Xtr_s)[:, 1]
+    pte = clf_global.predict_proba(Xte_s)[:, 1]
     mtr = dict(AUC=_safe_auc(ytr, ptr), PRAUC=_safe_ap(ytr, ptr), Brier=brier(ytr, ptr))
     mte = dict(AUC=_safe_auc(yte, pte), PRAUC=_safe_ap(yte, pte), Brier=brier(yte, pte))
 
     pos = int(y.sum())
-    print(f"Rows used: {len(X):,}  Positives: {pos:,}/{len(X):,}")
-    print(f"[train] AUC={mtr['AUC']:.3f}  PRAUC={mtr['PRAUC']:.3f}  Brier={mtr['Brier']:.3f}")
-    print(f"[test]  AUC={mte['AUC']:.3f}  PRAUC={mte['PRAUC']:.3f}  Brier={mte['Brier']:.3f}")
+    print(f"Rows used (GLOBAL): {len(X):,}  Positives: {pos:,}/{len(X):,}")
+    print(f"[train][GLOBAL] AUC={mtr['AUC']:.3f}  PRAUC={mtr['PRAUC']:.3f}  Brier={mtr['Brier']:.3f}")
+    print(f"[test] [GLOBAL] AUC={mte['AUC']:.3f}  PRAUC={mte['PRAUC']:.3f}  Brier={mte['Brier']:.3f}")
 
-    # Top coefficients
-    coef = clf.coef_.ravel()
+    # Top coefficients (GLOBAL)
+    coef = clf_global.coef_.ravel()
     order = np.argsort(np.abs(coef))[::-1][:20]
-    print("\nTop |coef| (20):")
+    print("\nTop |coef| (GLOBAL, 20):")
     for idx in order:
         print(f"  {feats[idx]:28s} {coef[idx]:+0.4f}")
 
-    # Save bundle
+    # ---- Optional: train PER-LEAD models (if columns exist)
+    per_lead_models: Dict[int, LogisticRegression] = {}
+    if args.per_lead:
+        print("\n[per-lead] attempting per-lead training using existing lead label columns…")
+        for L in args.per_lead:
+            y_col = _find_lead_label_column(df, args.target, L)
+            if not y_col:
+                print(f"  • lead {L:>3}h: skipped (no column like '{args.target}_lead{L}' / 'L{L}' / '{L}h').")
+                continue
+
+            yL = pd.to_numeric(df[y_col], errors="coerce").fillna(0).astype(int).to_numpy()
+            try:
+                Xtr_dfL, Xte_dfL, ytrL, yteL = train_test_split(
+                    X, yL, test_size=args.test_size, random_state=42, stratify=yL
+                )
+            except ValueError:
+                Xtr_dfL, Xte_dfL, ytrL, yteL = train_test_split(
+                    X, yL, test_size=args.test_size, random_state=42, stratify=None
+                )
+
+            # Reuse global imputer/clip/scaler stats so features live in same space
+            XtrL = apply_clip(tr_imp(Xtr_dfL, imp_stats), clip_stats)
+            XteL = apply_clip(tr_imp(Xte_dfL, imp_stats), clip_stats)
+            XtrLs = scaler.transform(XtrL)
+            XteLs = scaler.transform(XteL)
+
+            # Train
+            clfL = _fit_logit(XtrLs, ytrL, C, class_weight)
+            ptrL = clfL.predict_proba(XtrLs)[:, 1]
+            pteL = clfL.predict_proba(XteLs)[:, 1]
+            mtrL = dict(AUC=_safe_auc(ytrL, ptrL), PRAUC=_safe_ap(ytrL, ptrL), Brier=brier(ytrL, ptrL))
+            mteL = dict(AUC=_safe_auc(yteL, pteL), PRAUC=_safe_ap(yteL, pteL), Brier=brier(yteL, pteL))
+
+            posL = int(yL.sum())
+            print(f"[per-lead {L:>3}h] N={len(yL):,}  Pos={posL:,} | "
+                  f"train: AUC={mtrL['AUC']:.3f} PRAUC={mtrL['PRAUC']:.3f} Brier={mtrL['Brier']:.3f} | "
+                  f"test:  AUC={mteL['AUC']:.3f} PRAUC={mteL['PRAUC']:.3f} Brier={mteL['Brier']:.3f}")
+
+            per_lead_models[int(L)] = clfL
+
+    # Save bundle (GLOBAL, plus optional per-lead models)
     artifact = dict(
-        model=clf,
+        model=clf_global,
         scaler=scaler,
         features=feats,
         target=args.target,
@@ -292,8 +389,12 @@ def main():
             auto_clean=args.auto_clean,
             min_nonnull_frac=args.min_nonnull_frac,
             drop_cols=args.drop_cols,
+            per_lead_trained=sorted(per_lead_models.keys()),
         ),
     )
+    if per_lead_models:
+        artifact["per_lead_models"] = per_lead_models
+
     joblib.dump(artifact, args.model_out)
     print(f"\nSaved {args.model_out}")
 
