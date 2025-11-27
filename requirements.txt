@@ -8,4 +8,4 @@ matplotlib
 cartopy
 scipy
 joblib
-pyyaml
+pyyaml>=6.0
