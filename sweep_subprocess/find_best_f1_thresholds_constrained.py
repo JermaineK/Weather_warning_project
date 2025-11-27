@@ -1,5 +1,47 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+find_best_f1_thresholds_constrained.py
+
+Fast constrained per-lead threshold search directly from:
+  - a labelled grid (CSV(.gz)/Parquet)
+  - a trained model bundle (joblib)
+
+It does NOT consume sweep summaries. Instead it:
+  • loads the model bundle (global model and/or per-lead models)
+  • scores probabilities on the labelled grid
+  • builds time-aware labels per lead:
+      - primary: success_col at t+lead (same grid)
+      - fallback: future window of base target in (t, t+lead] per (lat,lon)
+  • sweeps probability thresholds and maximises:
+      - F1  (under constraints on precision / coverage)
+      - Fβ (beta configurable)
+
+Output:
+  • CSV with one row per lead:
+      lead_h, thr_f1, F1, P_f1, R_f1, Cov_f1, Alerts_f1,
+      thr_Fbeta, Fbeta, P_Fbeta, R_Fbeta, Cov_Fbeta, Alerts_Fbeta,
+      status_f1, status_Fbeta, label_mode
+
+This CSV is compatible with grid_score.py when you set:
+  thresholds_csv: results/best_fbeta_thresholds.csv
+  thr_col: thr_Fbeta
+
+Typical usage
+-------------
+python find_best_f1_thresholds_constrained.py \
+  --labelled data/grid_labelled_FMA_gka_realthermo.parquet \
+  --model models/grid_logit_perlead.pkl \
+  --target storm \
+  --success-col storm_window \
+  --leads 24 48 72 120 \
+  --min-precision 0.12 \
+  --max-coverage 0.25 \
+  --fbeta 0.5 \
+  --out results/best_fbeta_thresholds.csv
+"""
+
+from __future__ import annotations
 
 import argparse
 import warnings
@@ -9,7 +51,9 @@ import numpy as np
 import pandas as pd
 import joblib
 
+
 # --------- lightweight I/O (CSV/GZ + Parquet) ---------
+
 def read_any(path: str, columns: Optional[List[str]] = None) -> pd.DataFrame:
     """
     Read CSV(.gz) or Parquet. If `columns` is provided, tries to read only those columns
@@ -23,18 +67,34 @@ def read_any(path: str, columns: Optional[List[str]] = None) -> pd.DataFrame:
             return pd.read_parquet(path)
     if columns:
         cols_set = set(columns)
-        return pd.read_csv(path, compression="infer", low_memory=False,
-                           usecols=lambda c: c in cols_set)
+        return pd.read_csv(
+            path,
+            compression="infer",
+            low_memory=False,
+            usecols=lambda c: c in cols_set,
+        )
     return pd.read_csv(path, compression="infer", low_memory=False)
+
 
 # --------- time/lon helpers ---------
 
 def _try_parse_time_raw(s: pd.Series, fmt: Optional[str]) -> pd.Series:
-    # Be lenient: strip Z, try ISO, try provided fmt, try epoch s/ms, then generic
+    """
+    Robust timestamp parser:
+      - strip 'Z', try ISO
+      - optional fixed format
+      - epoch seconds/ms
+      - fallback generic pd.to_datetime
+    Always returns tz-naive UTC.
+    """
     raw = s.astype(str).str.strip().str.replace("Z", "", regex=False)
+
+    # ISO-ish first
     t1 = pd.to_datetime(raw, utc=True, errors="coerce")
     if t1.notna().mean() > 0.5:
         return t1.dt.tz_localize(None)
+
+    # Optional custom format
     if fmt:
         try:
             t2 = pd.to_datetime(raw, format=fmt, utc=True, errors="coerce")
@@ -42,15 +102,20 @@ def _try_parse_time_raw(s: pd.Series, fmt: Optional[str]) -> pd.Series:
                 return t2.dt.tz_localize(None)
         except Exception:
             pass
+
+    # Epoch seconds / ms
     num = pd.to_numeric(raw, errors="coerce")
     if num.notna().any():
         mid = np.nanmedian(num)
-        unit = "ms" if (isinstance(mid, (int,float)) and mid > 1e11) else "s"
+        unit = "ms" if (isinstance(mid, (int, float)) and mid > 1e11) else "s"
         t3 = pd.to_datetime(num, unit=unit, utc=True, errors="coerce")
         if t3.notna().mean() > 0.5:
             return t3.dt.tz_localize(None)
+
+    # Last resort
     t4 = pd.to_datetime(raw, utc=True, errors="coerce")
     return t4.dt.tz_localize(None)
+
 
 def _norm_lon(series: pd.Series, mode: str) -> pd.Series:
     x = pd.to_numeric(series, errors="coerce")
@@ -58,17 +123,25 @@ def _norm_lon(series: pd.Series, mode: str) -> pd.Series:
         return x
     if mode == "0..360":
         return (x % 360 + 360) % 360
-    return ((x + 180) % 360) - 180  # -180..180
+    # default: -180..180
+    return ((x + 180) % 360) - 180
+
 
 def _parse_area(aoi: Optional[str]):
-    if not aoi: return None
+    """
+    Parse AOI string 'latN,lonW,latS,lonE' into floats.
+    Example: '-5,125,-35,175'
+    """
+    if not aoi:
+        return None
     try:
         latN, lonW, latS, lonE = [float(x.strip()) for x in aoi.split(",")]
         return latN, lonW, latS, lonE
     except Exception:
         raise ValueError("--area must be 'latN,lonW,latS,lonE' (e.g., -10,135,-30,155)")
 
-# --------- utils ---------
+
+# --------- model / feature utils ---------
 
 def load_model_any(path: str):
     """
@@ -86,25 +159,37 @@ def load_model_any(path: str):
     if isinstance(m, dict):
         model = m.get("model") or m.get("model-out") or m.get("estimator")
         scaler = m.get("scaler", None)
-        feats  = list(m.get("features", m.get("feats", []) or []))
-        imp    = m.get("imputer_stats", None)
-        clip   = m.get("clip_stats", None)
+        feats = list(m.get("features", m.get("feats", []) or []))
+        imp = m.get("imputer_stats", None)
+        clip = m.get("clip_stats", None)
         per_lead = m.get("per_lead_models", {}) or {}
         if model is None and not per_lead:
             raise ValueError("Bundle lacks a global 'model' and has no 'per_lead_models'.")
         if not feats:
             raise ValueError("Bundle lacks 'features'.")
         return model, scaler, feats, imp, clip, per_lead
-    # plain estimator path (no per-lead support here)
-    return m, getattr(m, "scaler_", None), list(getattr(m, "features_", []) or []), None, None, {}
 
-def build_feature_matrix(df: pd.DataFrame,
-                         feats: List[str],
-                         imputer_stats: Optional[Dict[str, float]],
-                         clip_stats: Optional[Dict[str, np.ndarray]],
-                         scaler) -> np.ndarray:
+    # plain estimator path (no per-lead support here)
+    return (
+        m,
+        getattr(m, "scaler_", None),
+        list(getattr(m, "features_", []) or []),
+        None,
+        None,
+        {},
+    )
+
+
+def build_feature_matrix(
+    df: pd.DataFrame,
+    feats: List[str],
+    imputer_stats: Optional[Dict[str, float]],
+    clip_stats: Optional[Dict[str, np.ndarray]],
+    scaler,
+) -> np.ndarray:
     """
-    Align columns to `feats`; impute with trainer stats (or zeros), optional clip, then scale.
+    Align columns to `feats`; impute with trainer stats (or zeros),
+    optional clip, then scale.
     """
     Xdf = pd.DataFrame(index=df.index)
     for c in feats:
@@ -142,7 +227,12 @@ def build_feature_matrix(df: pd.DataFrame,
 
     return X
 
-def future_max_label_by_point(df: pd.DataFrame, target_col: str, hours: int) -> np.ndarray:
+
+def future_max_label_by_point(
+    df: pd.DataFrame,
+    target_col: str,
+    hours: int,
+) -> np.ndarray:
     """
     For each (lat,lon) time series, compute future max within `hours`.
     Aligned to the original row order; robust to duplicates and irregularities.
@@ -161,9 +251,12 @@ def future_max_label_by_point(df: pd.DataFrame, target_col: str, hours: int) -> 
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=FutureWarning)
-        s = df.groupby(["lat","lon"], sort=False).apply(_per_point)
-    s.index = s.index.droplevel([0,1])
+        s = df.groupby(["lat", "lon"], sort=False).apply(_per_point)
+    s.index = s.index.droplevel([0, 1])
     return s.to_numpy(dtype=int)
+
+
+# --------- threshold sweeps ---------
 
 def sweep_thresholds(p: np.ndarray, y: np.ndarray, q_grid: Optional[int] = 1000) -> pd.DataFrame:
     """
@@ -198,14 +291,17 @@ def sweep_thresholds(p: np.ndarray, y: np.ndarray, q_grid: Optional[int] = 1000)
         denom_f1 = precision + recall
         f1 = np.where(denom_f1 > 0, 2 * precision * recall / denom_f1, 0.0)
 
-    return pd.DataFrame({
-        "thr": thrs,
-        "precision": precision,
-        "recall": recall,
-        "coverage": coverage,
-        "F1": f1,
-        "alerts": (coverage * n).astype(np.int64),
-    })
+    return pd.DataFrame(
+        {
+            "thr": thrs,
+            "precision": precision,
+            "recall": recall,
+            "coverage": coverage,
+            "F1": f1,
+            "alerts": (coverage * n).astype(np.int64),
+        }
+    )
+
 
 def add_fbeta(table: pd.DataFrame, beta: float) -> pd.DataFrame:
     b2 = beta * beta
@@ -217,12 +313,20 @@ def add_fbeta(table: pd.DataFrame, beta: float) -> pd.DataFrame:
     t["Fbeta"] = fbeta
     return t
 
-def pick_best(table: pd.DataFrame, min_precision: float, max_coverage: float,
-              metric: str) -> Dict[str, object]:
+
+def pick_best(
+    table: pd.DataFrame,
+    min_precision: float,
+    max_coverage: float,
+    metric: str,
+) -> Dict[str, object]:
     """
     Pick best row under constraints; if none feasible, pick 'nearest' by relaxing precision.
     """
-    feasible = table[(table["precision"] >= min_precision) & (table["coverage"] <= max_coverage)]
+    feasible = table[
+        (table["precision"] >= min_precision) &
+        (table["coverage"] <= max_coverage)
+    ]
     if len(feasible):
         row = feasible.loc[feasible[metric].idxmax()]
         status = "feasible"
@@ -246,17 +350,21 @@ def pick_best(table: pd.DataFrame, min_precision: float, max_coverage: float,
         "status": status,
     }
 
+
 def _fmt(res: dict, tag_label: str, score_key: str) -> None:
-    thr   = res.get("thr", np.nan)
-    scr   = res.get(score_key, 0.0)
-    P     = res.get("P", 0.0)
-    R     = res.get("R", 0.0)
-    Cov   = res.get("Cov", 0.0)
-    Alrt  = res.get("Alerts", None)
-    stat  = res.get("status", "unknown")
+    thr = res.get("thr", np.nan)
+    scr = res.get(score_key, 0.0)
+    P = res.get("P", 0.0)
+    R = res.get("R", 0.0)
+    Cov = res.get("Cov", 0.0)
+    Alrt = res.get("Alerts", None)
+    stat = res.get("status", "unknown")
     extra = f"  Alerts≈{Alrt:,}" if isinstance(Alrt, (int, np.integer)) else ""
-    print(f"Lead +{res.get('lead_h','?')}h → [{stat}]  Best {tag_label} = {scr:.3f} @ thr={thr:.3f} "
-          f"(P={P:.3f}, R={R:.3f})  Cov={Cov:.3f}{extra}")
+    print(
+        f"Lead +{res.get('lead_h','?')}h → [{stat}]  Best {tag_label} = {scr:.3f} @ thr={thr:.3f} "
+        f"(P={P:.3f}, R={R:.3f})  Cov={Cov:.3f}{extra}"
+    )
+
 
 # --------- diagnostics helpers ---------
 
@@ -271,31 +379,71 @@ def _warn_if_flat(table: pd.DataFrame, y: np.ndarray, lead_h: int, tag: str = ""
     if uniq_pts <= 3:
         print(f"[warn] lead={lead_h}h{tag}: PR curve has ≤3 distinct points (uniq_pts={uniq_pts}).")
 
+
 # --------- main ---------
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Fast constrained F1 / Fβ threshold finder (per-lead aware)")
+    ap = argparse.ArgumentParser(
+        description="Fast constrained F1 / Fβ threshold finder (per-lead aware)"
+    )
     ap.add_argument("--labelled", required=True, help="Labelled CSV(.gz) or Parquet")
     ap.add_argument("--model", required=True, help="Trained model bundle (joblib)")
-    ap.add_argument("--target", choices=["storm","near_storm","pregen"], default="pregen",
-                    help="Sharp base label used for training and (fallback) horizon windows.")
-    ap.add_argument("--success-col", default="storm_window",
-                    help="Success metric column (evaluated at t+lead on the same grid). "
-                         "If missing, we fall back to future window of --target per lead.")
-    ap.add_argument("--leads", nargs="+", type=int, required=True, help="Lead hours, e.g. 24 48 72")
+    ap.add_argument(
+        "--target",
+        choices=["storm", "near_storm", "pregen"],
+        default="pregen",
+        help="Sharp base label used for training and (fallback) horizon windows.",
+    )
+    ap.add_argument(
+        "--success-col",
+        default="storm_window",
+        help=(
+            "Success metric column (evaluated at t+lead on the same grid). "
+            "If missing, we fall back to future window of --target per lead."
+        ),
+    )
+    ap.add_argument(
+        "--leads",
+        nargs="+",
+        type=int,
+        required=True,
+        help="Lead hours, e.g. 24 48 72",
+    )
     ap.add_argument("--min-precision", type=float, default=0.12)
     ap.add_argument("--max-coverage", type=float, default=0.25)
     ap.add_argument("--fbeta", type=float, default=0.5)
     ap.add_argument("--out", required=True, help="CSV to save lead→thresholds")
-    ap.add_argument("--save-table", default=None, help="Optional CSV with per-threshold metrics (last lead)")
+    ap.add_argument(
+        "--save-table",
+        default=None,
+        help="Optional CSV with per-threshold metrics (last lead)",
+    )
     ap.add_argument("--verbose", action="store_true")
     # robustness flags:
-    ap.add_argument("--time-format", default=None, help="Optional custom time format for parsing.")
-    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="none",
-                    help="Normalize longitudes before processing.")
-    ap.add_argument("--area", default=None, help='Optional crop "latN,lonW,latS,lonE" after lon normalization.')
-    ap.add_argument("--prob-grid", type=int, default=1000, help="Threshold quantile grid size (default 1000).")
+    ap.add_argument(
+        "--time-format",
+        default=None,
+        help="Optional custom time format for parsing.",
+    )
+    ap.add_argument(
+        "--normalize-lon",
+        choices=["none", "-180..180", "0..360"],
+        default="none",
+        help="Normalize longitudes before processing.",
+    )
+    ap.add_argument(
+        "--area",
+        default=None,
+        help='Optional crop "latN,lonW,latS,lonE" after lon normalization.',
+    )
+    ap.add_argument(
+        "--prob-grid",
+        type=int,
+        default=1000,
+        help="Threshold quantile grid size (default 1000).",
+    )
     return ap.parse_args()
+
 
 def main():
     args = parse_args()
@@ -306,7 +454,10 @@ def main():
     print(f"Model    : {args.model}")
     print(f"Target   : {args.target}  | Success={args.success_col} (lead-aware)")
     print(f"Leads    : {args.leads}")
-    print(f"Constraints → min_precision={args.min_precision}  max_coverage={args.max_coverage}  β={args.fbeta}")
+    print(
+        f"Constraints → min_precision={args.min_precision}  "
+        f"max_coverage={args.max_coverage}  β={args.fbeta}"
+    )
     print(f"Out      : {args.out}")
 
     # Load bundle to know features and (optionally) per-lead models
@@ -319,45 +470,64 @@ def main():
     # Load & sanitize
     base = read_any(args.labelled, columns=columns)
 
-    # Ensure core cols exist (target may be missing only if success exists—handle below)
-    need = {"time","lat","lon"}
+    # Ensure core cols exist (target may be missing only if success exists—handled below)
+    need = {"time", "lat", "lon"}
     missing = need - set(base.columns)
     if missing:
         raise ValueError(f"Labelled file missing columns: {sorted(missing)}")
 
     base["time"] = _try_parse_time_raw(base["time"], args.time_format)
-    base["lat"]  = pd.to_numeric(base["lat"], errors="coerce")
-    base["lon"]  = _norm_lon(base["lon"], args.normalize_lon)
-    base = base.dropna(subset=["time","lat","lon"]).reset_index(drop=True)
+    base["lat"] = pd.to_numeric(base["lat"], errors="coerce")
+    base["lon"] = _norm_lon(base["lon"], args.normalize_lon)
+    base = base.dropna(subset=["time", "lat", "lon"]).reset_index(drop=True)
 
     # Optional AOI crop
     a = _parse_area(args.area)
     if a:
         latN, lonW, latS, lonE = a
-        base = base.loc[(base["lat"] <= latN) & (base["lat"] >= latS) &
-                        (base["lon"] >= lonW) & (base["lon"] <= lonE)].reset_index(drop=True)
+        base = base.loc[
+            (base["lat"] <= latN)
+            & (base["lat"] >= latS)
+            & (base["lon"] >= lonW)
+            & (base["lon"] <= lonE)
+        ].reset_index(drop=True)
 
     if not base.empty:
-        tmin = base["time"].min(); tmax = base["time"].max()
-        print(f"[domain] time: {tmin} → {tmax}  | rows: {len(base):,}")
-        print(f"[domain] lon:  {base['lon'].min():.3f} .. {base['lon'].max():.3f}  "
-              f"| lat: {base['lat'].min():.3f} .. {base['lat'].max():.3f}")
+        tmin = base["time"].min()
+        tmax = base["time"].max()
+        print(
+            f"[domain] time: {tmin} → {tmax}  | rows: {len(base):,}"
+        )
+        print(
+            f"[domain] lon:  {base['lon'].min():.3f} .. {base['lon'].max():.3f}  "
+            f"| lat: {base['lat'].min():.3f} .. {base['lat'].max():.3f}"
+        )
 
     success_available = args.success_col in base.columns
-    target_available  = args.target in base.columns
+    target_available = args.target in base.columns
 
     if not success_available and not target_available:
-        raise ValueError(f"Neither success_col '{args.success_col}' nor target '{args.target}' are present.")
+        raise ValueError(
+            f"Neither success_col '{args.success_col}' nor target '{args.target}' are present."
+        )
 
     # Build features once (aligned to trainer)
-    X = build_feature_matrix(base, feats, imputer_stats=imp_stats, clip_stats=clip_stats, scaler=scaler)
+    X = build_feature_matrix(
+        base,
+        feats,
+        imputer_stats=imp_stats,
+        clip_stats=clip_stats,
+        scaler=scaler,
+    )
 
     # For diagnostics only
     if target_available:
         y0 = pd.to_numeric(base[args.target], errors="coerce").fillna(0).astype(int).to_numpy()
         print(f"Rows: {len(base):,}  Pos(coincident {args.target} at t): {y0.sum():,}")
     else:
-        print(f"Rows: {len(base):,}  (no '{args.target}' present; using success only for selection)")
+        print(
+            f"Rows: {len(base):,}  (no '{args.target}' present; using success-only for selection)"
+        )
 
     results_rows = []
     last_table = None
@@ -365,22 +535,33 @@ def main():
     # Pre-build success lookup for lead-aware merging (same grid at t+lead)
     if success_available:
         succ = base[["time", "lat", "lon", args.success_col]].copy()
-        succ[args.success_col] = pd.to_numeric(succ[args.success_col], errors="coerce").fillna(0).astype(np.int8)
+        succ[args.success_col] = (
+            pd.to_numeric(succ[args.success_col], errors="coerce")
+            .fillna(0)
+            .astype(np.int8)
+        )
         succ = succ.dropna(subset=["time"]).reset_index(drop=True)
         succ = succ.sort_values("time", kind="mergesort")
     else:
         # we will compute per-lead future windows of target on the fly
-        base_small = base[["time","lat","lon", args.target]].copy()
-        base_small[args.target] = pd.to_numeric(base_small[args.target], errors="coerce").fillna(0).astype(np.int8)
+        base_small = base[["time", "lat", "lon", args.target]].copy()
+        base_small[args.target] = (
+            pd.to_numeric(base_small[args.target], errors="coerce")
+            .fillna(0)
+            .astype(np.int8)
+        )
 
     # Also keep features for joins
-    base_key = base[["time","lat","lon"]].copy()
+    base_key = base[["time", "lat", "lon"]].copy()
 
     # For anti-flattening checks
     last_pos = None
 
     for i, h in enumerate(args.leads, start=1):
-        print(f"\nLead +{h}h – scoring probabilities and sweeping thresholds … ({i}/{len(args.leads)})")
+        print(
+            f"\nLead +{h}h – scoring probabilities and sweeping thresholds … "
+            f"({i}/{len(args.leads)})"
+        )
 
         # Pick estimator for this lead (fallback to global)
         est = per_lead.get(h, model_global)
@@ -402,8 +583,15 @@ def main():
             # Align by shifting the *features clock* forward by +h and joining success at that time
             shifted = base_key.copy()
             shifted["time"] = shifted["time"] + pd.to_timedelta(int(h), unit="h")
-            y_df = shifted.merge(succ, on=["time","lat","lon"], how="left", validate="one_to_one")
-            y = pd.to_numeric(y_df[args.success_col], errors="coerce").fillna(0).astype(np.int8).to_numpy()
+            y_df = shifted.merge(
+                succ, on=["time", "lat", "lon"], how="left", validate="one_to_one"
+            )
+            y = (
+                pd.to_numeric(y_df[args.success_col], errors="coerce")
+                .fillna(0)
+                .astype(np.int8)
+                .to_numpy()
+            )
             label_mode = f"success={args.success_col} @ t+{h}h"
         else:
             # Fallback: build future-of-target window per lead (old behavior)
@@ -412,7 +600,9 @@ def main():
             label_mode = f"future_of_{args.target} (window={h}h)"
 
         pos = int(y.sum())
-        print(f"  • label mode: {label_mode} | positives={pos:,}  frac={pos/len(y):.4f}")
+        print(
+            f"  • label mode: {label_mode} | positives={pos:,}  frac={pos/len(y):.4f}"
+        )
         if last_pos is not None:
             d = pos - last_pos
             print(f"  • Δpositives vs prev lead: {d:+,}")
@@ -420,8 +610,10 @@ def main():
 
         # Early degeneracy flags (warn, but still compute)
         if pos == 0 or pos == len(y):
-            print(f"[warn] lead={h}h: label degeneracy (all zeros or all ones). "
-                  f"Threshold search will be uninformative.")
+            print(
+                f"[warn] lead={h}h: label degeneracy (all zeros or all ones). "
+                f"Threshold search will be uninformative."
+            )
 
         # Sweep thresholds under constraints
         tbl = sweep_thresholds(prob, y, q_grid=args.prob_grid)
@@ -431,9 +623,11 @@ def main():
         _warn_if_flat(tbl, y, h, tag="")
 
         if args.verbose:
-            print(tbl.describe(percentiles=[0.1,0.5,0.9]).to_string())
+            print(
+                tbl.describe(percentiles=[0.1, 0.5, 0.9]).to_string()
+            )
 
-        best_f1   = pick_best(tbl, args.min_precision, args.max_coverage, "F1")
+        best_f1 = pick_best(tbl, args.min_precision, args.max_coverage, "F1")
         best_fbet = pick_best(tbl, args.min_precision, args.max_coverage, "Fbeta")
         best_f1["lead_h"] = h
         best_fbet["lead_h"] = h
@@ -441,24 +635,26 @@ def main():
         _fmt(best_f1, "F1", "F1")
         _fmt(best_fbet, f"Fβ={args.fbeta}", "Fbeta")
 
-        results_rows.append({
-            "lead_h": h,
-            "thr_f1": best_f1["thr"],
-            "F1": best_f1["F1"],
-            "P_f1": best_f1["P"],
-            "R_f1": best_f1["R"],
-            "Cov_f1": best_f1["Cov"],
-            "Alerts_f1": best_f1["Alerts"],
-            "thr_Fbeta": best_fbet["thr"],
-            "Fbeta": best_fbet["Fbeta"],
-            "P_Fbeta": best_fbet["P"],
-            "R_Fbeta": best_fbet["R"],
-            "Cov_Fbeta": best_fbet["Cov"],
-            "Alerts_Fbeta": best_fbet["Alerts"],
-            "status_f1": best_f1["status"],
-            "status_Fbeta": best_fbet["status"],
-            "label_mode": label_mode,
-        })
+        results_rows.append(
+            {
+                "lead_h": h,
+                "thr_f1": best_f1["thr"],
+                "F1": best_f1["F1"],
+                "P_f1": best_f1["P"],
+                "R_f1": best_f1["R"],
+                "Cov_f1": best_f1["Cov"],
+                "Alerts_f1": best_f1["Alerts"],
+                "thr_Fbeta": best_fbet["thr"],
+                "Fbeta": best_fbet["Fbeta"],
+                "P_Fbeta": best_fbet["P"],
+                "R_Fbeta": best_fbet["R"],
+                "Cov_Fbeta": best_fbet["Cov"],
+                "Alerts_Fbeta": best_fbet["Alerts"],
+                "status_f1": best_f1["status"],
+                "status_Fbeta": best_fbet["status"],
+                "label_mode": label_mode,
+            }
+        )
 
         last_table = tbl
 
@@ -472,6 +668,7 @@ def main():
     if args.save_table and last_table is not None:
         last_table.to_csv(args.save_table, index=False)
         print(f"\nSaved threshold curve (last lead) → {args.save_table}")
+
 
 if __name__ == "__main__":
     main()

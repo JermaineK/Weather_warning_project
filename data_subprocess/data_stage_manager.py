@@ -5,7 +5,7 @@
 data_stage_manager.py
 
 Thin front door for data staging + heuristic scoring + IBTrACS matching +
-threshold feature mining + probability prediction.
+threshold feature mining + probability prediction + per-lead logit training.
 
 Current tools (script filenames in brackets):
 
@@ -14,16 +14,18 @@ Current tools (script filenames in brackets):
   - ibtracs-match     [ibtracs_match.py]
   - thresholds-scan   [thresholds_scan.py]
   - predict-prob      [predict_storm_probability.py]
+  - train-logit       [train_per_lead_logit.py]
 
 This manager does no heavy lifting itself; it just selects the script
 and forwards the remaining CLI arguments as-is. It is designed to be
 called from run_pipeline.py, e.g.:
 
-  python data_subprocess/data_stage_manager.py stage-data  --config ...
+  python data_subprocess/data_stage_manager.py stage-data      --config ...
   python data_subprocess/data_stage_manager.py score-heuristic --scoring-src ...
-  python data_subprocess/data_stage_manager.py ibtracs-match --alerts ... --tracks ...
+  python data_subprocess/data_stage_manager.py ibtracs-match   --alerts ... --tracks ...
   python data_subprocess/data_stage_manager.py thresholds-scan --alerts-with-targets ...
-  python data_subprocess/data_stage_manager.py predict-prob --scoring-src ...
+  python data_subprocess/data_stage_manager.py predict-prob    --scoring-src ...
+  python data_subprocess/data_stage_manager.py train-logit     --labelled ... --out ...
 
 Dash/underscore variants are accepted via normalisation.
 """
@@ -44,6 +46,7 @@ SCRIPT_MAP: Dict[str, str] = {
     "ibtracs-match":   "ibtracs_match.py",
     "thresholds-scan": "thresholds_scan.py",
     "predict-prob":    "predict_storm_probability.py",
+    "train-logit":     "train_per_lead_logit.py",
 }
 
 ALIASES: Dict[str, str] = {
@@ -51,19 +54,26 @@ ALIASES: Dict[str, str] = {
     "stage":      "stage-data",
     "stage_data": "stage-data",
 
-    "score":          "score-heuristic",
-    "heuristic":      "score-heuristic",
-    "heuristic-score":"score-heuristic",
+    "score":           "score-heuristic",
+    "heuristic":       "score-heuristic",
+    "heuristic-score": "score-heuristic",
 
-    "ibtracs":        "ibtracs-match",
-    "match":          "ibtracs-match",
+    "ibtracs":         "ibtracs-match",
+    "match":           "ibtracs-match",
 
-    "scan":           "thresholds-scan",
-    "thr-scan":       "thresholds-scan",
+    "scan":            "thresholds-scan",
+    "thr-scan":        "thresholds-scan",
 
-    "predict":        "predict-prob",
-    "predict_prob":   "predict-prob",
-    "prob":           "predict-prob",
+    "predict":         "predict-prob",
+    "predict_prob":    "predict-prob",
+    "prob":            "predict-prob",
+
+    # new trainer aliases
+    "train":                 "train-logit",
+    "train_logit":           "train-logit",
+    "train-perlead-logit":   "train-logit",
+    "train_per_lead_logit":  "train-logit",
+    "perlead-logit":         "train-logit",
 }
 
 
@@ -127,7 +137,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=(
             "Data-stage manager: staging, heuristic scoring, IBTrACS matching, "
-            "threshold feature mining, and probability prediction."
+            "threshold feature mining, probability prediction, and per-lead logit training."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -135,7 +145,8 @@ def main() -> int:
         "tool",
         help=(
             "Which data-stage tool to run "
-            "(stage-data, score-heuristic, ibtracs-match, thresholds-scan, predict-prob). "
+            "(stage-data, score-heuristic, ibtracs-match, thresholds-scan, "
+            "predict-prob, train-logit). "
             "Dash/underscore variants and simple aliases are accepted."
         ),
     )

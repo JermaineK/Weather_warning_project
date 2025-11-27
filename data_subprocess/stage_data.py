@@ -30,7 +30,14 @@ Handy extras:
 """
 
 from __future__ import annotations
-import argparse, glob, hashlib, json, os, shutil, sys, tempfile
+import argparse
+import glob
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -68,7 +75,7 @@ EMBEDDED_CONFIG: Dict[str, Any] = {
     #
     # Typical setup for your use-case:
     #   id_build_enable: true
-    #   id_src: data/grid_labelled_FMA_gka_realthermo.parquet.parquet
+    #   id_src: data/grid_labelled_FMA_gka_realthermo.parquet
     #   id_extra_src: data/grid_labelled_FMA_gka_realthermo_sph.csv.gz
     #   id_key_out: data/grid_key_table.csv.gz
     #   id_full_out: data/grid_labelled_FMA_gka_realthermo_with_id.csv.gz
@@ -77,7 +84,7 @@ EMBEDDED_CONFIG: Dict[str, Any] = {
     #                  "shear_deep","S","div","v10","SFI","SFI2",...]
     "id_build_enable": False,
     "id_src": None,
-    "id_extra_src": None,   # NEW: optional extra file to merge on time/lat/lon
+    "id_extra_src": None,   # optional extra file to merge on time/lat/lon
     "id_key_out": None,
     "id_full_out": None,
     "id_slim_out": None,
@@ -91,9 +98,11 @@ EMBEDDED_CONFIG: Dict[str, Any] = {
 def _is_parquet(p: Path) -> bool:
     return p.suffix.lower() in {".parquet", ".parq", ".pq", ".pqt"}
 
+
 def _is_csv_like(p: Path) -> bool:
     n = p.name.lower()
     return n.endswith(".csv") or n.endswith(".csv.gz") or n.endswith(".gz")
+
 
 def _sha256_file(path: Path, bufsize: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
@@ -102,14 +111,18 @@ def _sha256_file(path: Path, bufsize: int = 1024 * 1024) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
 def _to_utc_naive(series: pd.Series, fmt: Optional[str]) -> pd.Series:
     # accept already-datetime; otherwise parse
     if pd.api.types.is_datetime64_any_dtype(series):
         t = pd.to_datetime(series, utc=True, errors="coerce")
         return t.dt.tz_convert(None)
     raw = series.astype(str).str.strip().str.replace("Z", "", regex=False)
-    t = pd.to_datetime(raw, format=fmt, utc=True, errors="coerce") if fmt else pd.to_datetime(raw, utc=True, errors="coerce")
+    t = pd.to_datetime(raw, format=fmt, utc=True, errors="coerce") if fmt else pd.to_datetime(
+        raw, utc=True, errors="coerce"
+    )
     return t.dt.tz_convert(None)
+
 
 def _canon_norm_mode(mode: str) -> str:
     """Accepts ' -180..180' and other spacey variants."""
@@ -122,6 +135,7 @@ def _canon_norm_mode(mode: str) -> str:
         return "none"
     return "-180..180"
 
+
 def _norm_lon(vals: pd.Series, mode: str) -> pd.Series:
     x = pd.to_numeric(vals, errors="coerce")
     mode = _canon_norm_mode(mode)
@@ -132,17 +146,20 @@ def _norm_lon(vals: pd.Series, mode: str) -> pd.Series:
     # default → "-180..180"
     return ((x + 180.0) % 360.0) - 180.0
 
+
 def _parse_area(aoi: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
     if not aoi:
         return None
     latN, lonW, latS, lonE = [float(z.strip()) for z in str(aoi).split(",")]
     return latN, lonW, latS, lonE
 
+
 def _apply_aoi(df: pd.DataFrame, aoi: Tuple[float, float, float, float], latc: str, lonc: str) -> pd.DataFrame:
     N, W, S, E = aoi
     latv = pd.to_numeric(df[latc], errors="coerce")
     lonv = pd.to_numeric(df[lonc], errors="coerce")
     return df.loc[(latv <= N) & (latv >= S) & (lonv >= W) & (lonv <= E)]
+
 
 def _first_present(cols: List[str], cands: List[str]) -> Optional[str]:
     s = set(cols)
@@ -151,10 +168,12 @@ def _first_present(cols: List[str], cands: List[str]) -> Optional[str]:
             return c
     return None
 
+
 def _lat_lon_names(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
     lat = _first_present(list(df.columns), ["lat", "latitude", "Lat", "Latitude"])
     lon = _first_present(list(df.columns), ["lon", "longitude", "Lon", "Longitude"])
     return lat, lon
+
 
 def _safe_swap_write(tmp_path: Path, dest_path: Path):
     # Windows-safe replace
@@ -163,8 +182,10 @@ def _safe_swap_write(tmp_path: Path, dest_path: Path):
         dest_path.unlink()
     tmp_path.replace(dest_path)
 
+
 def _print(*a, **k):
     print(*a, **k, flush=True)
+
 
 # -------------------- config loader/merger --------------------
 
@@ -174,6 +195,7 @@ def _as_list(x: Any) -> List[str]:
     if isinstance(x, (list, tuple)):
         return [str(y) for y in x]
     return [str(x)]
+
 
 def load_config_file(path: Optional[str]) -> Dict[str, Any]:
     if not path:
@@ -201,14 +223,23 @@ def load_config_file(path: Optional[str]) -> Dict[str, Any]:
         out[k.replace("-", "_")] = v
     return out
 
+
 def normalize_config_shapes(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(cfg)
     out["sanitize"] = _as_list(out.get("sanitize"))
     out["scan"] = _as_list(out.get("scan"))
     for key in (
-        "time_col", "time_format", "normalize_lon", "area",
-        "manifest", "manifest_root",
-        "id_src", "id_extra_src", "id_key_out", "id_full_out", "id_slim_out",
+        "time_col",
+        "time_format",
+        "normalize_lon",
+        "area",
+        "manifest",
+        "manifest_root",
+        "id_src",
+        "id_extra_src",
+        "id_key_out",
+        "id_full_out",
+        "id_slim_out",
     ):
         if key in out and out[key] is not None:
             out[key] = str(out[key])
@@ -236,6 +267,7 @@ def normalize_config_shapes(cfg: Dict[str, Any]) -> Dict[str, Any]:
         out["id_chunk_rows"] = int(out["id_chunk_rows"])
     return out
 
+
 def merge_cli_over(base: Dict[str, Any], override_ns: argparse.Namespace) -> Dict[str, Any]:
     defaults = {
         "sanitize": [],
@@ -248,7 +280,6 @@ def merge_cli_over(base: Dict[str, Any], override_ns: argparse.Namespace) -> Dic
         "manifest": "staged/manifest.json",
         "manifest_root": ".",
         "hash": False,
-
         # ID builder defaults
         "id_build_enable": False,
         "id_src": None,
@@ -264,9 +295,12 @@ def merge_cli_over(base: Dict[str, Any], override_ns: argparse.Namespace) -> Dic
     # merge CLI on top where provided
     for k in defaults.keys():
         cli_val = getattr(override_ns, k, defaults[k])
-        if cli_val is not None and cli_val != defaults[k] and not (isinstance(cli_val, list) and cli_val == []):
+        if cli_val is not None and cli_val != defaults[k] and not (
+            isinstance(cli_val, list) and cli_val == []
+        ):
             merged[k] = cli_val
     return merged
+
 
 # -------------------- core: sanitize CSV in place --------------------
 
@@ -387,6 +421,7 @@ def sanitize_csv_inplace(
         lon_max=None if np.isnan(lon_max) else float(lon_max),
     )
 
+
 # -------------------- generic chunk iterator for CSV / Parquet --------------------
 
 def _iter_table_chunks(src: Path, chunk_rows: int = 500_000):
@@ -398,6 +433,7 @@ def _iter_table_chunks(src: Path, chunk_rows: int = 500_000):
         # Prefer streaming by row-group via pyarrow; fall back to a single pandas.read_parquet
         try:
             import pyarrow.parquet as pq  # type: ignore
+
             pf = pq.ParquetFile(str(src))
             for rg in range(pf.num_row_groups):
                 table = pf.read_row_group(rg)
@@ -412,20 +448,21 @@ def _iter_table_chunks(src: Path, chunk_rows: int = 500_000):
     else:
         low = src.name.lower()
         compression = "gzip" if low.endswith(".gz") else "infer"
-        rdr = pd.read_csv(src, compression=compression,
-                          low_memory=False, chunksize=chunk_rows)
+        rdr = pd.read_csv(src, compression=compression, low_memory=False, chunksize=chunk_rows)
         if not hasattr(rdr, "__iter__"):
             rdr = [rdr]
         for ch in rdr:
             if ch is not None and not ch.empty:
                 yield ch
 
-# -------------------- ID builder helper (streamed) --------------------
+
+# -------------------- ID builder helpers --------------------
 
 def _guess_time_col(cols: List[str], hint: str = "time") -> Optional[str]:
     if hint in cols:
         return hint
     return _first_present(cols, ["time", "datetime", "valid_time", "time_h"])
+
 
 def build_ids_from_csv(
     src: Path,
@@ -446,12 +483,11 @@ def build_ids_from_csv(
     row_id is a 64-bit stable hash of (time_floor_H, lat_round3, lon_round3),
     via pandas.util.hash_pandas_object.
 
-    Lead/label info is *not* included in the ID; that will be attached later.
-
-    If extra_src is provided, it is streamed in lockstep and non-key columns
-    from extra_src are merged into the full/slim tables, assuming row-aligned
-    and matching time/lat/lon.
+    If extra_src is provided, non-key columns from extra_src are merged into
+    each chunk by (time, lat, lon). Any duplicates in extra_src for a given
+    key are collapsed by keeping the first row for that key in the chunk.
     """
+
     # --- normalize slim_cols so we tolerate comma-joined args ---
     norm_cols: List[str] = []
     for item in (slim_cols or []):
@@ -485,98 +521,22 @@ def build_ids_from_csv(
     )
 
     key_comp = "gzip" if key_out.name.lower().endswith(".gz") else "infer"
-    full_comp = None
-    slim_comp = None
-    if full_out is not None:
-        full_comp = "gzip" if full_out.name.lower().endswith(".gz") else "infer"
-    if slim_out is not None:
-        slim_comp = "gzip" if slim_out.name.lower().endswith(".gz") else "infer"
+    full_comp = "gzip" if (full_out and full_out.name.lower().endswith(".gz")) else "infer"
+    slim_comp = "gzip" if (slim_out and slim_out.name.lower().endswith(".gz")) else "infer"
 
     extra_iter = None
-    merge_extra_enabled = False
-    if extra_src is not None:
-        if extra_src.exists():
-            extra_iter = _iter_table_chunks(extra_src, chunk_rows)
-            merge_extra_enabled = True
-        else:
-            _print(f"[id-build] extra_src specified but not found: {extra_src}; skipping extra merge.")
+    if extra_src is not None and extra_src.exists():
+        _print(f"[id-build] enabling extra merge from {extra_src}")
+        extra_iter = _iter_table_chunks(extra_src, chunk_rows)
+    elif extra_src is not None:
+        _print(f"[id-build] extra_src specified but not found: {extra_src}; skipping extra merge.")
 
-    for i, chunk in enumerate(_iter_table_chunks(src, chunk_rows), start=1):
-        base_chunk = chunk
-
-        # Try to merge extra chunk (if configured and still considered aligned)
-        merged_chunk = base_chunk
-        extra_chunk = None
-        if merge_extra_enabled and extra_iter is not None:
-            try:
-                extra_chunk = next(extra_iter)
-            except StopIteration:
-                _print("[id-build] extra_src exhausted before main src; disabling extra merge.")
-                merge_extra_enabled = False
-                extra_chunk = None
-
-        if extra_chunk is not None:
-            # Basic sanity: row counts must match
-            if len(extra_chunk) != len(base_chunk):
-                _print(
-                    f"[id-build] chunk {i}: extra rows={len(extra_chunk)} "
-                    f"!= main rows={len(base_chunk)}; disabling extra merge for remaining chunks."
-                )
-                merge_extra_enabled = False
-            else:
-                # Check we have matching time/lat/lon columns and that a few rows align
-                base_cols = list(base_chunk.columns)
-                extra_cols_list = list(extra_chunk.columns)
-
-                tcol_base = _guess_time_col(base_cols, hint=time_col_hint)
-                latc_base, lonc_base = _lat_lon_names(base_chunk)
-
-                tcol_extra = _guess_time_col(extra_cols_list, hint=time_col_hint)
-                latc_extra, lonc_extra = _lat_lon_names(extra_chunk)
-
-                if not tcol_base or not latc_base or not lonc_base or not tcol_extra or not latc_extra or not lonc_extra:
-                    _print(
-                        f"[id-build] chunk {i}: missing time/lat/lon in extra/main; "
-                        "disabling extra merge for remaining chunks."
-                    )
-                    merge_extra_enabled = False
-                else:
-                    # Compare first few rows of keys
-                    n_check = min(5, len(base_chunk))
-                    base_keys = pd.DataFrame({
-                        "time": _to_utc_naive(base_chunk[tcol_base], None).iloc[:n_check].reset_index(drop=True),
-                        "lat": pd.to_numeric(base_chunk[latc_base], errors="coerce").iloc[:n_check].round(3).reset_index(drop=True),
-                        "lon": pd.to_numeric(base_chunk[lonc_base], errors="coerce").iloc[:n_check].round(3).reset_index(drop=True),
-                    })
-                    extra_keys = pd.DataFrame({
-                        "time": _to_utc_naive(extra_chunk[tcol_extra], None).iloc[:n_check].reset_index(drop=True),
-                        "lat": pd.to_numeric(extra_chunk[latc_extra], errors="coerce").iloc[:n_check].round(3).reset_index(drop=True),
-                        "lon": pd.to_numeric(extra_chunk[lonc_extra], errors="coerce").iloc[:n_check].round(3).reset_index(drop=True),
-                    })
-                    if not base_keys.equals(extra_keys):
-                        _print(
-                            f"[id-build] chunk {i}: extra_src keys (time/lat/lon) "
-                            "do not match main; disabling extra merge for remaining chunks."
-                        )
-                        merge_extra_enabled = False
-                    else:
-                        # Merge extra non-key, non-duplicate columns into base chunk by row order
-                        merged_chunk = base_chunk.copy()
-                        key_names = {tcol_extra, latc_extra, lonc_extra}
-                        for col in extra_cols_list:
-                            if col in key_names:
-                                continue
-                            if col in merged_chunk.columns:
-                                # keep main's version
-                                continue
-                            merged_chunk[col] = extra_chunk[col].values
-        # Use merged_chunk for feature outputs; base_chunk for keys/ID
-        chunk = merged_chunk
+    for i, base_chunk in enumerate(_iter_table_chunks(src, chunk_rows), start=1):
+        chunk = base_chunk
 
         cols = list(chunk.columns)
         if cols_seen is None:
             cols_seen = len(cols)
-            # log first chunk columns + requested slim cols for debugging
             _print(f"[id-build] first chunk columns: {cols}")
             _print(f"[id-build] requested slim cols: {slim_cols}")
 
@@ -587,29 +547,109 @@ def build_ids_from_csv(
             _print(f"[id-build] {src.name}: missing time/lat/lon in chunk {i}, skipping.")
             continue
 
-        # Normalize key fields
-        t = _to_utc_naive(chunk[tcol], None)
-        # floor to hour so small timing jitter doesn't destroy IDs,
-        # but still unique at (date+hour,lat,lon)
-        t_floor = t.dt.floor("H")
-        latv = pd.to_numeric(chunk[latc], errors="coerce")
-        lonv = pd.to_numeric(chunk[lonc], errors="coerce")
+        # Normalized keys for base
+        base_time = _to_utc_naive(chunk[tcol], None)
+        base_lat = pd.to_numeric(chunk[latc], errors="coerce").round(3)
+        base_lon = pd.to_numeric(chunk[lonc], errors="coerce").round(3)
+        base_keys = pd.DataFrame({"time": base_time, "lat": base_lat, "lon": base_lon})
 
-        # hash input frame (small, fixed column set)
+        # --- attempt to merge extra_src on (time, lat, lon) for this chunk ---
+        if extra_iter is not None:
+            try:
+                extra_chunk = next(extra_iter)
+            except StopIteration:
+                _print("[id-build] extra_src exhausted; no further extra merges.")
+                extra_iter = None
+                extra_chunk = None
+
+            if extra_chunk is not None:
+                extra_cols_list = list(extra_chunk.columns)
+                tcol_extra = _guess_time_col(extra_cols_list, hint=time_col_hint)
+                latc_extra, lonc_extra = _lat_lon_names(extra_chunk)
+
+                if not tcol_extra or not latc_extra or not lonc_extra:
+                    _print(
+                        f"[id-build] chunk {i}: extra_src missing time/lat/lon; "
+                        "disabling extra merge for remaining chunks."
+                    )
+                    extra_iter = None
+                else:
+                    extra_time = _to_utc_naive(extra_chunk[tcol_extra], None)
+                    extra_lat = pd.to_numeric(extra_chunk[latc_extra], errors="coerce").round(3)
+                    extra_lon = pd.to_numeric(extra_chunk[lonc_extra], errors="coerce").round(3)
+
+                    extra_nonkey = [
+                        c for c in extra_cols_list
+                        if c not in {tcol_extra, latc_extra, lonc_extra}
+                    ]
+
+                    if extra_nonkey:
+                        extra_join = pd.concat(
+                            [
+                                pd.DataFrame({"time": extra_time, "lat": extra_lat, "lon": extra_lon}),
+                                extra_chunk[extra_nonkey].reset_index(drop=True),
+                            ],
+                            axis=1,
+                        )
+
+                        # collapse duplicates per (time,lat,lon) in extra_src chunk
+                        before = len(extra_join)
+                        extra_join = (
+                            extra_join
+                            .sort_values(["time", "lat", "lon"])
+                            .drop_duplicates(subset=["time", "lat", "lon"], keep="first")
+                        )
+                        dup_dropped = before - len(extra_join)
+                        if dup_dropped > 0:
+                            _print(
+                                f"[id-build] chunk {i}: dropped {dup_dropped} duplicate "
+                                "extra rows on (time,lat,lon)."
+                            )
+
+                        merged = base_keys.merge(
+                            extra_join,
+                            on=["time", "lat", "lon"],
+                            how="left",
+                            sort=False,
+                        )
+
+                        # sanity: must remain one row per base row
+                        if len(merged) != len(chunk):
+                            _print(
+                                f"[id-build] chunk {i}: merged rows={len(merged)} != base rows={len(chunk)}; "
+                                "disabling extra merge for remaining chunks."
+                            )
+                            extra_iter = None
+                        else:
+                            for col in extra_nonkey:
+                                if col in chunk.columns:
+                                    continue  # keep base version
+                                chunk[col] = merged[col].values
+
+                            _print(
+                                f"[id-build] chunk {i}: merged extra cols {extra_nonkey} "
+                                f"(matches={merged[extra_nonkey].notna().any(axis=1).sum():,})"
+                            )
+                    else:
+                        _print(f"[id-build] chunk {i}: no extra non-key columns; nothing to merge.")
+
+        # --- build IDs and outputs from (possibly merged) chunk ---
+
+        # floor time to hour for ID
+        t_floor = base_time.dt.floor("H")
+
         hash_frame = pd.DataFrame({
             "time": t_floor,
-            "lat": latv.round(3),
-            "lon": lonv.round(3),
+            "lat": base_lat,
+            "lon": base_lon,
         })
-
         row_id = hash_pandas_object(hash_frame, index=False).astype("uint64")
 
-        # key table: keep normalized time/lat/lon
         key_chunk = pd.DataFrame({
             "row_id": row_id,
             "time": t_floor,
-            "lat": latv,
-            "lon": lonv,
+            "lat": base_lat,
+            "lon": base_lon,
         })
 
         # stats
@@ -619,14 +659,14 @@ def build_ids_from_csv(
             tmax = t_floor.max()
             time_min = tmin if time_min is None else min(time_min, tmin)
             time_max = tmax if time_max is None else max(time_max, tmax)
-        if latv.notna().any():
-            lat_min = float(min(lat_min, latv.min()))
-            lat_max = float(max(lat_max, latv.max()))
-        if lonv.notna().any():
-            lon_min = float(min(lon_min, lonv.min()))
-            lon_max = float(max(lon_max, lonv.max()))
+        if base_lat.notna().any():
+            lat_min = float(min(lat_min, base_lat.min()))
+            lat_max = float(max(lat_max, base_lat.max()))
+        if base_lon.notna().any():
+            lon_min = float(min(lon_min, base_lon.min()))
+            lon_max = float(max(lon_max, base_lon.max()))
 
-        # write key table
+        # key table
         key_chunk.to_csv(
             key_out,
             index=False,
@@ -637,10 +677,9 @@ def build_ids_from_csv(
         )
         key_first = False
 
-        # full table: row_id + all original (merged) columns
+        # full table
         if full_out is not None:
             full_chunk = chunk.copy()
-            # insert row_id at front
             full_chunk.insert(0, "row_id", row_id.values)
             full_chunk.to_csv(
                 full_out,
@@ -686,6 +725,7 @@ def build_ids_from_csv(
         lon_max=None if np.isnan(lon_max) else float(lon_max),
     )
 
+
 # -------------------- scan only (Parquet / read-only) --------------------
 
 def scan_only(path: Path, time_col_hint: str = "time") -> Dict:
@@ -703,6 +743,7 @@ def scan_only(path: Path, time_col_hint: str = "time") -> Dict:
             # Metadata-only path to avoid loading giant tables into RAM
             try:
                 import pyarrow.parquet as pq  # type: ignore
+
                 pf = pq.ParquetFile(str(path))
                 md = pf.metadata
                 if md is not None:
@@ -745,53 +786,154 @@ def scan_only(path: Path, time_col_hint: str = "time") -> Dict:
         _print(f"[scan] {path.name}: {e}")
 
     return dict(
-        rows=rows, cols=cols, time_min=time_min, time_max=time_max,
-        lat_min=lat_min, lat_max=lat_max, lon_min=lon_min, lon_max=lon_max,
-        bytes=bytes_, type=dtype
+        rows=rows,
+        cols=cols,
+        time_min=time_min,
+        time_max=time_max,
+        lat_min=lat_min,
+        lat_max=lat_max,
+        lon_min=lon_min,
+        lon_max=lon_max,
+        bytes=bytes_,
+        type=dtype,
     )
+
 
 # -------------------- main --------------------
 
 def main():
     ap = argparse.ArgumentParser(description="Stage data (sanitize & manifest).")
-    ap.add_argument("--config", default=None, help="YAML/JSON config file. CLI overrides values in this file.")
-    ap.add_argument("--use-embedded-config", action="store_true",
-                    help="Apply the embedded config block at the top of this script.")
-    ap.add_argument("--print-embedded-config", action="store_true",
-                    help="Print the embedded config (JSON) and exit.")
-    ap.add_argument("--save-embedded-config", default=None,
-                    help="Save the embedded config (JSON) to the given path and exit.")
+    ap.add_argument(
+        "--config",
+        default=None,
+        help="YAML/JSON config file. CLI overrides values in this file.",
+    )
+    ap.add_argument(
+        "--use-embedded-config",
+        action="store_true",
+        help="Apply the embedded config block at the top of this script.",
+    )
+    ap.add_argument(
+        "--print-embedded-config",
+        action="store_true",
+        help="Print the embedded config (JSON) and exit.",
+    )
+    ap.add_argument(
+        "--save-embedded-config",
+        default=None,
+        help="Save the embedded config (JSON) to the given path and exit.",
+    )
 
-    ap.add_argument("--sanitize", nargs="*", default=[], help="Glob(s) of CSV/CSV.GZ files to clean in place")
-    ap.add_argument("--scan", nargs="*", default=[], help="Extra files/globs to include in the manifest (no rewrite)")
-    ap.add_argument("--time-col", dest="time_col", default="time", help="Timestamp column (default: time)")
-    ap.add_argument("--time-format", dest="time_format", default=None, help="Optional strptime format")
-    ap.add_argument("--normalize-lon", dest="normalize_lon",
-                    choices=["-180..180", "0..360", "none"], default="-180..180")
-    ap.add_argument("--area", default=None, help='Optional AOI "latN,lonW,latS,lonE"')
-    ap.add_argument("--chunk-rows", dest="chunk_rows", type=int, default=1_000_000,
-                    help="CSV chunk size")
-    ap.add_argument("--manifest", default="staged/manifest.json", help="Manifest JSON path")
-    ap.add_argument("--manifest-root", dest="manifest_root", default=".", help="Base path for relative manifest paths")
-    ap.add_argument("--hash", action="store_true", help="Compute SHA256 for each file (slower)")
+    ap.add_argument(
+        "--sanitize",
+        nargs="*",
+        default=[],
+        help="Glob(s) of CSV/CSV.GZ files to clean in place",
+    )
+    ap.add_argument(
+        "--scan",
+        nargs="*",
+        default=[],
+        help="Extra files/globs to include in the manifest (no rewrite)",
+    )
+    ap.add_argument(
+        "--time-col",
+        dest="time_col",
+        default="time",
+        help="Timestamp column (default: time)",
+    )
+    ap.add_argument(
+        "--time-format",
+        dest="time_format",
+        default=None,
+        help="Optional strptime format",
+    )
+    ap.add_argument(
+        "--normalize-lon",
+        dest="normalize_lon",
+        choices=["-180..180", "0..360", "none"],
+        default="-180..180",
+    )
+    ap.add_argument(
+        "--area",
+        default=None,
+        help='Optional AOI "latN,lonW,latS,lonE"',
+    )
+    ap.add_argument(
+        "--chunk-rows",
+        dest="chunk_rows",
+        type=int,
+        default=1_000_000,
+        help="CSV chunk size",
+    )
+    ap.add_argument(
+        "--manifest",
+        default="staged/manifest.json",
+        help="Manifest JSON path",
+    )
+    ap.add_argument(
+        "--manifest-root",
+        dest="manifest_root",
+        default=".",
+        help="Base path for relative manifest paths",
+    )
+    ap.add_argument(
+        "--hash",
+        action="store_true",
+        help="Compute SHA256 for each file (slower)",
+    )
 
     # ID builder CLI
-    ap.add_argument("--id-build-enable", dest="id_build_enable", action="store_true",
-                    help="Enable ID/key+slim generation from a rich CSV/Parquet file")
-    ap.add_argument("--id-src", dest="id_src", default=None,
-                    help="Source rich CSV(.gz) or Parquet to derive row_id/time/lat/lon from")
-    ap.add_argument("--id-extra-src", dest="id_extra_src", default=None,
-                    help="Optional extra CSV/Parquet with matching time/lat/lon to merge before ID build")
-    ap.add_argument("--id-key-out", dest="id_key_out", default=None,
-                    help="Output key CSV(.gz) with row_id,time,lat,lon")
-    ap.add_argument("--id-full-out", dest="id_full_out", default=None,
-                    help="Optional output full CSV(.gz) with row_id + all original columns (plus extras)")
-    ap.add_argument("--id-slim-out", dest="id_slim_out", default=None,
-                    help="Optional output slim CSV(.gz) with row_id + selected features")
-    ap.add_argument("--id-slim-cols", dest="id_slim_cols", nargs="*", default=None,
-                    help="Columns to keep in slim scoring table")
-    ap.add_argument("--id-chunk-rows", dest="id_chunk_rows", type=int, default=None,
-                    help="Chunk size for ID builder (defaults to chunk_rows)")
+    ap.add_argument(
+        "--id-build-enable",
+        dest="id_build_enable",
+        action="store_true",
+        help="Enable ID/key+slim generation from a rich CSV/Parquet file",
+    )
+    ap.add_argument(
+        "--id-src",
+        dest="id_src",
+        default=None,
+        help="Source rich CSV(.gz) or Parquet to derive row_id/time/lat/lon from",
+    )
+    ap.add_argument(
+        "--id-extra-src",
+        dest="id_extra_src",
+        default=None,
+        help="Optional extra CSV/Parquet with matching time/lat/lon to merge before ID build",
+    )
+    ap.add_argument(
+        "--id-key-out",
+        dest="id_key_out",
+        default=None,
+        help="Output key CSV(.gz) with row_id,time,lat,lon",
+    )
+    ap.add_argument(
+        "--id-full-out",
+        dest="id_full_out",
+        default=None,
+        help="Optional output full CSV(.gz) with row_id + all original columns (plus extras)",
+    )
+    ap.add_argument(
+        "--id-slim-out",
+        dest="id_slim_out",
+        default=None,
+        help="Optional output slim CSV(.gz) with row_id + selected features",
+    )
+    ap.add_argument(
+        "--id-slim-cols",
+        dest="id_slim_cols",
+        nargs="*",
+        default=None,
+        help="Columns to keep in slim scoring table",
+    )
+    ap.add_argument(
+        "--id-chunk-rows",
+        dest="id_chunk_rows",
+        type=int,
+        default=None,
+        help="Chunk size for ID builder (defaults to chunk_rows)",
+    )
 
     ns = ap.parse_args()
 
@@ -799,7 +941,9 @@ def main():
         print(json.dumps(EMBEDDED_CONFIG, indent=2))
         return
     if ns.save_embedded_config:
-        Path(ns.save_embedded_config).write_text(json.dumps(EMBEDDED_CONFIG, indent=2), encoding="utf-8")
+        Path(ns.save_embedded_config).write_text(
+            json.dumps(EMBEDDED_CONFIG, indent=2), encoding="utf-8"
+        )
         print(f"Saved embedded config → {ns.save_embedded_config}")
         return
 
@@ -830,7 +974,7 @@ def main():
         return files
 
     sanitize_targets = _expand_many(merged.get("sanitize", []))
-    scan_targets     = _expand_many(merged.get("scan", []))
+    scan_targets = _expand_many(merged.get("scan", []))
 
     if (not sanitize_targets and not scan_targets and not merged.get("id_build_enable")):
         _print("[stage] Nothing to do. Provide --sanitize/--scan or enable id-build.")
@@ -881,7 +1025,9 @@ def main():
         stats = scan_only(p, time_col_hint=merged["time_col"])
         # Avoid duplicate keys when building dict(...)
         stats.pop("bytes", None)
-        typ = stats.pop("type", None) or ("parquet" if _is_parquet(p) else ("csv" if _is_csv_like(p) else "file"))
+        typ = stats.pop("type", None) or (
+            "parquet" if _is_parquet(p) else ("csv" if _is_csv_like(p) else "file")
+        )
         rec = dict(
             path=str(p.relative_to(root)) if str(p).startswith(str(root)) else str(p),
             bytes=p.stat().st_size,
@@ -903,7 +1049,9 @@ def main():
         full_out_str = merged.get("id_full_out") or ""
         slim_out_str = merged.get("id_slim_out") or ""
         slim_cols = merged.get("id_slim_cols") or []
-        id_chunk_rows = int(merged.get("id_chunk_rows") or merged.get("chunk_rows") or 500_000)
+        id_chunk_rows = int(
+            merged.get("id_chunk_rows") or merged.get("chunk_rows") or 500_000
+        )
 
         src_path = Path(src_str) if src_str else None
         extra_src_path = Path(extra_src_str) if extra_src_str else None
@@ -931,7 +1079,9 @@ def main():
             # key table record
             if key_out.exists():
                 rec = dict(
-                    path=str(key_out.relative_to(root)) if str(key_out).startswith(str(root)) else str(key_out),
+                    path=str(key_out.relative_to(root))
+                    if str(key_out).startswith(str(root))
+                    else str(key_out),
                     bytes=key_out.stat().st_size,
                     type="csv",
                     **stats,
@@ -945,7 +1095,9 @@ def main():
             # full table record (existing data + row_id)
             if full_out and full_out.exists():
                 rec_full = dict(
-                    path=str(full_out.relative_to(root)) if str(full_out).startswith(str(root)) else str(full_out),
+                    path=str(full_out.relative_to(root))
+                    if str(full_out).startswith(str(root))
+                    else str(full_out),
                     bytes=full_out.stat().st_size,
                     type="csv",
                     rows=stats["rows"],
@@ -966,7 +1118,9 @@ def main():
             # slim table record
             if slim_out and slim_out.exists():
                 rec_slim = dict(
-                    path=str(slim_out.relative_to(root)) if str(slim_out).startswith(str(root)) else str(slim_out),
+                    path=str(slim_out.relative_to(root))
+                    if str(slim_out).startswith(str(root))
+                    else str(slim_out),
                     bytes=slim_out.stat().st_size,
                     type="csv",
                     rows=stats["rows"],
@@ -990,6 +1144,7 @@ def main():
     manifest = {"files": records}
     out_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     _print(f"[stage] manifest → {out_manifest}  (files={len(records)})")
+
 
 if __name__ == "__main__":
     try:

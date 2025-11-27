@@ -1,0 +1,151 @@
+---
+Features Pipeline — Mini README
+(build → patch → join → GKA → thermo → spherical → bulk-shear → join-features)
+This directory contains the feature-generation pipeline for the storm-analysis dataset.
+Each script does one job only, and features_manager.py acts as the unified front door.
+The philosophy is: small tools, predictable flags, safe merges, no silent type surprises.
+
+1. The Manager (features_manager.py)
+Call everything through:
+python features_manager.py <mode> [flags...]
+
+Available modes:
+
+
+build
+build_features_grid.py
+Build the base lat/lon/time grid & raw diagnostics
+
+
+patch
+features_patch.py
+Patch broken or missing columns in a features table
+
+
+join
+join_labels_grid.py
+Attach storm labels / pregen flags
+
+
+gka
+compute_gka_features.py
+Add GKA + geometric-kernel features
+
+
+integrate-thermo
+integrate_era5_thermo.py
+Merge ERA5 thermo (t2m, msl, u10/v10)
+
+
+spherical-feedback / spherical
+compute_spherical_feedback.py
+Compute radial/center/vdr/t2m anomalies
+
+
+bulk-shear
+features_bulk_shear.py
+Compute pressure-level shear + S3
+
+
+join-features
+features_join_features.py
+Merge any two feature tables on (time,lat,lon)
+
+
+
+Dry-run to inspect the command:
+python features_manager.py gka --dry-run --infile x --outfile y
+
+Manager does light flag rewrites (mainly in join) and whitespace cleanup for comma lists (mainly in join-features). It never touches data.
+
+2. Typical End-to-End Flow
+A canonical feature build looks like:
+# 1. Base grid
+python features_manager.py build --out grid_base.parquet
+
+# 2. Patch / quick fixes
+python features_manager.py patch --in grid_base.parquet --out grid_base_patched.parquet
+
+# 3. Attach storm labels
+python features_manager.py join --features grid_base_patched.parquet \
+                                --labels labels.csv \
+                                --out grid_labelled.parquet
+
+# 4. GKA + geometric-kernel responses
+python features_manager.py gka --infile grid_labelled.parquet \
+                               --outfile grid_gka.parquet \
+                               --allow-S-from-S3
+
+# 5. Integrate ERA5 thermo
+python features_manager.py integrate-thermo \
+    --features grid_gka.parquet \
+    --thermo-glob "era5_single/*.nc" \
+    --out grid_gka_thermo.parquet
+
+# 6. Spherical-feedback features
+python features_manager.py spherical \
+    --infile grid_gka_thermo.parquet \
+    --out grid_sphfb.parquet
+
+# 7. Bulk shear (pressure-level)
+python features_manager.py bulk-shear \
+    --pl-glob "era5_pl_uv/*.nc" \
+    --out bulk_shear.parquet \
+    --low-pair 1000,925 \
+    --deep-pair 1000,500 \
+    --s3-window 3
+
+# 8. Merge shear+S3 into the main table
+python features_manager.py join-features \
+    --left grid_sphfb.parquet \
+    --right bulk_shear.parquet \
+    --on "time, lat, lon" \
+    --out grid_final.parquet
+
+Everything remains column-aligned and lon-normalized across steps.
+
+3. Notes on S3 (bulk shear)
+features_bulk_shear.py produces:
+
+shear_low
+shear_deep
+S3 (rolling-smoothed low or deep shear)
+
+features_join_features.py attaches it with a left join:
+
+If the left table has no S3, the new S3 becomes the canonical S3.
+If the left table does have an S3, the incoming one becomes S3_r.
+
+No manager intervention happens here; all merging logic lives in the join script.
+
+4. Lon Consistency
+Every script normalizes longitude on entry (-180..180 by default).
+Manager never overrides this; it only passes your flag through unchanged:
+--normalize-lon -180..180
+
+Downstream scripts are robust to extra whitespace (" -180..180").
+
+5. Joining Rules
+join-features uses:
+left.merge(right, on=["time","lat","lon"], how="left")
+
+So right-hand columns only add data; nothing is dropped.
+Manager trims whitespace in:
+--on "time, lat, lon"  →  "time,lat,lon"
+
+ensuring the keys resolve cleanly.
+
+6. CSV/Parquet Interop
+Every tool accepts:
+
+.parquet, .parq, .pq
+.csv / .csv.gz
+
+I/O is unified so you can mix formats freely:
+python features_manager.py gka \
+    --infile data.csv.gz \
+    --outfile out.parquet
+
+
+In short
+The manager gives the pipeline a stable, human-friendly interface, while letting each component remain clean and modular. Keep using it as the front door — every dependency and normalization step stays consistent, and debugging stays local to the actual worker script.

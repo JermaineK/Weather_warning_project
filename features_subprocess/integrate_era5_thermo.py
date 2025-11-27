@@ -1,78 +1,137 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-integrate_era5_thermo.py  — streaming, low-memory integrator (v3)
+integrate_era5_thermo.py
 
-- Streams features in batches (Parquet or CSV) and ERA5 single-level NetCDFs per file.
-- Exact (time,lat,lon) merge or per-hour nearest-neighbor merge.
-- Version-robust for pyarrow.dataset (no .scan()).
-- Avoids Arrow→Pandas ExtensionArray pitfalls:
-    * no types_mapper
-    * no predeclared schema — writer created from first output batch
+Integrate ERA5 single-level fields (u10, v10, msl, t2m) back into a large
+feature table (e.g. grid_labelled_FMA_gka.parquet), month-by-month, in a
+memory-conscious way.
+
+Key points
+----------
+* Input features: CSV/CSV.GZ/Parquet, with columns at least: time, lat, lon
+* ERA5 thermo: one or more NetCDFs (e.g. era5_single_YYYYMM_oper.nc)
+* Matching is on (time, lat, lon) using ERA5’s own grid coordinates
+* No fragile integer index tricks; a preserved __idx column is used when
+  writing merged thermo values back into the big features DataFrame.
+
+CLI (example)
+-------------
+python integrate_era5_thermo.py \
+    --features data/grid_labelled_FMA_gka.parquet \
+    --thermo-glob "data_era5/extracted/**/era5_single_*_*.nc" \
+    --out data/grid_labelled_FMA_gka_realthermo.parquet \
+    --normalize-lon "-180..180" \
+    --area "-5,125,-35,175" \
+    --nearest --nearest-maxdeg 0.4
 """
 
 from __future__ import annotations
-import argparse, glob, sys, math, warnings
+import argparse
+import glob
 from pathlib import Path
-from typing import Iterable, Optional, List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+pd.options.mode.copy_on_write = True
 
-import pyarrow as pa
-import pyarrow.dataset as ds
-import pyarrow.parquet as pq
+# ---------- ERA5 alias and coord helpers (borrowed from build_features_grid.py) ----------
 
-# Optional KDTree for nearest mode
-try:
-    from scipy.spatial import cKDTree
-    HAVE_KDTREE = True
-except Exception:
-    HAVE_KDTREE = False
+ALIASES = {
+    "u10": ["u10", "10m_u_component_of_wind", "U10M", "u_10m"],
+    "v10": ["v10", "10m_v_component_of_wind", "V10M", "v_10m"],
+    "msl": ["msl", "mean_sea_level_pressure", "MSL", "prmsl"],
+    "t2m": ["t2m", "2m_temperature", "T2M", "t_2m"],
+}
 
-# ---------------- CLI ----------------
+POSSIBLE_TIME_NAMES = ("time", "valid_time", "forecast_reference_time")
+POSSIBLE_LAT_NAMES  = ("lat", "latitude", "Latitude", "nav_lat")
+POSSIBLE_LON_NAMES  = ("lon", "longitude", "Longitude", "nav_lon")
 
-def parse_args():
-    ap = argparse.ArgumentParser(description="Integrate ERA5 thermo onto features (streaming, low-memory).")
-    ap.add_argument("--features", required=True, help="Features table (Parquet or CSV(.gz))")
 
-    # prefer thermo_glob; accept nc_glob alias
-    ap.add_argument("--thermo-glob", default=None, help="Glob of ERA5 single-level *.nc files")
-    ap.add_argument("--nc-glob",     default=None, help="Alias of --thermo-glob")
+def _pick_coord_name(cands, present):
+    for c in cands:
+        if c in present:
+            return c
+    return None
 
-    ap.add_argument("--out", required=True, help="Output: Parquet or CSV(.gz)")
 
-    ap.add_argument("--normalize-lon",
-                    choices=["none","-180..180","0..360"," -180..180"," 0..360"],
-                    default="none")
+def _resolve_alias(name: str | None, present: set[str], key: str) -> str | None:
+    """
+    Resolve a variable name inside an xarray Dataset, using an explicit name
+    if provided, otherwise an alias list for that key.
+    """
+    if name and name in present:
+        return name
+    if key in ALIASES:
+        for cand in ALIASES[key]:
+            if cand in present:
+                return cand
+    # if user supplied one of the alias strings explicitly, map it to the
+    # first present candidate
+    if name and key in ALIASES and name in ALIASES[key]:
+        for cand in ALIASES[key]:
+            if cand in present:
+                return cand
+    return None
 
-    ap.add_argument("--vars", nargs="*", default=["u10","v10","msl","t2m"],
-                    help="Thermo vars to extract and attach")
 
-    ap.add_argument("--nearest", action="store_true",
-                    help="Per-hour nearest-neighbor instead of exact (time,lat,lon) join")
-    ap.add_argument("--nearest-maxdeg", type=float, default=0.4,
-                    help="Angular threshold (deg) for nearest; outside → NaN")
+def collapse_expver(ds: xr.Dataset) -> xr.Dataset:
+    """Handle expver dimension in ERA5 (1/5 merge) the same way as build_features_grid."""
+    if "expver" not in ds.dims:
+        return ds
+    try:
+        values = set(np.array(ds.coords["expver"].values).tolist())
+        if 1 in values:
+            ds1 = ds.sel(expver=1)
+            if 5 in values:
+                ds5 = ds.sel(expver=5)
+                ds = ds1.combine_first(ds5)
+            else:
+                ds = ds1
+        else:
+            ds = ds.isel(expver=0)
+    except Exception:
+        ds = ds.isel(expver=0)
+    return ds.squeeze(drop=True)
 
-    ap.add_argument("--row-group-rows", type=int, default=1_000_000,
-                    help="Parquet row group size when writing")
-    ap.add_argument("--scan-batch-rows", type=int, default=500_000,
-                    help="Max rows per batch read from features (Parquet)")
-    ap.add_argument("--csv-chunk-rows", type=int, default=1_000_000,
-                    help="Rows per CSV write chunk")
 
-    ap.add_argument("--engine", default=None, help="xarray engine hint")
-    ap.add_argument("--overwrite", action="store_true")
-    ap.add_argument("--quiet", action="store_true")
-    return ap.parse_args()
+def normalize_coords(ds: xr.Dataset,
+                     time_name: str | None = None,
+                     lat_name: str | None = None,
+                     lon_name: str | None = None) -> xr.Dataset:
+    ds = collapse_expver(ds)
+    present = set(ds.dims) | set(ds.coords)
+    t_in  = time_name or _pick_coord_name(POSSIBLE_TIME_NAMES, present)
+    la_in = lat_name  or _pick_coord_name(POSSIBLE_LAT_NAMES,  present)
+    lo_in = lon_name  or _pick_coord_name(POSSIBLE_LON_NAMES,  present)
+    if not all([t_in, la_in, lo_in]):
+        raise ValueError(f"Missing coords: time={t_in}, lat={la_in}, lon={lo_in}")
 
-# ---------------- lon helpers ----------------
+    ren = {}
+    if t_in  != "time": ren[t_in]  = "time"
+    if la_in != "lat":  ren[la_in] = "lat"
+    if lo_in != "lon":  ren[lo_in] = "lon"
+    if ren:
+        ds = ds.rename(ren)
+    for c in ("time", "lat", "lon"):
+        if c in ds and c not in ds.coords:
+            ds = ds.set_coords(c)
+    return ds
 
-def _canon_norm(mode: str) -> str:
-    return (mode or "none").strip()
+
+def _canon_norm(mode: str | None) -> str:
+    mode = (mode or "none").strip()
+    if mode in ("-180..180", "0..360", "none"):
+        return mode
+    if mode.replace(" ", "") == "-180..180":
+        return "-180..180"
+    if mode.replace(" ", "") == "0..360":
+        return "0..360"
+    return "none"
+
 
 def reframe_lon_vals(lon_vals: np.ndarray, mode: str) -> np.ndarray:
     mode = _canon_norm(mode)
@@ -80,348 +139,278 @@ def reframe_lon_vals(lon_vals: np.ndarray, mode: str) -> np.ndarray:
         return lon_vals
     if mode == "0..360":
         return (lon_vals % 360 + 360) % 360
+    # default -180..180
     return ((lon_vals + 180) % 360) - 180
 
-# ---------------- NetCDF → DataFrame ----------------
 
-def _open_dataset_with_fallback(path: str, hint: Optional[str]):
-    engines = [hint] if hint else []
-    engines += ["netcdf4", "h5netcdf", "scipy"]
-    for eng in engines:
-        if eng is None: continue
-        try:
-            return xr.open_dataset(path, engine=eng)
-        except Exception:
-            pass
-    return xr.open_dataset(path)
-
-def _nc_to_frame(nc_path: str, vars_wanted: List[str], norm_lon: str) -> pd.DataFrame:
-    dsx = _open_dataset_with_fallback(nc_path, hint=None)
-
-    def _pick(cands):
-        for c in cands:
-            if c in dsx.coords or c in dsx.dims:
-                return c
-        return None
-
-    tname = _pick(("time","valid_time","forecast_reference_time"))
-    latn  = _pick(("lat","latitude","Latitude","nav_lat"))
-    lonn  = _pick(("lon","longitude","Longitude","nav_lon"))
-    if not all([tname, latn, lonn]):
-        raise ValueError(f"Missing coords in {nc_path}: time={tname}, lat={latn}, lon={lonn}")
-    ren = {}
-    if tname!="time": ren[tname]="time"
-    if latn!="lat":   ren[latn]="lat"
-    if lonn!="lon":   ren[lonn]="lon"
-    if ren: dsx = dsx.rename(ren)
-
-    # expver collapse
-    if "expver" in dsx.dims:
-        try:
-            values = set(np.array(dsx.coords["expver"].values).tolist())
-            if 1 in values:
-                ds1 = dsx.sel(expver=1)
-                if 5 in values:
-                    ds5 = dsx.sel(expver=5)
-                    dsx = ds1.combine_first(ds5)
-                else:
-                    dsx = ds1
-            else:
-                dsx = dsx.isel(expver=0)
-        except Exception:
-            dsx = dsx.isel(expver=0)
-        dsx = dsx.squeeze(drop=True)
-
-    # reframe longitudes and sort
-    lon2 = reframe_lon_vals(dsx["lon"].to_numpy(), norm_lon)
+def reframe_lon_ds(ds: xr.Dataset, mode: str) -> xr.Dataset:
+    mode = _canon_norm(mode)
+    if mode == "none":
+        return ds
+    lon2 = reframe_lon_vals(ds["lon"].to_numpy(), mode)
     order = np.argsort(lon2)
-    dsx = dsx.assign_coords(lon=("lon", lon2))
+    ds = ds.assign_coords(lon=("lon", lon2))
     if not np.all(order == np.arange(len(lon2))):
-        dsx = dsx.sortby("lon")
+        ds = ds.sortby("lon")
+    return ds
 
-    present = set(dsx.data_vars)
-    alias_map = {
-        "u10": ["u10","10m_u_component_of_wind","U10M","u_10m"],
-        "v10": ["v10","10m_v_component_of_wind","V10M","v_10m"],
-        "msl": ["msl","mean_sea_level_pressure","MSL","prmsl"],
-        "t2m": ["t2m","2m_temperature","T2M","t_2m"],
-    }
-    keep: Dict[str,str] = {}
-    for want in vars_wanted:
-        if want in present:
-            keep[want] = want
-        elif want in alias_map:
-            for a in alias_map[want]:
-                if a in present:
-                    keep[want] = a
-                    break
 
-    vars_real = list(set(keep.values()))
-    if vars_real:
-        sub = dsx[vars_real]
-        rev = {v:k for k,v in keep.items()}
-        sub = sub.rename({v: rev.get(v, v) for v in vars_real})
-        df = sub.to_dataframe().reset_index()
+def parse_area(aoi: str | None):
+    if not aoi:
+        return None
+    latN, lonW, latS, lonE = [float(x.strip()) for x in aoi.split(",")]
+    return latN, lonW, latS, lonE
+
+
+def select_aoi_ds(ds: xr.Dataset, aoi):
+    if not aoi:
+        return ds
+    latN, lonW, latS, lonE = aoi
+    ds = ds.sel(lon=slice(lonW, lonE))
+    lat_vals = ds["lat"].values
+    if lat_vals[0] <= lat_vals[-1]:
+        ds = ds.sel(lat=slice(latS, latN))
     else:
-        df = dsx[[]].to_dataframe().reset_index()
+        ds = ds.sel(lat=slice(latN, latS))
+    return ds
 
-    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
-    for c in vars_wanted:
-        if c in df.columns and pd.api.types.is_float_dtype(df[c]):
-            df[c] = df[c].astype("float32")
 
-    keep_cols = ["time","lat","lon"] + [c for c in vars_wanted if c in df.columns]
-    df = df[keep_cols].dropna(subset=["time","lat","lon"]).reset_index(drop=True)
-    dsx.close()
+# ---------- generic I/O helpers ----------
+
+def load_any_table(path: str) -> pd.DataFrame:
+    """Load features file (CSV/CSV.GZ/Parquet)."""
+    p = str(path).lower()
+    if p.endswith((".parquet", ".parq", ".pq")):
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(
+            path,
+            compression="infer",
+            low_memory=False,
+            encoding_errors="replace",
+            on_bad_lines="skip",
+            parse_dates=["time"],
+        )
+    if "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
     return df
 
-def _time_bounds(df: pd.DataFrame) -> Tuple[pd.Timestamp, pd.Timestamp]:
-    return (pd.to_datetime(df["time"]).min(), pd.to_datetime(df["time"]).max())
 
-# ---------------- Feature dataset helpers ----------------
-
-def _dataset_for_features(path: str):
-    low = str(path).lower()
-    if low.endswith((".parquet",".parq",".pq")):
-        return "parquet", ds.dataset(path, format="parquet")
-    return "csv", None  # CSV handled via pandas chunker
-
-def _csv_batches(path: str, chunksize: int, t0: pd.Timestamp, t1: pd.Timestamp):
-    it = pd.read_csv(path, chunksize=chunksize, low_memory=False, parse_dates=["time"])
-    for chunk in it:
-        mask = (chunk["time"] >= t0) & (chunk["time"] <= t1)
-        sub = chunk.loc[mask].copy()
-        if not sub.empty:
-            yield sub
-
-def _append_csv(path: str, df: pd.DataFrame, first: bool):
-    comp = "gzip" if str(path).lower().endswith(".gz") else "infer"
-    df.to_csv(path, index=False, mode=("w" if first else "a"), header=first,
-              compression=comp, date_format="%Y-%m-%d %H:%M:%S")
-
-# ---------- nearest-neighbor utilities ----------
-
-def _gc_dist_deg(lat1, lon1, lat2, lon2):
-    rlat1 = np.radians(lat1); rlat2 = np.radians(lat2)
-    rdlon = np.radians(lon1 - lon2)
-    rdlon = (rdlon + np.pi) % (2*np.pi) - np.pi
-    sin2 = np.sin((rlat2-rlat1)/2.0)**2 + np.cos(rlat1)*np.cos(rlat2)*np.sin(rdlon/2.0)**2
-    ang = 2*np.arcsin(np.minimum(1.0, np.sqrt(sin2)))
-    return np.degrees(ang)
-
-def _nearest_join_hour(hrows: pd.DataFrame, era_hour: pd.DataFrame, maxdeg: float) -> pd.DataFrame:
-    if era_hour.empty or hrows.empty:
-        return hrows
-
-    thermo_cols = [c for c in era_hour.columns if c not in ("time","lat","lon")]
-
-    if not HAVE_KDTREE:
-        out_vals = {c: np.full(len(hrows), np.nan, dtype=era_hour[c].dtype if c in era_hour else float)
-                    for c in thermo_cols}
-        for i, (la, lo) in enumerate(hrows[["lat","lon"]].to_numpy()):
-            box = era_hour[(np.abs(era_hour["lat"]-la)<=maxdeg) & (np.abs(era_hour["lon"]-lo)<=maxdeg)]
-            if box.empty:
-                continue
-            d = _gc_dist_deg(la, lo, box["lat"].to_numpy(), box["lon"].to_numpy())
-            j = int(np.argmin(d))
-            if d[j] <= maxdeg:
-                row = box.iloc[j]
-                for c in thermo_cols: out_vals[c][i] = row[c]
-        for c, arr in out_vals.items(): hrows[c] = arr
-        return hrows
-
-    lat0 = float(np.clip(np.nanmean(era_hour["lat"].to_numpy()), -80, 80))
-    x = era_hour["lon"].to_numpy() * np.cos(np.radians(lat0))
-    y = era_hour["lat"].to_numpy()
-    tree = cKDTree(np.c_[x, y])
-
-    tx = hrows["lon"].to_numpy() * np.cos(np.radians(lat0))
-    ty = hrows["lat"].to_numpy()
-    _, idx = tree.query(np.c_[tx, ty], k=1, workers=-1)
-
-    cand = era_hour.iloc[idx].reset_index(drop=True)
-    ang = _gc_dist_deg(hrows["lat"].to_numpy(), hrows["lon"].to_numpy(),
-                       cand["lat"].to_numpy(), cand["lon"].to_numpy())
-    ok = ang <= maxdeg
-    for c in thermo_cols:
-        vals = cand[c].to_numpy()
-        out = np.full(len(hrows), np.nan, dtype=vals.dtype)
-        out[ok] = vals[ok]
-        hrows[c] = out
-    return hrows
-
-# ---------------- main integrate ----------------
-
-def integrate(features_path: str,
-              nc_files: List[str],
-              out_path: str,
-              norm_lon: str,
-              vars_wanted: List[str],
-              nearest: bool,
-              nearest_maxdeg: float,
-              row_group_rows: int,
-              scan_batch_rows: int,
-              csv_chunk_rows: int,
-              engine_hint: Optional[str],
-              quiet: bool):
-    if not nc_files:
-        raise SystemExit("No thermo NetCDF files found.")
-
-    feats_kind, feats_ds = _dataset_for_features(features_path)
-    feats_is_parquet = (feats_kind == "parquet")
-
-    # Output prep (lazy writer creation to avoid schema issues)
-    out_lower = str(out_path).lower()
-    is_parquet_out = out_lower.endswith((".parquet",".parq",".pq"))
-    outp = Path(out_path)
-    if outp.exists():
-        outp.unlink()
-
-    writer = None    # pq.ParquetWriter, created on first batch
-    csv_first = not is_parquet_out
-    total_rows = 0
-
-    # Determine desired column order from a tiny features sample (names only).
-    if feats_is_parquet:
-        scanner0 = ds.Scanner.from_dataset(feats_ds, columns=None, filter=None, batch_size=min(50_000, scan_batch_rows))
-        b0 = next(scanner0.to_batches(), None)
-        if b0 is None:
-            raise SystemExit("Features table appears empty.")
-        feat_cols = list(b0.schema.names)
+def write_any_table(path: str, df: pd.DataFrame) -> None:
+    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+    low = p.name.lower()
+    if low.endswith((".parquet", ".parq", ".pq")):
+        df.to_parquet(p, index=False)
     else:
-        sm = pd.read_csv(features_path, nrows=1000, low_memory=False)
-        feat_cols = list(sm.columns)
-        del sm
+        comp = "gzip" if (low.endswith(".csv.gz") or p.suffix.lower() == ".gz") else "infer"
+        df.to_csv(p, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
 
-    thermo_cols = [c for c in vars_wanted if c not in ("time","lat","lon")]
-    desired_order = feat_cols + [c for c in thermo_cols if c not in feat_cols]
 
-    # Process each monthly NetCDF
-    for i, nc in enumerate(sorted(nc_files), 1):
-        era = _nc_to_frame(nc, vars_wanted=vars_wanted, norm_lon=norm_lon)
-        if not quiet:
-            kept = [c for c in era.columns if c not in ("time","lat","lon")]
-            print(f"[{i}/{len(nc_files)}] {Path(nc).name}: rows={len(era):,} vars={kept}")
-        if era.empty:
+# ---------- thermo flattening ----------
+
+def flatten_era5_single(path: str,
+                        normalize_lon: str,
+                        area_box,
+                        engine: str | None = None) -> pd.DataFrame:
+    """
+    Open a single ERA5 single-level file, extract u10,v10,msl,t2m (if present),
+    normalize lon + AOI, and flatten to a tidy DataFrame with time,lat,lon,...
+    """
+    print(f"[thermo] open {Path(path).name}", flush=True)
+    # engine hint + fallback
+    engines = [engine] if engine else []
+    engines += ["netcdf4", "h5netcdf", "scipy"]
+    ds = None
+    tried = []
+    for eng in engines:
+        if eng is None:
             continue
+        try:
+            ds = xr.open_dataset(path, engine=eng)
+            break
+        except Exception as e:
+            tried.append((eng, str(e)[:80]))
+    if ds is None:
+        # last resort: let xarray guess
+        ds = xr.open_dataset(path)
 
-        t0, t1 = _time_bounds(era)
+    ds = normalize_coords(ds)
+    ds = reframe_lon_ds(ds, normalize_lon)
+    ds = select_aoi_ds(ds, area_box)
 
-        if feats_is_parquet:
-            t0_ns = pd.Timestamp(t0).to_datetime64()
-            t1_ns = pd.Timestamp(t1).to_datetime64()
-            tf = (ds.field("time") >= pa.scalar(t0_ns, type=pa.timestamp('ns'))) & \
-                 (ds.field("time") <= pa.scalar(t1_ns, type=pa.timestamp('ns')))
-            scanner = ds.Scanner.from_dataset(feats_ds, columns=None, filter=tf, batch_size=scan_batch_rows)
-            batch_iter = scanner.to_batches()
-        else:
-            batch_iter = _csv_batches(features_path, chunksize=scan_batch_rows, t0=t0, t1=t1)
+    present_vars = set(ds.data_vars)
+    u_name = _resolve_alias(None, present_vars, "u10")
+    v_name = _resolve_alias(None, present_vars, "v10")
+    msl_name = _resolve_alias(None, present_vars, "msl")
+    t2m_name = _resolve_alias(None, present_vars, "t2m")
 
-        # Iterate feature batches
-        for batch in batch_iter:
-            if feats_is_parquet:
-                # Robust: ignore metadata, let pandas infer; downcast later
-                pdf = batch.to_pandas(ignore_metadata=True)
-            else:
-                pdf = batch  # already pandas DataFrame
+    keep = []
+    if u_name and v_name:
+        keep += [u_name, v_name]
+    if msl_name:
+        keep.append(msl_name)
+    if t2m_name:
+        keep.append(t2m_name)
 
-            if pdf.empty:
-                continue
+    if not keep:
+        print(f"[thermo] {Path(path).name}: no core vars (u10/v10/msl/t2m) found; skipping.")
+        ds.close()
+        return pd.DataFrame(columns=["time","lat","lon"])
 
-            if not np.issubdtype(pdf["time"].dtype, np.datetime64):
-                pdf["time"] = pd.to_datetime(pdf["time"], utc=True, errors="coerce").dt.tz_localize(None)
+    sub = ds[keep]
+    # downcast to float32 for IO savings
+    for v in list(sub.data_vars):
+        if np.issubdtype(sub[v].dtype, np.floating):
+            sub[v] = sub[v].astype("float32")
 
-            # Ensure thermo columns exist
-            for c in thermo_cols:
-                if c not in pdf.columns:
-                    pdf[c] = np.nan
+    df = sub.to_dataframe().reset_index()
+    # ensure time/lat/lon are columns, drop any all-NaN rows
+    for c in ("time","lat","lon"):
+        if c not in df.columns and c in df.index.names:
+            df = df.reset_index(c)
+    df = df.dropna(subset=["time","lat","lon"])
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
+    df["lat"]  = pd.to_numeric(df["lat"], errors="coerce").astype("float32")
+    df["lon"]  = pd.to_numeric(df["lon"], errors="coerce").astype("float32")
 
-            if not nearest:
-                joined = pdf.merge(era, on=["time","lat","lon"], how="left", suffixes=("", "_thermo"))
-            else:
-                # per-hour nearest map
-                for t, idx in pdf.groupby(pdf["time"].dt.floor("H"), sort=False).indices.items():
-                    hrows = pdf.loc[idx, ["time","lat","lon"]].copy()
-                    era_h = era.loc[era["time"] == t, :]
-                    if era_h.empty:
-                        continue
-                    out_h = _nearest_join_hour(hrows, era_h, maxdeg=nearest_maxdeg)
-                    for c in [col for col in era.columns if col not in ("time","lat","lon")]:
-                        pdf.loc[idx, c] = out_h[c].to_numpy()
-                joined = pdf
+    # unify var names to canonical u10,v10,msl,t2m
+    ren = {}
+    if u_name and u_name != "u10": ren[u_name] = "u10"
+    if v_name and v_name != "v10": ren[v_name] = "v10"
+    if msl_name and msl_name != "msl": ren[msl_name] = "msl"
+    if t2m_name and t2m_name != "t2m": ren[t2m_name] = "t2m"
+    if ren:
+        df = df.rename(columns=ren)
 
-            # Downcast float64 → float32 to keep memory in check
-            for c in joined.select_dtypes(include=["float64"]).columns:
-                joined[c] = joined[c].astype("float32")
+    # auto-convert MSL Pa→hPa if needed
+    if "msl" in df.columns:
+        try:
+            med = float(np.nanmedian(df["msl"].to_numpy()))
+            if med > 2000.0:  # pretty safe Pa vs hPa separator
+                df["msl"] = df["msl"] / 100.0
+        except Exception:
+            pass
 
-            # Reorder columns to stable order (features first, then thermo)
-            for c in desired_order:
-                if c not in joined.columns:
-                    joined[c] = np.nan
-            joined = joined[[c for c in desired_order if c in joined.columns]]
+    keep_cols = ["time","lat","lon"]
+    for c in ("u10","v10","msl","t2m"):
+        if c in df.columns:
+            keep_cols.append(c)
+    df = df[keep_cols].sort_values(["time","lat","lon"], kind="mergesort").reset_index(drop=True)
 
-            if is_parquet_out:
-                table = pa.Table.from_pandas(joined, preserve_index=False)
-                if writer is None:
-                    writer = pq.ParquetWriter(out_path, schema=table.schema,
-                                              compression="zstd", use_dictionary=True, write_statistics=True)
-                writer.write_table(table, row_group_size=row_group_rows)
-            else:
-                if len(joined) > csv_chunk_rows:
-                    for start in range(0, len(joined), csv_chunk_rows):
-                        _append_csv(out_path, joined.iloc[start:start+csv_chunk_rows], first=csv_first)
-                        csv_first = False
-                else:
-                    _append_csv(out_path, joined, first=csv_first)
-                    csv_first = False
+    print(f"[thermo] {Path(path).name}: rows={len(df):,} vars={keep_cols[3:]}", flush=True)
+    ds.close()
+    return df
 
-            total_rows += len(joined)
-            del joined, pdf
-        del era
 
-    if writer is not None:
-        writer.close()
+# ---------- CLI + main ----------
 
-    if not quiet:
-        print(f"[ok] wrote {out_path}  rows≈{total_rows:,}")
+def parse_args():
+    ap = argparse.ArgumentParser(
+        description="Integrate ERA5 single-level thermo fields back into a feature table."
+    )
+    ap.add_argument("--features", required=True,
+                    help="Input feature table (CSV/CSV.GZ/Parquet) with time,lat,lon.")
+    ap.add_argument("--thermo-glob", default=None,
+                    help="Glob for ERA5 single-level NetCDFs (e.g. data_era5/extracted/**/era5_single_*_*.nc)")
+    ap.add_argument("--nc-glob", default=None,
+                    help="Alias for --thermo-glob (for older YAMLs).")
+    ap.add_argument("--out", required=True,
+                    help="Output features with thermo columns added/overwritten.")
+    ap.add_argument("--engine", default=None,
+                    help="Optional xarray engine hint: netcdf4, h5netcdf, scipy, cfgrib")
+    ap.add_argument("--normalize-lon", default="-180..180",
+                    help="Lon mode: ' -180..180', '-180..180', '0..360', 'none'")
+    ap.add_argument("--area", default=None,
+                    help='Optional AOI "latN,lonW,latS,lonE" applied when reading ERA5.')
+    # kept for compatibility; we currently do exact (time,lat,lon) join
+    ap.add_argument("--nearest", action="store_true",
+                    help="(Currently a no-op: exact (time,lat,lon) merge is used.)")
+    ap.add_argument("--nearest-maxdeg", type=float, default=0.4,
+                    help="Unused placeholder for future nearest-neighbour matching.")
+    return ap.parse_args()
 
-# ---------------- entry ----------------
 
-if __name__ == "__main__":
+def main():
     args = parse_args()
+    feat_path = Path(args.features)
+    out_path = Path(args.out)
 
     thermo_glob = args.thermo_glob or args.nc_glob
     if not thermo_glob:
-        print("ERROR: provide --thermo-glob (or --nc-glob).", file=sys.stderr)
-        sys.exit(2)
+        raise SystemExit("Must supply --thermo-glob or --nc-glob")
 
     nc_files = sorted(glob.glob(thermo_glob, recursive=True))
     if not nc_files:
-        print("ERROR: No NetCDF files matched.", file=sys.stderr)
-        sys.exit(2)
+        raise SystemExit(f"No ERA5 thermo files found for pattern: {thermo_glob}")
 
-    outp = Path(args.out)
-    if outp.exists() and not args.overwrite:
-        print(f"ERROR: Outfile exists; use --overwrite: {outp}", file=sys.stderr)
-        sys.exit(2)
-    if outp.exists() and args.overwrite:
-        outp.unlink()
+    area_box = parse_area(args.area)
+    lon_mode = _canon_norm(args.normalize_lon)
 
-    try:
-        integrate(
-            features_path=args.features,
-            nc_files=nc_files,
-            out_path=args.out,
-            norm_lon=args.normalize_lon,
-            vars_wanted=list(dict.fromkeys(["u10","v10","msl","t2m"] + (args.vars or []))),
-            nearest=args.nearest,
-            nearest_maxdeg=float(args.nearest_maxdeg),
-            row_group_rows=int(args.row_group_rows),
-            scan_batch_rows=int(args.scan_batch_rows),
-            csv_chunk_rows=int(args.csv_chunk_rows),
-            engine_hint=args.engine,
-            quiet=args.quiet,
+    print(f"[integrate] features: {feat_path}")
+    print(f"[integrate] thermo glob: {thermo_glob} → {len(nc_files)} files")
+    print(f"[integrate] lon mode: {lon_mode}  AOI: {area_box}", flush=True)
+    if args.nearest:
+        print("[integrate] --nearest requested; using exact (time,lat,lon) join for now.", flush=True)
+
+    # Load feature table once
+    feat = load_any_table(str(feat_path))
+    if not {"time","lat","lon"}.issubset(feat.columns):
+        raise SystemExit("Feature table must include columns: time, lat, lon")
+
+    # normalize coords same way as thermo
+    feat["time"] = pd.to_datetime(feat["time"], utc=True, errors="coerce").dt.tz_localize(None)
+    feat["lat"]  = pd.to_numeric(feat["lat"], errors="coerce").astype("float32")
+    feat["lon"]  = reframe_lon_vals(pd.to_numeric(feat["lon"], errors="coerce").to_numpy(), lon_mode).astype("float32")
+    feat = feat.dropna(subset=["time","lat","lon"]).reset_index(drop=True)
+
+    # stable ordering, preserve index for later
+    feat.sort_values(["time","lat","lon"], kind="mergesort", inplace=True, ignore_index=True)
+
+    # We'll add thermo columns if missing
+    for c in ("u10","v10","msl","t2m"):
+        if c not in feat.columns:
+            feat[c] = np.nan
+
+    # Process each ERA5 file month-by-month
+    for i, nc in enumerate(nc_files, start=1):
+        thermo_df = flatten_era5_single(nc, lon_mode, area_box, engine=args.engine)
+        if thermo_df.empty:
+            print(f"[integrate] {Path(nc).name}: no thermo rows after AOI; skipping", flush=True)
+            continue
+
+        # restrict features to time range of this thermo chunk
+        tmin = thermo_df["time"].min()
+        tmax = thermo_df["time"].max()
+        mask = (feat["time"] >= tmin) & (feat["time"] <= tmax)
+        if not mask.any():
+            print(f"[integrate] {Path(nc).name}: no feature rows in [{tmin}, {tmax}]; skipping", flush=True)
+            continue
+
+        feat_chunk = feat.loc[mask, ["time","lat","lon"]].copy()
+        feat_chunk["__idx"] = feat_chunk.index  # preserve original indices into main feat
+
+        # Merge thermo onto this time-slice
+        merged = feat_chunk.merge(
+            thermo_df,
+            on=["time","lat","lon"],
+            how="left",
+            suffixes=("","_thermo")
         )
-    except Exception as e:
-        print(f"ERROR: {type(e).__name__}({e})", file=sys.stderr)
-        sys.exit(1)
+
+        # Write back into feat, using preserved __idx
+        idx = merged["__idx"].to_numpy()
+        for col in ("u10","v10","msl","t2m"):
+            if col in merged.columns:
+                vals = pd.to_numeric(merged[col], errors="coerce").to_numpy()
+                feat.loc[idx, col] = vals
+
+        print(f"[integrate] {i}/{len(nc_files)} {Path(nc).name}: "
+              f"feat_rows_in_range={mask.sum():,} thermo_rows={len(thermo_df):,}", flush=True)
+
+    # done
+    write_any_table(str(out_path), feat)
+    print(f"[integrate] wrote {out_path} rows={len(feat):,}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

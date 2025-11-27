@@ -34,7 +34,7 @@ Also writes .meta.json next to the pickle.
 
 import argparse, json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -108,10 +108,14 @@ def nearest_step_hours(lead_h: int, dt_h: int):
 # ---------- feature picking ----------
 
 BASE_RESERVED = {
-    "time","lat","lon","name","basin","storm_id","sid","pmin","vmax",
-    "lead","lead_h","lead_hours","lead_hour",
-    "storm","near_storm","pregen","alert","alert_final","event","target","label","y",
-    "number","expver","_grp","_grp_round"
+    "time", "lat", "lon",
+    "name", "basin", "storm_id", "sid", "pmin", "vmax",
+    "lead", "lead_h", "lead_hours", "lead_hour",
+    "storm", "near_storm", "pregen", "alert", "alert_final", "event", "target", "label", "y",
+    "number", "expver",
+    "_grp", "_grp_round",
+    "row_id",
+    "storm_hit", "storm_window", "storm_point"  # common downstream target/meta cols
 }
 
 def pick_features(df: pd.DataFrame, exclude_cols: set[str]):
@@ -169,6 +173,7 @@ def _safe_auc(ytrue, p):
     except Exception:
         return float("nan")
 
+
 def _safe_ap(ytrue, p):
     try:
         return average_precision_score(ytrue, p)
@@ -204,25 +209,29 @@ def main():
     ap.add_argument("--class-weight", default="balanced", help='sklearn class_weight (default "balanced")')
     ap.add_argument("--C", type=float, default=1.0, help="LR inverse regularization strength")
     ap.add_argument("--seed", type=int, default=42, help="Random seed")
-    ap.add_argument("--round-geo", type=int, default=4, help="Decimals to round lat/lon for stable grouping (default 4)")
-    ap.add_argument("--eval", action="store_true", help="Do leakage-safe eval (day-grouped split) and write metrics CSV")
+    ap.add_argument("--round-geo", type=int, default=4,
+                    help="Decimals to round lat/lon for stable grouping (default 4)")
+    ap.add_argument("--eval", action="store_true",
+                    help="Do leakage-safe eval (day-grouped split) and write metrics CSV")
 
     args = ap.parse_args()
 
     df = read_any(args.labelled)
 
     # time to datetime, sort for stable operations
-    required_cols = {"time","lat","lon"}
+    required_cols = {"time", "lat", "lon"}
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"Labelled file must contain {sorted(required_cols)} (missing {sorted(missing)}).")
     df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
-    df = df.dropna(subset=["time","lat","lon"]).copy()
-    df = df.sort_values(["lat","lon","time"]).reset_index(drop=True)
+    df = df.dropna(subset=["time", "lat", "lon"]).copy()
+    df = df.sort_values(["lat", "lon", "time"]).reset_index(drop=True)
 
     # Stable group ids
-    df["_grp_round"] = pd.factorize(list(zip(df["lat"].round(args.round-geo),
-                                             df["lon"].round(args.round-geo))))[0]
+    df["_grp_round"] = pd.factorize(
+        list(zip(df["lat"].round(args.round_geo),
+                 df["lon"].round(args.round_geo)))
+    )[0]
     df["_day"] = pd.to_datetime(df["time"]).dt.floor("D")
 
     # Determine mode
@@ -237,8 +246,6 @@ def main():
     trained: List[int] = []
     lead_meta: Dict[int, dict] = {}
     metrics_rows: List[dict] = []
-
-    rng = np.random.RandomState(args.seed)
 
     # ===== Mode A: DIRECT per-hour labels =====
     if direct_mode:
@@ -260,7 +267,8 @@ def main():
 
         for H, col in label_cols.items():
             y_arr = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int).to_numpy()
-            pos = int(y_arr.sum()); neg = int(len(y_arr) - pos)
+            pos = int(y_arr.sum())
+            neg = int(len(y_arr) - pos)
 
             same_frac = None
             if last_y is not None and last_y.shape == y_arr.shape:
@@ -271,7 +279,7 @@ def main():
             if pos < args.min_positives:
                 print(f"[skip] lead={H:>3d}h (direct): positives={pos} < {args.min_positives}")
                 continue
-            if pos/len(y_arr) < 0.005:
+            if pos / len(y_arr) < 0.005:
                 print(f"[warn] lead={H:>3d}h prevalence is very low ({pos/len(y_arr):.4f}); expect fragile metrics.")
 
             X = df[feats].to_numpy(dtype=float)
@@ -331,8 +339,10 @@ def main():
     # ===== Mode B: SHIFTED (time-aware default) =====
     else:
         if args.label_col not in df.columns:
-            raise ValueError(f"Column '{args.label_col}' missing from {args.labelled}. "
-                             f"Columns seen: {list(df.columns)[:20]} ...")
+            raise ValueError(
+                f"Column '{args.label_col}' missing from {args.labelled}. "
+                f"Columns seen: {list(df.columns)[:20]} ..."
+            )
 
         # coerce label to binary int
         yraw = pd.to_numeric(df[args.label_col], errors="coerce").fillna(0)
@@ -345,7 +355,10 @@ def main():
         exclude = set(BASE_RESERVED) | {args.label_col}
         feats = pick_features(df, exclude)
 
-        diag_header(df, f"shifted(base={args.label_col}) leads={leads[0]}..{leads[-1]}  time-aware={'no' if args.step_shift else 'yes'}")
+        diag_header(
+            df,
+            f"shifted(base={args.label_col}) leads={leads[0]}..{leads[-1]}  time-aware={'no' if args.step_shift else 'yes'}"
+        )
 
         last_pos = None
         last_y = None
@@ -358,7 +371,7 @@ def main():
                     print(f"[skip] lead={L}h < dt={args.dt_hours}h → zero-step shift; skipping.")
                     continue
 
-                df_shift = df[["time","lat","lon", args.label_col] + feats + ["_grp_round"]].copy()
+                df_shift = df[["time", "lat", "lon", args.label_col] + feats + ["_grp_round"]].copy()
 
                 def _shift_group(g):
                     g = g.sort_values("time")
@@ -402,7 +415,7 @@ def main():
                 if pos < args.min_positives:
                     print(f"[skip] lead={L:>3d}h: positives={pos} < {args.min_positives}")
                     continue
-                if pos/len(y_arr) < 0.005:
+                if pos / len(y_arr) < 0.005:
                     print(f"[warn] lead={L:>3d}h prevalence is very low ({pos/len(y_arr):.4f}); expect fragile metrics.")
 
                 X = df[feats].to_numpy(dtype=float)

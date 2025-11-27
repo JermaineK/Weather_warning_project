@@ -13,14 +13,15 @@ Fixes / Enhancements:
   • Optional --engine and multi-engine fallback (netcdf4 → h5netcdf → scipy).
   • Accept normalize-lon values with or without leading spaces (argparse quirk).
   • MSL auto-convert Pa→hPa if median suggests Pascals.
-  • NEW: --require-vars now accepts CSV, space-separated, or repeated flags (works with YAML flattening).
-  • NEW: prints one-line debug of present variables on the first skip due to missing required vars.
+  • --require-vars accepts CSV, space-separated, or repeated flags (friendly to YAML flattening).
+  • On first skip from missing required vars, prints a sample of present variables.
 """
 
 from __future__ import annotations
 import argparse, glob, sys
 from pathlib import Path
 import warnings
+
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -47,10 +48,19 @@ def parse_args():
     ap.add_argument("--mslvar", default=None, help="mean sea level pressure var (e.g., msl or mean_sea_level_pressure)")
     ap.add_argument("--t2mvar", default=None, help="2m temperature var (e.g., t2m or 2m_temperature)")
 
-    ap.add_argument("--require-vars", nargs="*", default=None,
-                    help="Require ALL (alias-aware). Accepts CSV or space-separated (e.g., u10 v10 msl t2m OR 'u10,v10,msl,t2m').")
-    ap.add_argument("--force-keep", nargs="*", default=None,
-                    help="Optional list of variables to keep if present (e.g., cape cin blh).")
+    ap.add_argument(
+        "--require-vars",
+        nargs="*",
+        default=None,
+        help="Require ALL (alias-aware). Accepts CSV or space-separated "
+             "(e.g., u10 v10 msl t2m OR 'u10,v10,msl,t2m').",
+    )
+    ap.add_argument(
+        "--force-keep",
+        nargs="*",
+        default=None,
+        help="Optional list of variables to keep if present (e.g., cape cin blh).",
+    )
 
     # Coord names
     ap.add_argument("--time-name", default=None)
@@ -58,9 +68,11 @@ def parse_args():
     ap.add_argument("--lon-name",  default=None)
 
     # Domain / thinning
-    ap.add_argument("--normalize-lon",
-                    choices=["none","-180..180","0..360"," -180..180"," 0..360"],
-                    default="none")
+    ap.add_argument(
+        "--normalize-lon",
+        choices=["none", "-180..180", "0..360", " -180..180", " 0..360"],
+        default="none",
+    )
     ap.add_argument("--area", default=None, help="latN,lonW,latS,lonE  (match lon range to normalize-lon)")
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--delta-hours", type=int, default=1)
@@ -69,22 +81,28 @@ def parse_args():
 
     # Grid identity & duplicates
     ap.add_argument("--emit-grid-index", action="store_true")
-    ap.add_argument("--dedup", choices=["none","time_lat_lon"], default="none")
+    ap.add_argument("--dedup", choices=["none", "time_lat_lon"], default="none")
 
     # Derived fields
-    ap.add_argument("--with-vortdiv", action="store_true",
-                    help="Compute vorticity/divergence per grid cell and derived proxies S, agree.")
-    ap.add_argument("--export-uv", action="store_true",
-                    help="Include raw u and v wind components in the output frame.")
+    ap.add_argument(
+        "--with-vortdiv",
+        action="store_true",
+        help="Compute vorticity/divergence per grid cell and derived proxies S, agree.",
+    )
+    ap.add_argument(
+        "--export-uv",
+        action="store_true",
+        help="Include raw u and v wind components in the output frame.",
+    )
+
     args = ap.parse_args()
 
-    # ---- NEW: normalize --require-vars to a clean list, accepting CSV/whitespace/repeated flags
+    # Normalize --require-vars: supports CSV, whitespace, repeated flags.
     if args.require_vars:
         norm: list[str] = []
         for tok in args.require_vars:
             if tok is None:
                 continue
-            # split both on commas and whitespace
             parts = [p.strip() for p in tok.replace(",", " ").split() if p.strip()]
             norm.extend(parts)
         args.require_vars = norm if norm else None
@@ -101,16 +119,19 @@ ALIASES = {
 }
 
 def _resolve_alias(name: str | None, present: set[str], key: str | None = None) -> str | None:
+    """Try explicit name, then alias group keyed by `key`."""
     if name and name in present:
         return name
     if key and key in ALIASES:
+        # direct alias search
         for cand in ALIASES[key]:
             if cand in present:
                 return cand
-    if name and key in ALIASES and name in ALIASES[key]:
-        for cand in ALIASES[key]:
-            if cand in present:
-                return cand
+        # if user passed one alias name, allow any alias that is present
+        if name and name in ALIASES[key]:
+            for cand in ALIASES[key]:
+                if cand in present:
+                    return cand
     return None
 
 def _resolve_require_vars(require_list: list[str] | None, present: set[str]) -> bool:
@@ -138,10 +159,12 @@ POSSIBLE_LON_NAMES  = ("lon", "longitude", "Longitude", "nav_lon")
 
 def _pick_name(cands, present):
     for c in cands:
-        if c in present: return c
+        if c in present:
+            return c
     return None
 
 def collapse_expver(ds: xr.Dataset) -> xr.Dataset:
+    """Collapse ECMWF expver dimension into a single best-estimate field."""
     if "expver" not in ds.dims:
         return ds
     try:
@@ -162,19 +185,25 @@ def collapse_expver(ds: xr.Dataset) -> xr.Dataset:
 def normalize_coords(ds: xr.Dataset, time_name=None, lat_name=None, lon_name=None) -> xr.Dataset:
     ds = collapse_expver(ds)
     present = set(ds.dims) | set(ds.coords)
+
     t_in  = time_name or _pick_name(POSSIBLE_TIME_NAMES, present)
     la_in = lat_name  or _pick_name(POSSIBLE_LAT_NAMES,  present)
     lo_in = lon_name  or _pick_name(POSSIBLE_LON_NAMES,  present)
+
     if not all([t_in, la_in, lo_in]):
         raise ValueError(f"Missing coords: time={t_in}, lat={la_in}, lon={lo_in}")
+
     ren = {}
     if t_in  != "time": ren[t_in]  = "time"
     if la_in != "lat":  ren[la_in] = "lat"
     if lo_in != "lon":  ren[lo_in] = "lon"
-    if ren: ds = ds.rename(ren)
-    for c in ("time","lat","lon"):
+    if ren:
+        ds = ds.rename(ren)
+
+    for c in ("time", "lat", "lon"):
         if c in ds and c not in ds.coords:
             ds = ds.set_coords(c)
+
     return ds
 
 # ---------------- lon reframing / area ----------------
@@ -184,13 +213,17 @@ def _canon_norm(mode: str) -> str:
 
 def reframe_lon_vals(lon_vals: np.ndarray, mode: str) -> np.ndarray:
     mode = _canon_norm(mode)
-    if mode == "none": return lon_vals
-    if mode == "0..360": return (lon_vals % 360 + 360) % 360
+    if mode == "none":
+        return lon_vals
+    if mode == "0..360":
+        return (lon_vals % 360 + 360) % 360
+    # default: -180..180
     return ((lon_vals + 180) % 360) - 180
 
 def reframe_lon_ds(ds: xr.Dataset, mode: str) -> xr.Dataset:
     mode = _canon_norm(mode)
-    if mode == "none": return ds
+    if mode == "none":
+        return ds
     lon2 = reframe_lon_vals(ds["lon"].to_numpy(), mode)
     order = np.argsort(lon2)
     ds = ds.assign_coords(lon=("lon", lon2))
@@ -199,12 +232,14 @@ def reframe_lon_ds(ds: xr.Dataset, mode: str) -> xr.Dataset:
     return ds
 
 def parse_area(aoi: str | None):
-    if not aoi: return None
+    if not aoi:
+        return None
     latN, lonW, latS, lonE = [float(x.strip()) for x in aoi.split(",")]
     return latN, lonW, latS, lonE
 
 def select_aoi_ds(ds: xr.Dataset, aoi):
-    if not aoi: return ds
+    if not aoi:
+        return ds
     latN, lonW, latS, lonE = aoi
     ds = ds.sel(lon=slice(lonW, lonE))
     lat_vals = ds["lat"].values
@@ -217,12 +252,14 @@ def select_aoi_ds(ds: xr.Dataset, aoi):
 # ---------------- thinning utilities ----------------
 
 def keep_delta_hours(df: pd.DataFrame, delta: int) -> pd.DataFrame:
-    if delta is None or delta <= 1: return df
+    if delta is None or delta <= 1:
+        return df
     t = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
     return df.loc[(t.dt.hour.to_numpy() % int(delta)) == 0].copy()
 
 def apply_area_df(df: pd.DataFrame, aoi):
-    if not aoi: return df
+    if not aoi:
+        return df
     latN, lonW, latS, lonE = aoi
     return df.loc[
         (df["lat"] <= latN) & (df["lat"] >= latS) &
@@ -230,19 +267,27 @@ def apply_area_df(df: pd.DataFrame, aoi):
     ].copy()
 
 def stride_df(df: pd.DataFrame, stride: int) -> pd.DataFrame:
-    if stride <= 1 or df.empty: return df
-    df = df.sort_values(["time","lat","lon"], kind="mergesort").reset_index(drop=True)
+    if stride <= 1 or df.empty:
+        return df
+
+    df = df.sort_values(["time", "lat", "lon"], kind="mergesort").reset_index(drop=True)
+
     def _per_time(g):
         lats = np.sort(g["lat"].unique())
         lons = np.sort(g["lon"].unique())
-        lat_map = {v:i for i,v in enumerate(lats)}
-        lon_map = {v:i for i,v in enumerate(lons)}
+        lat_map = {v: i for i, v in enumerate(lats)}
+        lon_map = {v: i for i, v in enumerate(lons)}
         gi = g.copy()
         gi["_ilat"] = g["lat"].map(lat_map).to_numpy()
         gi["_ilon"] = g["lon"].map(lon_map).to_numpy()
         keep = (gi["_ilat"] % stride == 0) & (gi["_ilon"] % stride == 0)
-        return gi.loc[keep].drop(columns=["_ilat","_ilon"])
-    return df.groupby(pd.to_datetime(df["time"]).dt.floor("H"), sort=False, group_keys=False).apply(_per_time)
+        return gi.loc[keep].drop(columns=["_ilat", "_ilon"])
+
+    return df.groupby(
+        pd.to_datetime(df["time"]).dt.floor("H"),
+        sort=False,
+        group_keys=False
+    ).apply(_per_time)
 
 # ---------------- vorticity/divergence helpers ----------------
 
@@ -252,13 +297,18 @@ def compute_zeta_div(u: np.ndarray, v: np.ndarray, lat: np.ndarray, lon: np.ndar
     m_per_deg_x_row = 111_320.0 * np.cos(np.deg2rad(lat))
     dlat_deg = np.gradient(lat)
     dlon_deg = np.gradient(lon)
+
     y_m = np.cumsum(np.r_[0.0, m_per_deg_y * dlat_deg[1:]])
     x_m_nominal = np.cumsum(np.r_[0.0, (m_per_deg_x_row[0] * dlon_deg[1:])])
+
     dU_dy, dU_dx = np.gradient(u, y_m, x_m_nominal, edge_order=1)
     dV_dy, dV_dx = np.gradient(v, y_m, x_m_nominal, edge_order=1)
+
+    # Adjust dx scaling away from equator row
     scale2d = (m_per_deg_x_row / m_per_deg_x_row[0])[:, None]
     dU_dx = dU_dx * scale2d
     dV_dx = dV_dx * scale2d
+
     zeta = dV_dx - dU_dy
     div  = dU_dx + dV_dy
     return zeta, div
@@ -269,18 +319,24 @@ def to_frame(ds: xr.Dataset, keep_vars: list[str]) -> pd.DataFrame:
     keep_vars = [v for v in keep_vars if v in ds.data_vars]
     if not keep_vars:
         raise ValueError("No requested variables found in dataset.")
+
     sub = ds[keep_vars]
+
+    # Downcast only the actual data variables; coords are left alone so joins remain exact.
     for v in list(sub.data_vars):
         if np.issubdtype(sub[v].dtype, np.floating):
             sub[v] = sub[v].astype("float32")
+
     df = sub.to_dataframe().reset_index()
-    for c in ("time","lat","lon"):
+
+    for c in ("time", "lat", "lon"):
         if c not in df.columns:
             if c in df.index.names:
                 df = df.reset_index(c)
             else:
                 raise KeyError(f"Missing '{c}' column after to_dataframe(); columns={list(df.columns)}")
-    return df.dropna(subset=["time","lat","lon"])
+
+    return df.dropna(subset=["time", "lat", "lon"])
 
 # ---------------- open helpers ----------------
 
@@ -288,6 +344,7 @@ def _open_dataset_with_fallback(path: str, hint_engine: str | None):
     engines = [hint_engine] if hint_engine else []
     engines += ["netcdf4", "h5netcdf", "scipy"]
     tried = []
+
     for eng in engines:
         if eng is None:
             continue
@@ -295,6 +352,7 @@ def _open_dataset_with_fallback(path: str, hint_engine: str | None):
             return xr.open_dataset(path, engine=eng)
         except Exception as e:
             tried.append((eng, str(e)[:120]))
+
     try:
         return xr.open_dataset(path)
     except Exception as e:
@@ -306,9 +364,12 @@ def _open_dataset_with_fallback(path: str, hint_engine: str | None):
 def main():
     args = parse_args()
 
-    files = []
-    if args.nc_glob: files += glob.glob(args.nc_glob, recursive=True)
-    if args.nc: files += [p for p in args.nc if p]
+    files: list[str] = []
+    if args.nc_glob:
+        files += glob.glob(args.nc_glob, recursive=True)
+    if args.nc:
+        files += [p for p in args.nc if p]
+
     files = sorted({str(f) for f in files if Path(f).exists()})
     if not files:
         print("[err] No NetCDF files found.", file=sys.stderr)
@@ -321,8 +382,9 @@ def main():
     out_path = Path(args.out_features)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    dfs = []
-    ok_files = skipped_require = 0
+    dfs: list[pd.DataFrame] = []
+    ok_files = 0
+    skipped_require = 0
     printed_missing_debug = False
 
     for i, f in enumerate(files, 1):
@@ -333,13 +395,15 @@ def main():
 
         present_vars = set(ds.data_vars)
 
+        # Required vars check (alias-aware)
         if not _resolve_require_vars(required_raw, present_vars):
             print(f"[skip {i}/{len(files)}] {Path(f).name}: missing one or more required variables (alias-aware).")
             if not printed_missing_debug:
                 printed_missing_debug = True
                 try:
                     pv = sorted(list(present_vars))
-                    print("  └─ present (sample file) →", pv[:40], ("… +%d more" % (max(0, len(pv)-40))) if len(pv) > 40 else "")
+                    extra = max(0, len(pv) - 40)
+                    print("  └─ present (sample file) →", pv[:40], (f"… +{extra} more" if extra > 0 else ""))
                 except Exception:
                     pass
             skipped_require += 1
@@ -347,8 +411,8 @@ def main():
             continue
 
         # Resolve aliases for core vars
-        u_name = _resolve_alias(args.uvar, present_vars, "u10")
-        v_name = _resolve_alias(args.vvar, present_vars, "v10")
+        u_name   = _resolve_alias(args.uvar,   present_vars, "u10")
+        v_name   = _resolve_alias(args.vvar,   present_vars, "v10")
         msl_name = _resolve_alias(args.mslvar, present_vars, "msl")
         t2m_name = _resolve_alias(args.t2mvar, present_vars, "t2m")
 
@@ -358,9 +422,11 @@ def main():
         if u_name and v_name:
             U = ds[u_name].astype("float32")
             V = ds[v_name].astype("float32")
+
             if args.export_uv:
                 ds = ds.assign({u_name: U, v_name: V})
                 keep_vars += [u_name, v_name]
+
             wspd = np.sqrt(U**2 + V**2).astype("float32")
             ds = ds.assign(wspd=wspd)
             keep_vars.append("wspd")
@@ -369,6 +435,7 @@ def main():
                 lat_vals = ds["lat"].values
                 lon_vals = ds["lon"].values
                 times = ds["time"].values
+
                 z_stack, d_stack = [], []
                 for t in times:
                     u2 = U.sel(time=t).values
@@ -376,17 +443,27 @@ def main():
                     zeta, div = compute_zeta_div(u2, v2, lat_vals, lon_vals)
                     z_stack.append(zeta.astype(np.float32))
                     d_stack.append(div.astype(np.float32))
-                zeta_da = xr.DataArray(np.stack(z_stack, axis=0),
-                                       coords={"time": ds["time"], "lat": ds["lat"], "lon": ds["lon"]},
-                                       dims=("time","lat","lon"), name="zeta").astype("float32")
-                div_da  = xr.DataArray(np.stack(d_stack, axis=0),
-                                       coords={"time": ds["time"], "lat": ds["lat"], "lon": ds["lon"]},
-                                       dims=("time","lat","lon"), name="div").astype("float32")
+
+                zeta_da = xr.DataArray(
+                    np.stack(z_stack, axis=0),
+                    coords={"time": ds["time"], "lat": ds["lat"], "lon": ds["lon"]},
+                    dims=("time", "lat", "lon"),
+                    name="zeta",
+                ).astype("float32")
+                div_da = xr.DataArray(
+                    np.stack(d_stack, axis=0),
+                    coords={"time": ds["time"], "lat": ds["lat"], "lon": ds["lon"]},
+                    dims=("time", "lat", "lon"),
+                    name="div",
+                ).astype("float32")
+
                 ds = ds.assign(zeta=zeta_da, div=div_da)
-                keep_vars += ["zeta","div"]
+                keep_vars += ["zeta", "div"]
+
                 S = np.sqrt(zeta_da**2 + div_da**2).astype("float32")
                 ds = ds.assign(S=S)
                 keep_vars.append("S")
+
                 agree = (np.abs(zeta_da) > np.abs(div_da)).astype("float32")
                 ds = ds.assign(agree=agree)
                 keep_vars.append("agree")
@@ -403,7 +480,7 @@ def main():
             ds = ds.assign(msl=msl_da)
             keep_vars.append("msl")
 
-        # 2m temperature (keep as-is)
+        # 2m temperature (keep as-is, in K)
         if t2m_name:
             ds = ds.assign(t2m=ds[t2m_name].astype("float32"))
             keep_vars.append("t2m")
@@ -411,10 +488,13 @@ def main():
         # Force-keep extras if present
         for v in list(force_keep):
             if v in present_vars:
-                ds = ds.assign({v: ds[v].astype("float32") if np.issubdtype(ds[v].dtype, np.floating) else ds[v]})
+                dv = ds[v]
+                if np.issubdtype(dv.dtype, np.floating):
+                    dv = dv.astype("float32")
+                ds = ds.assign({v: dv})
                 keep_vars.append(v)
 
-        # Default fallback
+        # Default fallback: keep all numeric data variables
         if not keep_vars:
             keep_vars = [k for k in ds.data_vars if np.issubdtype(ds[k].dtype, np.number)]
 
@@ -422,52 +502,66 @@ def main():
             df = to_frame(ds, keep_vars)
         except Exception as e:
             print(f"[skip {i}] {Path(f).name}: to_frame error {e}")
-            ds.close(); continue
+            ds.close()
+            continue
 
         # Time filters and geo post-processing
         df = keep_delta_hours(df, args.delta_hours)
         df = apply_area_df(df, area_box)
+
         if _canon_norm(args.normalize_lon) != "none":
-            df["lon"] = reframe_lon_vals(pd.to_numeric(df["lon"], errors="coerce").to_numpy(),
-                                         _canon_norm(args.normalize_lon))
+            df["lon"] = reframe_lon_vals(
+                pd.to_numeric(df["lon"], errors="coerce").to_numpy(),
+                _canon_norm(args.normalize_lon),
+            )
+
         if args.stride > 1:
             df = stride_df(df, args.stride)
 
+        # Normalize time to tz-naive UTC
         df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
-        df = df.dropna(subset=["time","lat","lon"]).reset_index(drop=True)
+        df = df.dropna(subset=["time", "lat", "lon"]).reset_index(drop=True)
 
         if not df.empty:
-            dfs.append(df); ok_files += 1
-            kept = sorted(set(df.columns) - {"time","lat","lon"})
+            dfs.append(df)
+            ok_files += 1
+            kept = sorted(set(df.columns) - {"time", "lat", "lon"})
             print(f"[{i}/{len(files)}] {Path(f).name}: rows={len(df):,}  vars={kept}")
+
         ds.close()
 
     if not dfs:
-        print(f"[err] No rows produced. Files read={ok_files}, skipped_missing_required={skipped_require}", file=sys.stderr)
+        print(
+            f"[err] No rows produced. Files read={ok_files}, "
+            f"skipped_missing_required={skipped_require}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     out_df = pd.concat(dfs, ignore_index=True)
+
     if args.dedup == "time_lat_lon":
-        out_df = out_df.drop_duplicates(subset=["time","lat","lon"], keep="first", ignore_index=True)
+        out_df = out_df.drop_duplicates(subset=["time", "lat", "lon"], keep="first", ignore_index=True)
 
     if args.emit_grid_index and not out_df.empty:
         lats = np.sort(out_df["lat"].unique())
         lons = np.sort(out_df["lon"].unique())
-        out_df["ilat"] = out_df["lat"].map({v:i for i,v in enumerate(lats)}).astype("int32")
-        out_df["ilon"] = out_df["lon"].map({v:i for i,v in enumerate(lons)}).astype("int32")
+        out_df["ilat"] = out_df["lat"].map({v: i for i, v in enumerate(lats)}).astype("int32")
+        out_df["ilon"] = out_df["lon"].map({v: i for i, v in enumerate(lons)}).astype("int32")
 
-    out_df.sort_values(["time","lat","lon"], inplace=True, ignore_index=True)
+    out_df.sort_values(["time", "lat", "lon"], inplace=True, ignore_index=True)
 
-    low = out_df.__class__.__name__  # not used; keep compatibility
     out_path = Path(args.out_features)
     name_low = out_path.name.lower()
-    if name_low.endswith((".parquet",".parq",".pq")):
+    if name_low.endswith((".parquet", ".parq", ".pq")):
         out_df.to_parquet(out_path, index=False)
     else:
-        comp = "gzip" if name_low.endswith(".csv.gz") or out_path.suffix.lower()==".gz" else "infer"
+        comp = "gzip" if (name_low.endswith(".csv.gz") or out_path.suffix.lower() == ".gz") else "infer"
         out_df.to_csv(out_path, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
 
-    H = out_df["lat"].nunique(); W = out_df["lon"].nunique(); T = out_df["time"].nunique()
+    H = out_df["lat"].nunique()
+    W = out_df["lon"].nunique()
+    T = out_df["time"].nunique()
     print(f"[ok] wrote {len(out_df):,} rows → {out_path}  (H={H} x W={W} x T={T})")
     if args.emit_grid_index:
         print("  (ilat/ilon present → stable grid IDs across hours)")

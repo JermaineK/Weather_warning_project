@@ -1,0 +1,156 @@
+---
+Fetch Subprocess Mini-README
+This folder provides a complete, reproducible front-end for fetching all input data needed for the tropical-cyclone feature pipeline.
+The fetch manager is the main entry point. All other scripts can be run directly, but the manager adds defaults, presets, and safety checks.
+
+1. Overview
+fetch_manager.py
+A unified command wrapper for:
+
+era5
+era5_fetch_cds.py
+Fetch ERA5 single-level data (u10, v10, msl, t2m, d2m, etc.)
+
+
+era5-pl
+era5_fetch_cds.py
+Fetch ERA5 pressure-level winds (u, v @ 1000–500 hPa)
+
+
+era5-both
+era5_fetch_cds.py
+Fetch single-level + pressure-level in one run
+
+
+era5-merge-single
+era5_merge_singlelevels.py
+Merge monthly single-level .nc files into clean union files
+
+
+ibtracs
+ibtracs_fetch.py
+Fetch + clean IBTrACS best-track data
+
+
+intensity
+prepare_besttrack_intensity.py
+Prepare best-track intensity CSV for downstream evaluation
+
+
+
+All tools support --dry-run for safe inspection of the generated command.
+Presets use environment variables (FETCH_AREA, FETCH_HOURS, FETCH_SINGLE_VARS, …) but any CLI argument overrides the preset.
+
+2. ERA5 Fetching
+Single-level fetch
+Recommended:
+python fetch_subprocess/fetch_manager.py era5 \
+  --start 2025-01-01 --end 2025-03-01 \
+  --area "-10,135,-25,155" \
+  --target-dir data_era5/extracted
+
+The manager injects a safe default variable set:
+u10 v10 msl t2m d2m tcwv tp sshf slhf divergence vorticity
+
+Pressure-level fetch
+Used for bulk-shear features:
+python fetch_subprocess/fetch_manager.py era5-pl \
+  --start 2025-01-01 --end 2025-03-01 \
+  --area "-10,135,-25,155" \
+  --target-dir data_era5/extracted
+
+Defaults injected:
+
+pl-levels: 1000,925,850,700,500
+pl-vars: u v
+suffix: uv
+
+Both (single + pl)
+python fetch_subprocess/fetch_manager.py era5-both \
+  --start 2025-01-01 --end 2025-03-01 \
+  --area "-10,135,-25,155" \
+  --target-dir data_era5/extracted
+
+
+3. ERA5 Merging
+After downloading month-sliced .nc files:
+python fetch_subprocess/fetch_manager.py era5-merge-single \
+  --in-glob "data_era5/extracted/**/era5_*.nc" \
+  --out-dir data_era5/extracted \
+  --suffix oper \
+  --overwrite
+
+Merging does:
+
+standardizes to (time, lat, lon)
+wraps longitudes to [-180, 180)
+aliases long var names → short (t2m, msl, tcwv…)
+compresses to clean monthly union NetCDFs
+
+
+4. IBTrACS Fetch / Clean
+Fast local caching + area cropping + multi-agency wind fallback.
+Example:
+python fetch_subprocess/fetch_manager.py ibtracs \
+  --start 1979-01-01 --end 2024-12-31 \
+  --area "-10,135,-25,155" \
+  --out data/tracks/ibtracs_aus.csv
+
+Manager defaults:
+
+--normalize-lon -180..180
+
+Output columns:
+time, lat, lon, vmax, pmin, name, basin, storm_id, source
+
+
+5. Prepare Best-Track Intensity
+Used by intensity_analysis.py.
+python fetch_subprocess/fetch_manager.py intensity \
+  --ibtracs data/tracks/ibtracs_aus.csv \
+  --out data/tracks/intensity_clean.csv.gz \
+  --start 1979-01-01 --end 2024-12-31 \
+  --min-wind 20
+
+Automatically:
+
+converts winds (m/s → kt if needed)
+fixes fill values
+normalizes lon
+filters by area + time
+
+
+6. Typical End-to-End Workflow
+1. Fetch ERA5 single-levels
+fm era5 --start 2025-01-01 --end 2025-03-01 \
+  --area "-10,135,-25,155" \
+  --target-dir data_era5/extracted
+
+2. Fetch ERA5 pressure-levels
+fm era5-pl ...same window...
+
+3. Merge single-levels
+fm era5-merge-single --in-glob "data_era5/extracted/**/era5_*.nc" \
+  --out-dir data_era5/extracted --overwrite
+
+4. Fetch tracks
+fm ibtracs --start 1979-01-01 --end 2024-12-31 \
+  --area "-10,135,-25,155" \
+  --out data/tracks/ibtracs_aus.csv
+
+5. Prepare intensity
+fm intensity --ibtracs data/tracks/ibtracs_aus.csv \
+  --out data/tracks/intensity_clean.csv.gz
+
+Where fm is an optional alias:
+alias fm="python fetch_subprocess/fetch_manager.py"
+
+
+7. Key Environment Variables (Optional)
+These only control presets; you can ignore them.
+export FETCH_AREA="-10,135,-25,155"
+export FETCH_HOURS="0..23"
+export FETCH_PL_LEVELS="1000,925,850,700,500"
+export FETCH_PL_VARS="u v"
+export FETCH_SINGLE_VARS="u10 v10 msl t2m d2m tcwv tp sshf slhf divergence vorticity"
+

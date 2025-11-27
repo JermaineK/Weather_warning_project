@@ -9,7 +9,7 @@ Highlights:
   • Streams CSV (.csv/.csv.gz) in chunks; handles Parquet in-memory.
   • Verbose error reporting with tracebacks.
   • Robust alias binding for columns (u/v/zeta/div/msl/S/S3/etc).
-  • Memory-safe parity-eta using integer keys (no zip(list(...))).
+  • Memory-safe parity-eta using integer keys (prefers ilat/ilon when present).
   • Guards: --disable-eta, --eta-max-rows, --eta-window.
 
 Usage examples
@@ -62,6 +62,7 @@ ALIASES: Dict[str, List[str]] = {
 
 CORE_FOR_REQUIRE = ("zeta","div","u","v")  # enforced when --require-core
 
+
 # ---------------- utilities ----------------
 
 def _first_present(cols: Iterable[str], pool: List[str]) -> Optional[str]:
@@ -97,6 +98,7 @@ def _pick_series(out_df: pd.DataFrame, bind: Dict[str, Optional[str]], *canon_na
             return out_df[colname]
     return None
 
+
 # ---------- memory-safe parity-eta ----------
 
 def _combine_codes(lat_codes: np.ndarray, lon_codes: np.ndarray) -> np.ndarray:
@@ -107,36 +109,41 @@ def _combine_codes(lat_codes: np.ndarray, lon_codes: np.ndarray) -> np.ndarray:
     lon_i = lon_codes.astype(np.int64, copy=False)
     return (lat_i << 32) ^ (lon_i & 0xFFFFFFFF)
 
-def _group_codes(lat: pd.Series, lon: pd.Series) -> np.ndarray:
+
+def _group_codes(lat: pd.Series,
+                 lon: pd.Series,
+                 ilat: Optional[pd.Series] = None,
+                 ilon: Optional[pd.Series] = None) -> np.ndarray:
     """
-    Prefer integer grid indices if present (ilat/ilon). Otherwise factorize lat/lon separately.
+    Prefer integer grid indices ilat/ilon if provided; otherwise factorize lat/lon separately.
     Returns an int64 array of keys (one per row).
     """
-    if "ilat" in lat.index and "ilon" in lon.index:
-        pass  # not relevant; we need columns, not index labels
-    # Try columns first
-    if "ilat" in lat.axes[1] if hasattr(lat, "axes") else False:
-        pass
+    if ilat is not None and ilon is not None:
+        lat_codes = pd.to_numeric(ilat, errors="coerce").astype("Int64").to_numpy()
+        lon_codes = pd.to_numeric(ilon, errors="coerce").astype("Int64").to_numpy()
+    else:
+        lat_codes, _ = pd.factorize(lat, sort=False)
+        lon_codes, _ = pd.factorize(lon, sort=False)
 
-    # If ilat/ilon columns exist on the parent frame, use them (caller passes series; we don't have df here)
-    # So caller will detect and pass ilat/ilon via kwargs if desired. To keep signature simple, we factorize here.
+    return _combine_codes(
+        np.asarray(lat_codes, dtype=np.int32),
+        np.asarray(lon_codes, dtype=np.int32),
+    )
 
-    lat_codes, _ = pd.factorize(lat, sort=False)
-    lon_codes, _ = pd.factorize(lon, sort=False)
-    return _combine_codes(lat_codes.astype(np.int32, copy=False),
-                          lon_codes.astype(np.int32, copy=False))
 
 def _roll_group_eta(sign_series: pd.Series,
                     lat: pd.Series,
                     lon: pd.Series,
+                    ilat: Optional[pd.Series] = None,
+                    ilon: Optional[pd.Series] = None,
                     window: int = 7) -> np.ndarray:
     """
-    Rolling mean of sign(zeta) per (lat,lon) group, centered, using integer keys to avoid tuple allocation.
+    Rolling mean of sign(zeta) per grid cell using integer keys.
+
+    If ilat/ilon are provided, they define the groups; otherwise we factorize lat/lon.
     """
-    # integer group keys
-    keys = _group_codes(lat, lon)
+    keys = _group_codes(lat, lon, ilat=ilat, ilon=ilon)
     s = pd.Series(sign_series.to_numpy(), index=np.arange(len(sign_series)))
-    # Perform groupby-rolling mean with center=True without building huge Python objects
     m = (
         s.groupby(keys, sort=False)
          .rolling(window, min_periods=1, center=True)
@@ -144,6 +151,7 @@ def _roll_group_eta(sign_series: pd.Series,
          .reset_index(level=0, drop=True)
     )
     return m.to_numpy()
+
 
 # ---------------- feature computation ----------------
 
@@ -172,10 +180,12 @@ def _compute_chunk_features(df: pd.DataFrame,
     v     = _pick_series(out, bind, "v", "v10")
 
     if verbose:
-        print(f"[GKA] chunk rows={len(out):,}  present:"
-              f" zeta={zeta is not None} div={divv is not None} msl={msl is not None}"
-              f" S={S is not None} S3={S3 is not None} shear={shear is not None}"
-              f" u={u is not None} v={v is not None}")
+        print(
+            f"[GKA] chunk rows={len(out):,}  present:"
+            f" zeta={zeta is not None} div={divv is not None} msl={msl is not None}"
+            f" S={S is not None} S3={S3 is not None} shear={shear is not None}"
+            f" u={u is not None} v={v is not None}"
+        )
 
     # 1) curvature / torsion proxies
     out["gka_kappa"] = _safe_num(zeta) if zeta is not None else 0.0
@@ -191,9 +201,14 @@ def _compute_chunk_features(df: pd.DataFrame,
             try:
                 z_vals = _safe_num(zeta).to_numpy(float)
                 signv = np.sign(z_vals)
-                eta = _roll_group_eta(pd.Series(signv, index=out.index),
-                                      out["lat"], out["lon"],
-                                      window=max(1, int(eta_window)))
+                eta = _roll_group_eta(
+                    pd.Series(signv, index=out.index),
+                    out["lat"],
+                    out["lon"],
+                    out["ilat"] if "ilat" in out.columns else None,
+                    out["ilon"] if "ilon" in out.columns else None,
+                    window=max(1, int(eta_window)),
+                )
                 out["gka_parity_eta"] = eta
             except MemoryError:
                 if verbose:
@@ -263,11 +278,12 @@ def _compute_chunk_features(df: pd.DataFrame,
     else:
         out["gka_dir_var"] = 0.0
 
-    # sanitize dtypes for new cols
+    # sanitize dtypes for new cols (downcast to float32 to keep size reasonable)
     for c in NEW_COLS:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
+        out[c] = pd.to_numeric(out[c], errors="coerce").astype("float32")
 
     return out
+
 
 # ---------------- I/O helpers ----------------
 
@@ -310,6 +326,7 @@ def _write_parquet(path: str | Path, df: pd.DataFrame, overwrite: bool) -> None:
         raise SystemExit(f"[GKA] Outfile exists; use --overwrite: {p}")
     df.to_parquet(p, index=False, engine="pyarrow")
 
+
 # ---------------- CLI ----------------
 
 def parse_args():
@@ -338,6 +355,7 @@ def parse_args():
     ap.add_argument("--eta-max-rows", type=int, default=5_000_000,
                     help="Skip eta if chunk has more than this many rows.")
     return ap.parse_args()
+
 
 # ---------------- main ----------------
 
@@ -396,8 +414,12 @@ def main():
                     print(f"[GKA] chunk {i} ok → rows {len(out):,}  total {total_rows:,}")
             except Exception as ex:
                 bad_chunks += 1
-                print("\n[GKA] ERROR in CSV chunk {}: {}: {}\n{}".format(
-                    i, type(ex).__name__, repr(ex), traceback.format_exc()), file=sys.stderr)
+                print(
+                    "\n[GKA] ERROR in CSV chunk {}: {}: {}\n{}".format(
+                        i, type(ex).__name__, repr(ex), traceback.format_exc()
+                    ),
+                    file=sys.stderr,
+                )
                 if args.fail_fast:
                     raise
 

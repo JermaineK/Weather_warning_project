@@ -1,0 +1,268 @@
+Sweep / Threshold Search Subprocess
+===================================
+
+Directory: sweep_subprocess/
+
+Purpose
+-------
+
+This subprocess runs *threshold sweeps* and *post-selection* for the grid-based
+alert models. It answers questions like:
+
+  • For a given model bundle and labelled grid, which score thresholds and
+    post-filters (persistence / neighbors / hourly throttling) give the best
+    F1 or Fβ?
+  • What per-lead thresholds should be used in the main pipeline
+    (e.g. best Fβ subject to coverage / precision constraints)?
+  • How do “gate” (build×relax) strategies compare to simple single-score
+    thresholding?
+
+All tools are invoked via `sweep_manager.py`, either directly on the CLI or
+through `run_pipeline.py` and `config/pipeline.yaml`.
+
+
+Files
+-----
+
+Core scripts in this subprocess:
+
+  • sweep_manager.py
+      Thin dispatcher and chain runner for the sweep tools. Provides:
+        - direct subcommands: run, gate, best-f1, best-constrained, pick
+        - aliases: sweep → run, gates → gate, best → best-f1, constrained → best-constrained
+        - chain recipes: run+pick, gate+pick (and optionally constrained+pick)
+
+  • sweep_runner.py
+      Baseline grid sweep for a single probabilistic model:
+        - Scores the labelled grid once with a model bundle.
+        - Builds time-aware future labels per (lat, lon) for each lead L.
+        - Applies per-row filters:
+            1) score threshold (p >= thr)
+            2) temporal persistence (≥ P consecutive kept hours per cell)
+            3) 8-neighbor filter (≥ N neighbors at the same hour)
+            4) hourly throttle (keep top q quantile by score within each hour)
+        - Computes AUC, PRAUC, Brier on the full population and
+          F1 / Precision / Recall / Coverage on the final kept mask.
+        - Outputs a summary grid: one row per (lead, thr, persist, neighbors, quantile).
+
+  • sweep_gate_runner.py
+      “Gate” sweep for build×relax model pairs:
+        - Uses two probabilistic models:
+            build: long-horizon “organizing” signal
+            relax: shorter-horizon “confidence” / “ready” signal
+        - Gate per row:
+              gate   = (past_max(p_build, build_window_h) >= tb)
+              alerts = gate & (p_relax >= tr)
+        - Past window is time-aware per (lat, lon), excluding current hour.
+        - Labels are future max in (t, t+lead] per (lat, lon).
+        - Optional hourly throttling (keep highest scores per hour).
+        - Outputs F1 / Precision / Recall / Coverage + AUC / PRAUC / Brier for each
+          (lead, tb, tr) combination.
+
+  • best_f1.py
+      Simple best-F1 threshold finder:
+        - Supports:
+            (A) per-lead bundle: {"per_lead_models": {lead_h → estimator}, "features": [...]}
+            (B) single model bundle: {"model", "scaler", "features"}
+        - Builds time-aware future labels per lead via (t, t+L] windows.
+        - For each lead, sweeps thresholds from the precision-recall curve and
+          reports:
+              best F1, threshold, precision, recall.
+        - Can write a compact CSV: one row per lead_h with best F1 parameters.
+
+  • find_best_f1_thresholds_constrained.py
+      Fast constrained threshold finder (per-lead aware, F1 and Fβ):
+        - Loads a model bundle (optionally with per_lead_models).
+        - For each requested lead:
+            - Scores probabilities for that lead.
+            - Builds label in one of two ways:
+                • success_col at t+lead (preferred), OR
+                • fallback future window of base target (t, t+lead].
+            - Builds a dense threshold grid across the probability range.
+            - Computes precision / recall / coverage / alerts per threshold.
+            - Adds an Fβ column.
+            - Picks best F1 and best Fβ under constraints:
+                • min_precision
+                • max_coverage
+              with sensible fallbacks if constraints cannot be met.
+        - Outputs a CSV with one row per lead_h, including:
+            thr_f1, thr_Fbeta, F1, Fbeta, P/R/Cov, Alerts, and status flags.
+        - Optionally saves the full threshold curve for the last lead.
+
+  • pick_best_from_sweep.py
+      Post-selector for sweep summaries (esp. from sweep_runner.py):
+        - Reads sweep summary (CSV or Parquet).
+        - Normalises numeric columns and recomputes F1 from Precision/Recall if needed.
+        - Applies constraints:
+              Coverage ≤ coverage_max
+              Recall   ≥ recall_min
+              Precision≥ prec_min
+          with a relaxed fallback if no rows match.
+        - For each lead:
+            - Picks the best row by constrained F1 (or F1_fix).
+            - Produces a best-per-lead table.
+        - Also prints top-N rows per lead for inspection.
+        - Writes best-per-lead thresholds to a CSV that can be wired into
+          the main scoring pipeline (e.g. best_fbeta_thresholds.csv).
+
+
+Calling via sweep_manager.py
+----------------------------
+
+Direct single-tool usage:
+
+  # run a plain grid sweep
+  python sweep_subprocess/sweep_manager.py tool run \
+    --labelled data/grid_labelled_FMA_gka_realthermo.parquet \
+    --model models/grid_logit_perlead.pkl \
+    --target storm \
+    --leads 24,48,72,120 \
+    --thr-grid 0.02:0.10:0.002 \
+    --persist 1,2 \
+    --neighbors 0,3 \
+    --quantiles 0.90 \
+    --subsample-hours 1.0 \
+    --out results/sweeps/demo_sweep_summary.csv
+
+  # gate sweep (build×relax)
+  python sweep_subprocess/sweep_manager.py tool gate \
+    --labelled data/grid_labelled_FMA_gka_realthermo_sph.csv.gz \
+    --build   models/build_gate_bundle.pkl \
+    --relax   models/relax_gate_bundle.pkl \
+    --target  storm \
+    --build-window 24 \
+    --tb 0.03:0.10:0.005 \
+    --tr 0.03:0.10:0.005 \
+    --leads 24,48,72 \
+    --quantile 0.90 \
+    --out results/sweeps/gate_sweep_summary.csv \
+    --progress
+
+  # constrained F1 / Fβ per lead (uses success_col or future-of-target)
+  python sweep_subprocess/sweep_manager.py tool best-constrained \
+    --labelled data/grid_labelled_FMA_gka_realthermo.parquet \
+    --model   models/grid_logit_perlead.pkl \
+    --target  storm \
+    --success-col storm_window \
+    --leads 24 48 72 120 \
+    --min-precision 0.12 \
+    --max-coverage 0.25 \
+    --fbeta 0.5 \
+    --out results/sweeps/best_constrained_thresholds.csv
+
+  # pick top rows from an existing sweep summary
+  python sweep_subprocess/sweep_manager.py tool pick \
+    --csv results/sweeps/demo_sweep_summary.csv \
+    --coverage-max 0.25 \
+    --recall-min   0.20 \
+    --prec-min     0.10 \
+    --topn 5 \
+    --save results/best_fbeta_thresholds.csv
+
+
+Chain recipes
+-------------
+
+The manager can run small chains to connect a sweep with the picker:
+
+  # 1) run sweep_runner, then
+  # 2) pick best thresholds from its summary
+  python sweep_subprocess/sweep_manager.py chain run+pick \
+    --run.labelled data/grid_labelled_FMA_gka_realthermo.parquet \
+    --run.model   models/grid_logit_perlead.pkl \
+    --run.target  storm \
+    --run.leads   24,48,72,120 \
+    --run.out     results/sweeps/demo_sweep_summary.csv \
+    --pick.csv    results/sweeps/demo_sweep_summary.csv \
+    --pick.save   results/best_fbeta_thresholds.csv
+
+  # (optional, if enabled in manager)
+  # 1) run constrained threshold finder, then
+  # 2) pass its table through the picker (for additional constraints or reshaping)
+  python sweep_subprocess/sweep_manager.py chain constrained+pick \
+    --constrained.labelled data/grid_labelled_FMA_gka_realthermo.parquet \
+    --constrained.model   models/grid_logit_perlead.pkl \
+    --constrained.target  storm \
+    --constrained.success-col storm_window \
+    --constrained.leads   24 48 72 120 \
+    --constrained.out     results/sweeps/best_constrained_thresholds.csv \
+    --pick.csv            results/sweeps/best_constrained_thresholds.csv \
+    --pick.save           results/best_fbeta_thresholds.csv
+
+Namespaced arguments follow the pattern `--<tool>.<arg>` and are stripped and
+forwarded internally (e.g. `--run.out` → `--out` for `sweep_runner`).
+
+
+Integration with run_pipeline.py
+--------------------------------
+
+In `config/pipeline.yaml`, the sweep subprocess is controlled by the `sweep:` block.
+
+Minimal example:
+
+  sweep:
+    enabled: true
+    steps:
+      - mode: run
+        labelled: data/grid_labelled_FMA_gka_realthermo.parquet
+        model:    models/grid_logit_perlead.pkl
+        target:   storm
+        leads:    "24,48,72,120"
+        thr_grid: "0.02:0.10:0.002"
+        persist:  "1,2"
+        neighbors: "0,3"
+        quantiles: "0.90"
+        subsample_hours: "1.0"
+        out: results/sweeps/demo_sweep_summary.csv
+
+      - mode: pick
+        csv:  results/sweeps/demo_sweep_summary.csv
+        coverage_max: 0.25
+        recall_min:   0.20
+        prec_min:     0.10
+        topn: 5
+        save: results/best_fbeta_thresholds.csv
+
+These steps are executed by `run_pipeline.py` as:
+
+  python sweep_subprocess/sweep_manager.py tool run  ...
+  python sweep_subprocess/sweep_manager.py tool pick ...
+
+The `score:` section can then consume the thresholds:
+
+  score:
+    enabled: true
+    jobs:
+      - features: data/grid_labelled_FMA_gka_realthermo.parquet
+        bundle:   models/grid_logit_perlead.pkl
+        leads:    "1..240"
+        out_dir:  results/alerts
+        run_name: coral_sea_demo
+        normalize_lon: " -180..180"
+        area: " -5,125,-35,175"
+        thresholds_csv: results/best_fbeta_thresholds.csv
+        thr_col: thr_Fbeta
+
+where `thresholds_csv` and `thr_col` point at the output from either:
+
+  • find_best_f1_thresholds_constrained.py (recommended), or
+  • pick_best_from_sweep.py (using sweep_runner’s summary).
+
+
+Typical Workflow
+----------------
+
+  1) Train or load a per-lead probabilistic model bundle on the labelled grid.
+
+  2) Run the sweep subprocess:
+       - For exploratory work: use `sweep_runner.py` to explore
+         (thr, persist, neighbors, quantile) grids.
+       - For production thresholds: use `find_best_f1_thresholds_constrained.py`
+         with min_precision / max_coverage / Fβ tuned to your use-case.
+
+  3) Use `pick_best_from_sweep.py` (or the constrained finder directly) to
+     produce a compact thresholds table (one row per lead).
+
+  4) Point the main `score:` section to that thresholds CSV via `thresholds_csv`
+     and `thr_col`, then run the full pipeline with:
+         python run_pipeline.py --config config/pipeline.yaml

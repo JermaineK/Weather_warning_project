@@ -21,7 +21,7 @@ Options:
 """
 
 import argparse, sys
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import numpy as np
 import pandas as pd
 
@@ -56,10 +56,11 @@ def _norm_lon(x: pd.Series, mode: str) -> pd.Series:
 
 
 def _to_naive_utc(s: pd.Series) -> pd.Series:
+    # Normalize to UTC then drop timezone for a clean tz-naive series
     return pd.to_datetime(s, utc=True, errors="coerce").dt.tz_localize(None)
 
 
-def _pick_first(df: pd.DataFrame, cands) -> Optional[str]:
+def _pick_first(df: pd.DataFrame, cands: List[str]) -> Optional[str]:
     for c in cands:
         if c in df.columns:
             return c
@@ -70,9 +71,11 @@ def _pick_first(df: pd.DataFrame, cands) -> Optional[str]:
 
 
 def _read_ibtracs_csv(path: str):
-    df = pd.read_csv(path)
+    # Use low_memory=False for saner dtypes
+    df = pd.read_csv(path, low_memory=False)
+
     # Probe common names (case-insensitive)
-    time_col = _pick_first(df, ["iso_time", "iso_time_str", "time", "datetime"])
+    time_col = _pick_first(df, ["iso_time", "iso_time_str", "time", "datetime", "date_time"])
     lat_col  = _pick_first(df, ["lat", "latitude"])
     lon_col  = _pick_first(df, ["lon", "longitude"])
     name_col = _pick_first(df, ["name", "storm_name"])
@@ -92,6 +95,7 @@ def _read_ibtracs_netcdf(path: str):
     if xr is None:
         raise RuntimeError("xarray not installed; cannot read NetCDF. Use an IBTrACS CSV instead.")
     ds = xr.open_dataset(path)
+
     # Pull a broad set and tidy to DataFrame; we'll probe column names later
     want = []
     for cand in ["time", "iso_time", "date_time"]:
@@ -108,9 +112,32 @@ def _read_ibtracs_netcdf(path: str):
                  "name", "storm_name"]:
         if cand in ds.variables:
             want.append(cand)
+
     df = ds[want].to_dataframe().reset_index()
-    # We’ll probe generically below
+    # We'll probe generically below
     return df, None, None, None, None, None, None
+
+
+def _combine_numeric_candidates(df: pd.DataFrame, candidates: List[str], mode: str) -> pd.Series:
+    """
+    Combine multiple numeric columns:
+      mode="max" → rowwise max across candidates
+      mode="min" → rowwise min across candidates
+    Returns NaNs if no candidates present.
+    """
+    present = []
+    for c in candidates:
+        col = _pick_first(df, [c])
+        if col:
+            present.append(col)
+    if not present:
+        return pd.Series(np.nan, index=df.index)
+
+    arr = {c: pd.to_numeric(df[c], errors="coerce") for c in present}
+    frame = pd.DataFrame(arr)
+    if mode == "min":
+        return frame.min(axis=1)
+    return frame.max(axis=1)
 
 
 # ----------------------------- main -----------------------------
@@ -160,20 +187,20 @@ def main():
     lon = _norm_lon(df[lon_col], args.normalize_lon)
 
     # Choose wind/pressure candidates
-    # wind_cols_map may be None in some NetCDF variants; fall back to generic list
     if isinstance(wind_cols_map, dict):
         src = args.wind_source.upper()
+        # dict keys: "USA", "WMO", "auto"
         pref = wind_cols_map.get(src, wind_cols_map.get("auto", []))
     else:
+        # NetCDF or unknown: generic fallbacks
         pref = ["usa_wind", "wmo_wind", "wind", "max_wind"]
-    wind_col = _pick_first(df, pref)
-    pres_col = _pick_first(df, pres_cols or ["usa_pres", "wmo_pres", "min_slp", "central_pressure", "pmin", "pres"])
 
-    vmax = pd.to_numeric(df[wind_col], errors="coerce") if wind_col else pd.Series([np.nan] * len(df))
-    pmin = pd.to_numeric(df[pres_col], errors="coerce") if pres_col else pd.Series([np.nan] * len(df))
+    # Combine candidate winds (max) and candidate pressures (min)
+    vmax = _combine_numeric_candidates(df, pref, mode="max")
+    pres_candidates = pres_cols or ["usa_pres", "wmo_pres", "min_slp", "central_pressure", "pmin", "pres"]
+    pmin = _combine_numeric_candidates(df, pres_candidates, mode="min")
 
     # Handle units (rough heuristic): if values look small, assume m/s → convert to kt
-    # Typical kt winds for TCs are > 34 kt. If 95th pct < 60, it's probably m/s.
     if vmax.notna().sum() > 10:
         p95 = np.nanpercentile(vmax.to_numpy(dtype=float), 95)
         if p95 < 60:  # likely m/s
@@ -195,13 +222,17 @@ def main():
         "name": name,
     }).dropna(subset=["obs_time", "lat", "lon"]).reset_index(drop=True)
 
+    # Stable ordering for downstream / debugging
+    if "name" in out.columns and "obs_time" in out.columns:
+        out = out.sort_values(["name", "obs_time"], kind="mergesort").reset_index(drop=True)
+
     n0 = len(out)
 
     # Optional filters
     if args.start:
         out = out.loc[out["obs_time"] >= pd.Timestamp(args.start)]
     if args.end:
-        # inclusive day
+        # inclusive end-day (keep anything up to end + 1 day)
         out = out.loc[out["obs_time"] <= (pd.Timestamp(args.end) + pd.Timedelta(days=1))]
     if args.min_wind > 0:
         out = out.loc[pd.to_numeric(out["vmax"], errors="coerce").fillna(-np.inf) >= float(args.min_wind)]
@@ -223,7 +254,7 @@ def main():
     compression = "gzip" if str(args.out).lower().endswith(".gz") else "infer"
     out.to_csv(args.out, index=False, compression=compression, date_format="%Y-%m-%d %H:%M:%S")
 
-    if not args.quiet:
+    if not args.quiet and len(out):
         tmin = out["obs_time"].min()
         tmax = out["obs_time"].max()
         print(f"[besttrack] wrote {args.out} | rows={len(out):,} | time: {tmin} → {tmax}")

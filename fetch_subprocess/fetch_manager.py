@@ -18,7 +18,7 @@ FETCH_AREA         e.g. "-10,135,-25,155"
 FETCH_HOURS        e.g. "0..23"
 FETCH_PL_LEVELS    e.g. "1000,925,850,700,500"
 FETCH_PL_VARS      e.g. "u v"
-FETCH_SINGLE_VARS  e.g. "u10 v10 msl t2m d2m tcwv tp sshf slhf"
+FETCH_SINGLE_VARS  e.g. "u10 v10 msl t2m d2m tcwv tp sshf slhf divergence vorticity"
 
 Downstream override rule: your CLI flags come after the preset, so they win.
 """
@@ -45,6 +45,7 @@ SCRIPT_MAP: Dict[str, str] = {
 }
 
 ALIASES: Dict[str, str] = {
+    "int": "intensity",
     "era5-fetch":     "era5",
     "reanalysis":     "era5",
     "tracks":         "ibtracs",
@@ -60,12 +61,16 @@ ALIASES: Dict[str, str] = {
 
 def normalize_tool(name: str) -> str:
     n = name.strip()
-    if n in SCRIPT_MAP: return n
-    if n in ALIASES:    return ALIASES[n]
+    if n in SCRIPT_MAP:
+        return n
+    if n in ALIASES:
+        return ALIASES[n]
     alt = n.replace("_", "-")
-    if alt in SCRIPT_MAP: return alt
+    if alt in SCRIPT_MAP:
+        return alt
     alt2 = n.replace("-", "_")
-    if alt2 in SCRIPT_MAP: return alt2
+    if alt2 in SCRIPT_MAP:
+        return alt2
     return n
 
 def find_script(tool: str) -> Path:
@@ -110,7 +115,11 @@ def build_preset_args(tool: str) -> List[str]:
     pl_lv  = os.getenv("FETCH_PL_LEVELS", "1000,925,850,700,500")
     pl_vs  = os.getenv("FETCH_PL_VARS",   "u v")
     # Safe default single-levels for your downstream thermo & features:
-    s_vs   = os.getenv("FETCH_SINGLE_VARS", "u10 v10 msl t2m d2m tcwv tp sshf slhf")
+    s_vs   = os.getenv(
+        "FETCH_SINGLE_VARS",
+        # Minimal but complete set for your downstream thermo + shear + GKA features:
+        "u10 v10 msl t2m d2m tcwv tp sshf slhf divergence vorticity",
+    )
 
     preset: List[str] = []
 
@@ -132,7 +141,10 @@ def build_preset_args(tool: str) -> List[str]:
     elif tool_norm == "era5-pl":
         # Pressure-levels only (u, v @ default levels) for bulk-shear harvests
         maybe_common()
-        preset.extend(["--pl-vars", *split_words(pl_vs)])
+        preset.extend(["--dataset", "reanalysis-era5-pressure-levels"])
+        pl_vars = split_words(pl_vs)
+        if pl_vars:
+            preset.extend(["--pl-vars", *pl_vars])
         preset.extend(["--pl-levels", pl_lv])
         preset.extend(["--pl-suffix", "uv"])  # tidy filenames
 
@@ -142,7 +154,9 @@ def build_preset_args(tool: str) -> List[str]:
         s_vars = split_words(s_vs)
         if s_vars:
             preset.extend(["--vars", *s_vars])
-        preset.extend(["--pl-vars", *split_words(pl_vs)])
+        pl_vars = split_words(pl_vs)
+        if pl_vars:
+            preset.extend(["--pl-vars", *pl_vars])
         preset.extend(["--pl-levels", pl_lv])
         preset.extend(["--pl-suffix", "uv"])
 
@@ -150,7 +164,12 @@ def build_preset_args(tool: str) -> List[str]:
         # No presets; you’ll pass --in-glob/--out-dir/--suffix etc. directly.
         pass
 
-    # Other tools (ibtracs/intensity) don't need presets.
+    elif tool_norm == "ibtracs":
+        # Enforce a consistent lon frame for downstream processing if the user
+        # doesn’t explicitly override it on the CLI.
+        preset.extend(["--normalize-lon", "-180..180"])
+
+    # Other tools (intensity, etc.) don't need presets: they already have sane defaults.
     return preset
 
 # ---------- Main ----------
@@ -164,6 +183,8 @@ def main():
     ap.add_argument("tool", choices=choices, help="Which fetch tool (or preset) to run")
     ap.add_argument("--dry-run", action="store_true", help="Print the command and exit")
     ap.add_argument("--quiet", action="store_true", help="Append --quiet to downstream tool if supported")
+    ap.add_argument("--print-preset", action="store_true",
+                    help="Print the resolved preset args for this tool (for debugging)")
 
     ns, extra = ap.parse_known_args()
 
@@ -172,6 +193,8 @@ def main():
 
     # Preset arguments (prepended); user's extra args come after and override as needed
     preset_args = build_preset_args(ns.tool)
+    if ns.print_preset:
+        print("[preset]", " ".join(map(str, preset_args)))
     if preset_args:
         cmd.extend(preset_args)
 

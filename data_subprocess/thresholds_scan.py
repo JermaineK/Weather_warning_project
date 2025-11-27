@@ -62,7 +62,7 @@ python data_subprocess/thresholds_scan.py ^
   --rich data/grid_labelled_FMA_gka_realthermo_sph.csv.gz ^
   --out-enriched results/high_score_enriched.csv.gz ^
   --out-summary results/feature_candidate_summary.csv ^
-  --score-quantile 0.99 ^
+  --score-quantile 0.9 ^
   --candidate-cols CAPE shear_deep S3 SFI sph_radial_abs spiral_score
 """
 
@@ -293,7 +293,7 @@ def select_high_score_alerts_streaming(
                 total_rows += len(chunk)
         _print(f"[scan] using fixed score threshold={thr:.4f} (total_rows={total_rows})")
     else:
-        q = 0.99 if score_quantile is None else float(score_quantile)
+        q = 0.9 if score_quantile is None else float(score_quantile)
         thr, total_rows = _estimate_quantile_reservoir(
             alerts_path=alerts_path,
             score_col=score_col,
@@ -617,8 +617,8 @@ def main():
     ap.add_argument(
         "--score-quantile",
         type=float,
-        default=0.99,
-        help="Quantile for score-based high selection when threshold not set (default: 0.99).",
+        default=0.9,
+        help="Quantile for score-based high selection when threshold not set (default: 0.9).",
     )
 
     # Candidate feature list

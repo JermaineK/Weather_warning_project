@@ -63,6 +63,8 @@ features:
       low_pair: 1000,925
       deep_pair: 1000,500
       overwrite: true
+      normalize_lon: *norm
+      area: *area
 
     - mode: join-features
       enabled: false
@@ -75,7 +77,7 @@ features:
     - mode: patch
       enabled: false
       in:  data/features_merged.parquet
-      out: data/features_merged_patched.parquet
+      out: data/features_merged_patched.csv.gz
       neighbor_step: 0.0
       radius_cells: 1
       prefer_shear: shear_06km
@@ -85,21 +87,21 @@ features:
     # Optional legacy join-to-labels; not required for the GKA+thermo chain
     - mode: join
       enabled: false
-      features: data/features_merged.parquet
+      features: data/features_merged_patched.csv.gz
       labels:   data/tracks/tracks_subset.csv
       out:      data/grid_labelled_base.csv.gz
 
     - mode: gka
-      enabled: false
-      infile:  data/features_merged_patched.parquet
-      outfile: data/grid_labelled_FMA_gka.parquet
+      enabled: true
+      infile:  data/features_merged_patched.csv.gz
+      outfile: data/grid_labelled_FMA_gka.csv.gz
       overwrite: true
 
     - mode: integrate-thermo
-      enabled: false
-      features: data/grid_labelled_FMA_gka.parquet
+      enabled: true
+      features: data/grid_labelled_FMA_gka.csv.gz
       thermo_glob: data_era5/extracted/**/era5_single_*_*.nc
-      out: data/grid_labelled_FMA_gka_realthermo.parquet
+      out: data/grid_labelled_FMA_gka_realthermo.csv.gz
       nearest: true
       nearest_maxdeg: 0.4
       normalize_lon: *norm
@@ -107,8 +109,8 @@ features:
       overwrite: true
 
     - mode: spherical-feedback
-      enabled: false
-      infile:  data/grid_labelled_FMA_gka_realthermo.parquet
+      enabled: true
+      infile:  data/grid_labelled_FMA_gka_realthermo.csv.gz
       out:     data/grid_labelled_FMA_gka_realthermo_sph.csv.gz
 
       neighbor_step: 0.0
@@ -135,8 +137,8 @@ data_stage:
     # 1) Stage: sanitize any CSVs + scan the rich label table(s),
     #    then build IDs + a slim scoring table for downstream scripts.
     - mode: stage-data
-      id_build_enable: false
-      id_src: data/grid_labelled_FMA_gka_realthermo.parquet
+      id_build_enable: true
+      id_src: data/grid_labelled_FMA_gka_realthermo.csv.gz
       id_extra_src: data/grid_labelled_FMA_gka_realthermo_sph.csv.gz
       id_key_out: data/grid_key_table.csv.gz
       id_full_out: data/grid_labelled_FMA_gka_realthermo_merged_with_id.csv.gz
@@ -183,15 +185,18 @@ data_stage:
         - gka_Q
         - gka_vortdiv_ratio
         - gka_dir_var
-        - sph_center
-        - sph_radial_signed
-        - sph_radial_abs
-        - sph_vdr_std
         - t2m_anom_local
         - pdrop_nd
         - thermo_shear
-        - SFI
-        - SFI2 
+
+    - mode: train-logit
+      enabled: true
+      labelled: data/grid_labelled_FMA_gka_realthermo_merged_with_id.csv.gz
+      out: models/grid_logit_perlead.pkl
+      label-col: storm
+      leads: "24,48,72,120,240"
+      min-positives: 30
+      eval: true
 
     # 2) Heuristic scoring from slim table → scored alerts
     - mode: score-heuristic
@@ -241,11 +246,6 @@ data_stage:
         - gka_Q
         - gka_vortdiv_ratio
         - gka_dir_var
-        - sph_center
-        - sph_radial_signed
-        - sph_radial_abs
-        - sph_vdr_std
-        - t2m_anom_local
         - pdrop_nd
         - thermo_shear
 
@@ -356,19 +356,79 @@ data_stage:
       weights_json:
       default_weight: 40.0
       shift: 0.0
-      temp: 200.0
-      keep_features: false
+      temp: 500.0
+      keep_features: true
       chunk_rows: 400000
 
 
 # =====================================================================
-# 3) Sweep manager — now ON (can be tuned)
+# 3) Sweep manager — model threshold sweeps (optional, exploratory)
 # =====================================================================
 sweep:
   enabled: true
   steps:
-    - {mode: run, out: results/sweeps/demo}
-    - {mode: pick, sweep_dir: results/sweeps/demo, metric: F1, out: results/sweeps/demo/best.csv}
+    # 3.1) Joint run+pick sweep:
+    #      - run: sweep_runner → builds a grid of (thr, persist, neighbors, quantile)
+    #      - pick: pick_best_from_sweep → filters & picks best per-lead rows
+    #
+    # Produces:
+    #   results/sweeps/coral_sea_demo_sweep.csv
+    #   results/sweeps/coral_sea_demo_best_from_sweep.csv   (nice human-readable table)
+    - mode: chain
+      recipe: "run+pick"
+
+      run:
+        labelled: data/grid_labelled_FMA_gka_realthermo_merged_with_id.csv.gz
+        model: models/grid_logit_perlead.pkl
+        target: storm           # or "pregen" / "near_storm" if that's what the bundle used
+        leads: "24,48,72,120,240"
+
+        # Threshold grid & filters
+        thr_grid: "0.02:0.18:0.002"
+        persist: "1,2"
+        neighbors: "0,3"
+        quantiles: "0.90"
+
+        # Hour downsampling for speed:
+        #   "1.0" = use all hours
+        #   "0.3" = random ~30% of hours
+        #   "every:3" = keep every 3rd hour
+        subsample_hours: "1.0"
+
+        out: "results/sweeps/coral_sea_demo_sweep.csv"
+
+      pick:
+        csv: "results/sweeps/coral_sea_demo_sweep.csv"
+        coverage_max: 0.25
+        recall_min:   0.20
+        prec_min:     0.10
+        topn: 5
+        save: "results/sweeps/coral_sea_demo_best_from_sweep.csv"
+
+    # 3.2) Constrained per-lead threshold finder.
+    #      This is the one that can feed directly into the `score:` section
+    #      via results/best_fbeta_thresholds.csv (thr_Fbeta per lead).
+    #      Leave disabled by default; enable once the model + labels are stable.
+    - mode: best-constrained
+      enabled: true
+      labelled: data/grid_labelled_FMA_gka_realthermo_merged_with_id.csv.gz
+      model: models/grid_logit_perlead.pkl
+      target: storm
+      success-col: storm_window   # if missing, script falls back to future window of `target`
+      leads: 24 48 72 120 240
+
+      min-precision: 0.12
+      max-coverage: 0.25
+      fbeta: 0.5
+
+      out: "results/best_fbeta_thresholds.csv"
+      save-table: "results/sweeps/coral_sea_demo_constrained_curve_last_lead.csv"
+
+      # Domain hygiene (matches rest of pipeline)
+      time-format:
+      normalize-lon: *norm
+      area: *area
+      prob-grid: 1000
 
 # =====================================================================
 # 4) Scoring (legacy ML scorer — may be bypassed if using heuristic-only)

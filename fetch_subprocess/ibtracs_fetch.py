@@ -52,7 +52,8 @@ def _download_or_cache(url: str, cache_path: Path) -> Path:
 
 def _to_utc_naive(series) -> pd.Series:
     t = pd.to_datetime(series, utc=True, errors="coerce")
-    return t.dt.tz_convert(None)
+    # FIX: drop timezone to get naive UTC
+    return t.dt.tz_localize(None)
 
 def _norm_lon(x: pd.Series, frame: str) -> pd.Series:
     v = pd.to_numeric(x, errors="coerce")
@@ -88,34 +89,25 @@ def _read_yaml_defaults(yaml_path: str) -> Dict[str, str]:
     return out
 
 def _preferred_wind(df: pd.DataFrame) -> pd.Series:
-    # Try USA_WIND, WMO_WIND, then any *_WIND numeric max per row
-    cand = [c for c in ["USA_WIND","WMO_WIND"] if c in df.columns]
+    # Prefer USA_WIND, WMO_WIND if present, else any *_WIND
+    cand = [c for c in ["USA_WIND", "WMO_WIND"] if c in df.columns]
     if not cand:
         cand = [c for c in df.columns if c.endswith("_WIND")]
     if not cand:
         return pd.Series(np.nan, index=df.index)
-    s = None
-    for c in cand:
-        v = pd.to_numeric(df[c], errors="coerce")
-        s = v if s is None else s.fillna(v)
-    # last resort: rowwise max across remaining *_WIND
-    if len(cand) > 1:
-        s = pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce") for c in cand}).max(axis=1)
-    return s
+
+    winds = {c: pd.to_numeric(df[c], errors="coerce") for c in cand}
+    return pd.DataFrame(winds).max(axis=1)
 
 def _preferred_pres(df: pd.DataFrame) -> pd.Series:
-    cand = [c for c in ["USA_PRES","WMO_PRES"] if c in df.columns]
+    cand = [c for c in ["USA_PRES", "WMO_PRES"] if c in df.columns]
     if not cand:
         cand = [c for c in df.columns if c.endswith("_PRES")]
     if not cand:
         return pd.Series(np.nan, index=df.index)
-    s = None
-    for c in cand:
-        v = pd.to_numeric(df[c], errors="coerce")
-        s = v if s is None else s.fillna(v)
-    if len(cand) > 1:
-        s = pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce") for c in cand}).min(axis=1)
-    return s
+
+    pres = {c: pd.to_numeric(df[c], errors="coerce") for c in cand}
+    return pd.DataFrame(pres).min(axis=1)
 
 def _dedup_per_sid_time(df: pd.DataFrame) -> pd.DataFrame:
     # keep max wind, min pressure per (SID,time)
@@ -171,8 +163,6 @@ def main():
         "LAT","LON",
         "USA_WIND","WMO_WIND","USA_PRES","WMO_PRES"
     ]
-    # If the file has lowercase headers, pandas will still select by name mismatch;
-    # so read all, but quickly try usecols and fall back gracefully.
     try:
         df = pd.read_csv(csv_path, low_memory=False, usecols=usecols)
     except Exception:
