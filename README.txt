@@ -44,14 +44,28 @@ python -m venv .venv
 source .venv/bin/activate   # or .\.venv\Scripts\activate on Windows
 pip install -r requirements.txt
 
-Minimal dependencies:
+Minimal dependencies (for quick data exploration or running lightweight scripts):
 
-pandas
-numpy
-scipy
-matplotlib
-pyyaml
-scikit-learn
+- numpy
+- pandas
+- scipy
+- matplotlib
+- pyyaml
+- scikit-learn
+
+Full pipeline dependencies (mirrors `requirements.txt`):
+
+- numpy
+- pandas
+- xarray
+- pyarrow
+- lightgbm
+- scikit-learn
+- matplotlib
+- cartopy
+- scipy
+- joblib
+- pyyaml
 
 
 ---

@@ -8,3 +8,4 @@ matplotlib
 cartopy
 scipy
 joblib
+pyyaml
