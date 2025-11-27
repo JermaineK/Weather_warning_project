@@ -1,9 +1,9 @@
 ---
 Reports & Maps Subprocess — Mini README
 This subsystem produces post-run artifacts: maps, overlays, summaries, and sanity checks.
-Everything is coordinated by reports_and_maps_manager.py, which creates a new timestamped run folder:
-results/reports/20251122_run001/
-results/reports/20251122_run002/
+Everything is coordinated by reports_and_maps_manager.py, which creates a new timestamped run folder (auto-incremented per day so prior runs remain for comparison):
+results/reports/251122_run001/
+results/reports/251122_run002/
 … (never overwritten)
 
 Each run folder contains:
@@ -33,12 +33,12 @@ python reports_and_maps_manager.py \
   --ibtracs data/ibtracs/ibtracs.ALL.list.v04r01.csv
 
 After completion, you'll find everything under:
-results/reports/YYYYMMDD_runNNN/
+results/reports/YYMMDD_runNNN/
 
 Manager flags (common):
 --run-name <string>              # Required. Appears in summary file.
 --run-root <dir>                 # Folder where runNNN folders are created.
---run-date YYYYMMDD              # Optional override; default = today UTC.
+--run-date YYMMDD                # Optional override; default = today UTC. (YYYYMMDD also accepted)
 --union-csv <file>               # Seed union-by-hour.
 --patches-csv <file>             # Seed patches.
 --matches-csv <file>             # Seed–track matched pairs.
