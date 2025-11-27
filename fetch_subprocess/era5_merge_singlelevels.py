@@ -222,7 +222,8 @@ def main():
     in_paths = [p for p in in_paths if p.is_file() and p.suffix.lower() == ".nc"]
 
     if not in_paths:
-        print(f"[err] no .nc matched: {args.in_glob}", file=sys.stderr)
+        msg = f"[err] no .nc matched: {args.in_glob}"
+        print(msg, file=sys.stderr)
         sys.exit(2)
 
     # bucket by YYYYMM
