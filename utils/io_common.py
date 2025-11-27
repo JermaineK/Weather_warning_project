@@ -1,15 +1,53 @@
 from __future__ import annotations
 from pathlib import Path
+import importlib.util
+import inspect
 import pandas as pd
 
 READ_DATE_COLS = ("time", "seed_time", "obs_time", "match_time")
+
+def _csv_kwargs(extra_kw):
+    kw = dict(memory_map=True, low_memory=True)
+
+    # opt in to Arrow-backed columns where possible; this keeps large numeric
+    # tables off the Python heap and helps avoid tokenization OOMs in pipelines
+    if "dtype_backend" in inspect.signature(pd.read_csv).parameters:
+        kw["dtype_backend"] = "pyarrow"
+    if importlib.util.find_spec("pyarrow") is not None:
+        kw.setdefault("engine", "pyarrow")
+
+    kw.update(extra_kw)
+
+    usecols = kw.get("usecols")
+    if "parse_dates" in kw:
+        parse = kw.get("parse_dates") or []
+        if usecols:
+            parse = [c for c in parse if c in usecols]
+        if parse:
+            kw["parse_dates"] = parse
+        else:
+            kw.pop("parse_dates", None)
+    elif READ_DATE_COLS:
+        parse = [c for c in READ_DATE_COLS if not usecols or c in usecols]
+        if parse:
+            kw["parse_dates"] = parse
+    return kw
+
 
 def read_any(path: str, parse_dates: tuple[str,...]=READ_DATE_COLS, **kw) -> pd.DataFrame:
     p = str(path).lower()
     if p.endswith((".parquet",".parq",".pq")):
         return pd.read_parquet(path, **kw)
-    return pd.read_csv(path, low_memory=False,
-                       parse_dates=[c for c in parse_dates if c in (kw.get("usecols") or []) or True], **kw)
+
+    if "parse_dates" not in kw and parse_dates:
+        kw["parse_dates"] = parse_dates
+    kw = _csv_kwargs(kw)
+
+    try:
+        return pd.read_csv(path, **kw)
+    except TypeError:
+        kw.pop("dtype_backend", None)
+        return pd.read_csv(path, **kw)
 
 def write_any(path: str, df: pd.DataFrame) -> None:
     p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)

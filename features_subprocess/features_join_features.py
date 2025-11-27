@@ -4,6 +4,9 @@
 features_join_features.py
 Merge two feature tables on keys (default: "time, lat, lon").
 
+Supports optional column pruning via --left-cols/--right-cols to reduce memory
+when reading wide CSV feature tables.
+
 Examples:
   python features_join_features.py \
     --left  data/features_eoi.parquet \
@@ -15,13 +18,48 @@ Examples:
 from __future__ import annotations
 import argparse
 from pathlib import Path
+import importlib
+import inspect
 import pandas as pd
+
+def _csv_read_kwargs(usecols):
+    """Return memory-friendlier kwargs for CSV loading.
+
+    We prefer the Arrow-backed dtype storage and the Arrow engine (when
+    available) because both stream data in smaller chunks and avoid creating
+    large temporary Python objects during parsing.
+    """
+
+    kw = dict(
+        compression="infer",
+        usecols=usecols if usecols else None,
+        memory_map=True,
+        low_memory=True,
+    )
+
+    # opt-in to Arrow dtype storage if the local pandas supports it
+    if "dtype_backend" in inspect.signature(pd.read_csv).parameters:
+        kw["dtype_backend"] = "pyarrow"
+
+    # Arrow engine often uses less memory than the default C parser
+    if importlib.util.find_spec("pyarrow") is not None:
+        kw["engine"] = "pyarrow"
+
+    return kw
+
 
 def read_any(path: str, usecols=None):
     low = str(path).lower()
     if low.endswith((".parquet",".parq",".pq",".pqt")):
         return pd.read_parquet(path, columns=usecols if usecols else None)
-    return pd.read_csv(path, compression="infer", low_memory=False, usecols=usecols if usecols else None)
+
+    kw = _csv_read_kwargs(usecols)
+    try:
+        return pd.read_csv(path, **kw)
+    except TypeError:
+        # Older pandas versions may not understand the dtype_backend kwarg.
+        kw.pop("dtype_backend", None)
+        return pd.read_csv(path, **kw)
 
 def write_any(path: str, df: pd.DataFrame, overwrite=True):
     p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
@@ -49,6 +87,8 @@ def parse_args():
     ap.add_argument("--left", required=True)
     ap.add_argument("--right", required=True)
     ap.add_argument("--on", default="time, lat, lon", help='comma-separated list of join keys')
+    ap.add_argument("--left-cols", help="comma-separated column subset for the left table")
+    ap.add_argument("--right-cols", help="comma-separated column subset for the right table")
     ap.add_argument("--out", required=True)
     ap.add_argument("--normalize-lon", default="-180..180")
     ap.add_argument("--overwrite", action="store_true")
@@ -56,15 +96,26 @@ def parse_args():
 
 def main():
     args = parse_args()
-    left  = read_any(args.left)
-    right = read_any(args.right)
+
+    keys = [k.strip() for k in str(args.on).split(",") if k.strip()]
+
+    def _with_keys(col_spec):
+        cols = [c.strip() for c in str(col_spec).split(",") if c.strip()] if col_spec else []
+        if cols:
+            cols = sorted({*cols, *keys})
+        return cols or None
+
+    left_cols = _with_keys(args.left_cols)
+    right_cols = _with_keys(args.right_cols)
+
+    left  = read_any(args.left, usecols=left_cols)
+    right = read_any(args.right, usecols=right_cols)
 
     if "time" in left:   left["time"]  = to_naive_utc(left["time"])
     if "time" in right:  right["time"] = to_naive_utc(right["time"])
     if "lon" in left:    left["lon"]   = wrap_lon(left["lon"], args.normalize_lon)
     if "lon" in right:   right["lon"]  = wrap_lon(right["lon"], args.normalize_lon)
 
-    keys = [k.strip() for k in str(args.on).split(",") if k.strip()]
     out = left.merge(right, on=keys, how="left", suffixes=("","_r"))
 
     write_any(args.out, out, overwrite=args.overwrite)
