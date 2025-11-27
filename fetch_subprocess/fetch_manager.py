@@ -102,12 +102,13 @@ def split_words(val: str | None) -> List[str]:
     raw = [s.strip() for s in val.replace(",", " ").split()]
     return [s for s in raw if s]
 
-def build_preset_args(tool: str) -> List[str]:
+def build_preset_args(tool: str, extra_args: List[str] | None = None) -> List[str]:
     """
     Returns a list of CLI args to PREPEND for the selected tool.
     Downstream user-supplied args come after and therefore override these.
     """
     tool_norm = normalize_tool(tool)
+    extra_args = extra_args or []
 
     # Env-driven defaults (optional)
     area   = os.getenv("FETCH_AREA")                # e.g. "-10,135,-25,155"
@@ -167,7 +168,9 @@ def build_preset_args(tool: str) -> List[str]:
     elif tool_norm == "ibtracs":
         # Enforce a consistent lon frame for downstream processing if the user
         # doesn’t explicitly override it on the CLI.
-        preset.extend(["--normalize-lon", "-180..180"])
+        has_norm = any(arg.startswith("--normalize-lon") for arg in extra_args)
+        if not has_norm:
+            preset.extend(["--normalize-lon", "-180..180"])
 
     # Other tools (intensity, etc.) don't need presets: they already have sane defaults.
     return preset
@@ -192,7 +195,7 @@ def main():
     cmd = [sys.executable, str(script)]
 
     # Preset arguments (prepended); user's extra args come after and override as needed
-    preset_args = build_preset_args(ns.tool)
+    preset_args = build_preset_args(ns.tool, extra)
     if ns.print_preset:
         print("[preset]", " ".join(map(str, preset_args)))
     if preset_args:
