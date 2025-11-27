@@ -198,6 +198,45 @@ data/tracks/
 
 
 
+\## Pipeline orchestration and CLI entry points
+
+The top-level pipeline fans out into manager scripts, which in turn dispatch to the worker scripts listed above. Steps are driven by your YAML config and translated into CLI flags for each target.
+
+```
+run_pipeline.py
+ ├─ run_fetch → fetch_subprocess/fetch_manager.py → era5_fetch_cds.py / era5_merge_singlelevels.py / ibtracs_fetch.py / prepare_besttrack_intensity.py (mode-driven)
+ ├─ run_features → features_subprocess/features_manager.py → build_features_grid.py / features_patch.py / join_labels_grid.py / compute_gka_features.py / integrate_era5_thermo.py / compute_spherical_feedback.py / features_bulk_shear.py / features_join_features.py (mode-driven)
+ ├─ run_data_stage → data_subprocess/data_stage_manager.py (mode-driven)
+ ├─ run_sweep → sweep_subprocess/sweep_manager.py (mode-driven; supports “chain” recipe)
+ ├─ run_score → grid_score.py (per-job args)
+ ├─ run_alerts_logic → alerts_logic_subprocess/alerts_logic_manager.py (mode-driven)
+ ├─ run_eval → eval_subprocess/eval_manager.py (mode-driven)
+ ├─ run_seeds → seeds_subprocess/seeds_tracks.py (subcommands: from-alerts, proto-outcomes, starts-vs-tracks, analyze)
+ ├─ run_report → reports_subprocess/reports_and_maps_manager.py (mode-driven steps, legacy single-step support)
+ └─ run_misc → arbitrary scripts resolved relative to repo root
+```
+
+### Core arguments
+
+- `run_pipeline.py` requires `--config <YAML>` and optionally `--sections` (comma list; defaults to all sections in the order above).
+- Each YAML section block honors an `enabled` toggle; steps/jobs within sections can also set `enabled` and `skip_if_exists` (where supported) to bypass work when outputs already exist.
+
+### Section-specific wiring
+
+- **Fetch (`fetch.steps`)**: each step must supply `mode` (defaults to `ibtracs`) selecting the fetch tool; additional keys become CLI flags. The manager requires positional `tool` plus optional `--dry-run`, `--quiet`, `--print-preset`, and any downstream script flags (user args override presets; some env vars like `FETCH_AREA` may influence defaults).
+- **Features (`features.steps`)**: `mode` defaults to `build`. Supports `skip_if_exists` before dispatch. Manager requires positional `mode`, optional `--dry-run`, and passes through the remaining YAML keys (with small flag rewrites/CSV compaction for certain modes).
+- **Data staging / sweep / alerts_logic / eval**: each step requires/assumes `mode` (defaults are documented in code) plus arbitrary CLI-flags-as-keys. `sweep` special-cases `mode: chain` with optional `recipe` (default `run+pick`).
+- **Score (`score.jobs`)**: list of jobs without modes; all keys become CLI args to `grid_score.py`.
+- **Seeds**: top-level toggles subsections `from_alerts`, `outcomes`, `starts`, `analyze`; each subsection’s keys map to CLI flags for the corresponding `seeds_tracks.py` subcommand.
+- **Report (`report.steps`)**: each step needs `mode` (default `summary`); legacy single-block configs are coerced into one summary step; supports `skip_if_exists` before dispatch.
+- **Misc (`misc.steps`)**: each entry must provide `script`; other keys become CLI flags; optional `skip_if_exists` supported.
+
+
+
+---
+
+
+
 \## Installation
 
 
