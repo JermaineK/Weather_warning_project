@@ -23,6 +23,7 @@ import sys
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Union
+from collections import Counter
 
 try:
     import yaml
@@ -95,62 +96,186 @@ def _candidate_out_path(step: Dict[str, Any]) -> Path | None:
             return Path(v)
     return None
 
+
+def _progress(tag: str, idx: int, total: int, label: str) -> None:
+    total = max(total, 1)
+    print(f"[{tag}] step {idx}/{total}: {label}")
+
+
+def _output_paths(step: Dict[str, Any]) -> List[Path]:
+    paths: List[Path] = []
+    for k, v in step.items():
+        if not isinstance(v, str) or not v.strip():
+            continue
+        key = k.lower()
+        if key == "outcomes":
+            continue
+        if key == "out" or key.startswith("out_") or key.startswith("outfile") or key.startswith("outcsv"):
+            paths.append(Path(v))
+    return paths
+
+
+def _input_paths(step: Dict[str, Any]) -> tuple[list[Path], list[str]]:
+    files: List[Path] = []
+    globs: List[str] = []
+
+    for k, v in step.items():
+        if not isinstance(v, str) or not v.strip():
+            continue
+        key = k.lower()
+        if key in {"mode", "enabled", "skip_if_exists", "recipe"}:
+            continue
+        if key.startswith("out") or key.startswith("outfile"):
+            continue
+        if "glob" in key:
+            globs.append(v)
+            continue
+
+        p = Path(v)
+        looks_like_path = p.suffix or "/" in v or "\\" in v
+        if looks_like_path:
+            files.append(p)
+
+    return files, globs
+
+
+def _read_columns(path: Path) -> List[str] | None:
+    suffixes = "".join(path.suffixes[-2:]).lower()
+    ext = suffixes if suffixes in {".csv.gz", ".parquet"} else path.suffix.lower()
+    try:
+        if ext == ".parquet":
+            try:
+                import pyarrow.parquet as pq  # type: ignore
+
+                return list(pq.ParquetFile(path).schema.names)
+            except Exception:
+                import pandas as pd  # type: ignore
+
+                return list(pd.read_parquet(path, columns=None).columns)
+        if ext in {".csv", ".csv.gz"}:
+            import pandas as pd  # type: ignore
+
+            return list(pd.read_csv(path, nrows=0).columns)
+    except Exception as exc:  # pragma: no cover - diagnostic path
+        print(f"[describe] failed reading columns for {path}: {exc}")
+    return None
+
+
+def _describe_path(tag: str, role: str, path: Path) -> None:
+    pp = path if path.is_absolute() else Path.cwd() / path
+    if not pp.exists():
+        print(f"[{tag} {role}] {path} (missing)")
+        return
+    if pp.is_dir():
+        count = Counter(child.is_dir() for child in pp.iterdir())
+        files = sum(1 for child in pp.iterdir() if child.is_file())
+        print(f"[{tag} {role}] {path} (dir: {files} files, {count[True]} dirs)")
+        return
+    cols = _read_columns(pp)
+    if cols:
+        print(f"[{tag} {role}] {path} columns={cols}")
+    else:
+        print(f"[{tag} {role}] {path} (exists; column listing unavailable)")
+
+
+def _describe_outputs(tag: str, step: Dict[str, Any]) -> None:
+    paths = _output_paths(step)
+    for p in paths:
+        _describe_path(tag, "output", p)
+
+
+def _describe_inputs(tag: str, step: Dict[str, Any]) -> None:
+    files, globs = _input_paths(step)
+
+    for g in globs:
+        matches = sorted(Path().glob(g))
+        if not matches:
+            print(f"[{tag} input] glob={g} (no matches)")
+            continue
+        print(f"[{tag} input] glob={g} → {len(matches)} matches (showing up to 3)")
+        for mp in matches[:3]:
+            _describe_path(tag, "input", mp)
+
+    for f in files:
+        _describe_path(tag, "input", f)
+
 # ---------------- section runners ----------------
 
 def run_fetch(sec: Dict[str, Any]) -> None:
     if not sec.get("enabled"):
         return
     mgr = _mgr(["fetch_subprocess", "fetch_manager.py"])
-    for step in sec.get("steps", []):
-        if step is None or step.get("enabled") is False:
-            continue
+    steps = [s for s in sec.get("steps", []) if s is not None]
+    total = len(steps)
+    for idx, step in enumerate(steps, 1):
         mode = str(step.get("mode", "ibtracs"))
+        _progress("fetch", idx, total, mode)
+        if step.get("enabled") is False:
+            print(f"[fetch] skip (disabled): {mode}")
+            continue
+        _describe_inputs("fetch", step)
         args = _flatten_kv("", {k: v for k, v in step.items()
                                 if k not in ("mode", "enabled", "skip_if_exists")})
         sh([sys.executable, str(mgr), mode, *args])
+        _describe_outputs("fetch", step)
 
 def run_features(sec: Dict[str, Any]) -> None:
     if not sec.get("enabled"):
         return
     mgr = _mgr(["features_subprocess", "features_manager.py"])
-    for step in sec.get("steps", []):
-        if step is None:
-            continue
+    steps = [s for s in sec.get("steps", []) if s is not None]
+    total = len(steps)
+    for idx, step in enumerate(steps, 1):
+        mode = str(step.get("mode", "build"))
+        _progress("features", idx, total, mode)
         if step.get("enabled") is False:
-            print(f"[features] skip (disabled): {step.get('mode')}")
+            print(f"[features] skip (disabled): {mode}")
             continue
+        _describe_inputs("features", step)
         if step.get("skip_if_exists"):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
-                print(f"[features] skip (exists): {step.get('mode')} → {outp}")
+                print(f"[features] skip (exists): {mode} → {outp}")
+                _describe_outputs("features", step)
                 continue
-        mode = str(step.get("mode", "build"))
         args = _flatten_kv(
             "",
             {k: v for k, v in step.items()
              if k not in ("mode", "enabled", "skip_if_exists")}
         )
         sh([sys.executable, str(mgr), mode, *args])
+        _describe_outputs("features", step)
 
 def run_data_stage(sec: Dict[str, Any]) -> None:
     if not sec.get("enabled"):
         return
     mgr = _mgr(["data_subprocess", "data_stage_manager.py"])
-    for step in sec.get("steps", []):
-        if step is None or step.get("enabled") is False:
-            continue
+    steps = [s for s in sec.get("steps", []) if s is not None]
+    total = len(steps)
+    for idx, step in enumerate(steps, 1):
         mode = str(step.get("mode", "stage"))
+        _progress("data_stage", idx, total, mode)
+        if step.get("enabled") is False:
+            print(f"[data_stage] skip (disabled): {mode}")
+            continue
+        _describe_inputs("data_stage", step)
         args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled")})
         sh([sys.executable, str(mgr), mode, *args])
+        _describe_outputs("data_stage", step)
 
 def run_sweep(sec: Dict[str, Any]) -> None:
     if not sec.get("enabled"):
         return
     mgr = _mgr(["sweep_subprocess", "sweep_manager.py"])
-    for step in sec.get("steps", []):
-        if step is None or step.get("enabled") is False:
-            continue
+    steps = [s for s in sec.get("steps", []) if s is not None]
+    total = len(steps)
+    for idx, step in enumerate(steps, 1):
         mode = str(step.get("mode", "run"))
+        _progress("sweep", idx, total, mode)
+        if step.get("enabled") is False:
+            print(f"[sweep] skip (disabled): {mode}")
+            continue
+        _describe_inputs("sweep", step)
         if mode == "chain":
             recipe = step.get("recipe", "run+pick")
             extra = {k: v for k, v in step.items() if k not in ("mode", "recipe","enabled")}
@@ -159,52 +284,69 @@ def run_sweep(sec: Dict[str, Any]) -> None:
         else:
             args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled")})
             sh([sys.executable, str(mgr), "tool", mode, *args])
+        _describe_outputs("sweep", step)
 
 def run_score(sec: Dict[str, Any]) -> None:
     if not sec.get("enabled"):
         return
     scorer = _mgr(["grid_score.py"])
-    for job in sec.get("jobs", []):
-        if job is None or job.get("enabled") is False:
+    jobs = [j for j in sec.get("jobs", []) if j is not None]
+    total = len(jobs)
+    for idx, job in enumerate(jobs, 1):
+        _progress("score", idx, total, job.get("mode", "score"))
+        if job.get("enabled") is False:
+            print(f"[score] skip (disabled): {job.get('mode')}")
             continue
+        _describe_inputs("score", job)
         args = _flatten_kv("", {k:v for k,v in job.items() if k!="enabled"})
         sh([sys.executable, str(scorer), *args])
+        _describe_outputs("score", job)
 
 def run_alerts_logic(sec: Dict[str, Any]) -> None:
     if not sec.get("enabled"):
         return
     mgr = _mgr(["alerts_logic_subprocess", "alerts_logic_manager.py"])
-    for step in sec.get("steps", []):
-        if step is None:
-            continue
+    steps = [s for s in sec.get("steps", []) if s is not None]
+    total = len(steps)
+    for idx, step in enumerate(steps, 1):
+        mode = str(step.get("mode", "denoise"))
+        _progress("alerts_logic", idx, total, mode)
         if step.get("enabled") is False:
-            print(f"[alerts_logic] skip (disabled): {step.get('mode')}")
+            print(f"[alerts_logic] skip (disabled): {mode}")
             continue
+        _describe_inputs("alerts_logic", step)
 
         if step.get("skip_if_exists"):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
-                print(f"[alerts_logic] skip (exists): {step.get('mode')} → {outp}")
+                print(f"[alerts_logic] skip (exists): {mode} → {outp}")
+                _describe_outputs("alerts_logic", step)
                 continue
 
-        mode = str(step.get("mode", "denoise"))
         args = _flatten_kv(
             "",
             {k: v for k, v in step.items()
              if k not in ("mode", "enabled", "skip_if_exists")}
         )
         sh([sys.executable, str(mgr), mode, *args])
+        _describe_outputs("alerts_logic", step)
 
 def run_eval(sec: Dict[str, Any]) -> None:
     if not sec.get("enabled"):
         return
     mgr = _mgr(["eval_subprocess", "eval_manager.py"])
-    for step in sec.get("steps", []):
-        if step is None or step.get("enabled") is False:
-            continue
+    steps = [s for s in sec.get("steps", []) if s is not None]
+    total = len(steps)
+    for idx, step in enumerate(steps, 1):
         mode = str(step.get("mode", "hourly-rollup"))
+        _progress("eval", idx, total, mode)
+        if step.get("enabled") is False:
+            print(f"[eval] skip (disabled): {mode}")
+            continue
+        _describe_inputs("eval", step)
         args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled")})
         sh([sys.executable, str(mgr), mode, *args])
+        _describe_outputs("eval", step)
 
 def run_seeds(sec: Dict[str, Any]) -> None:
     """
@@ -230,25 +372,24 @@ def run_seeds(sec: Dict[str, Any]) -> None:
         return
     tool = _mgr(["seeds_subprocess", "seeds_tracks.py"])
 
-    A = sec.get("from_alerts")
-    if A and A.get("enabled", True):
-        sh([sys.executable, str(tool), "from-alerts",
-            *_flatten_kv("", {k:v for k,v in A.items() if k!="enabled"})])
+    raw_steps = [
+        ("from-alerts", sec.get("from_alerts")),
+        ("proto-outcomes", sec.get("outcomes")),
+        ("starts-vs-tracks", sec.get("starts")),
+        ("analyze", sec.get("analyze")),
+    ]
+    steps = [(name, cfg) for name, cfg in raw_steps if cfg is not None]
+    total = len(steps)
 
-    B = sec.get("outcomes")
-    if B and B.get("enabled", True):
-        sh([sys.executable, str(tool), "proto-outcomes",
-            *_flatten_kv("", {k:v for k,v in B.items() if k!="enabled"})])
-
-    C = sec.get("starts")
-    if C and C.get("enabled", True):
-        sh([sys.executable, str(tool), "starts-vs-tracks",
-            *_flatten_kv("", {k:v for k,v in C.items() if k!="enabled"})])
-
-    D = sec.get("analyze")
-    if D and D.get("enabled", True):
-        sh([sys.executable, str(tool), "analyze",
-            *_flatten_kv("", {k:v for k,v in D.items() if k!="enabled"})])
+    for idx, (name, cfg) in enumerate(steps, 1):
+        _progress("seeds", idx, total, name)
+        if cfg.get("enabled", True) is False:
+            print(f"[seeds] skip (disabled): {name}")
+            continue
+        _describe_inputs("seeds", cfg)
+        args = _flatten_kv("", {k:v for k,v in cfg.items() if k!="enabled"})
+        sh([sys.executable, str(tool), name, *args])
+        _describe_outputs("seeds", cfg)
 
 def run_report(sec: Dict[str, Any]) -> None:
     """
@@ -283,26 +424,30 @@ def run_report(sec: Dict[str, Any]) -> None:
         legacy_step.setdefault("mode", "summary")
         steps = [legacy_step]
 
-    for step in steps:
+    for idx, step in enumerate(steps, 1):
         if step is None:
             continue
+        mode = str(step.get("mode", "summary"))
+        _progress("report", idx, len(steps), mode)
         if step.get("enabled") is False:
-            print(f"[report] skip (disabled): {step.get('mode')}")
+            print(f"[report] skip (disabled): {mode}")
             continue
+        _describe_inputs("report", step)
 
         if step.get("skip_if_exists"):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
-                print(f"[report] skip (exists): {step.get('mode')} → {outp}")
+                print(f"[report] skip (exists): {mode} → {outp}")
+                _describe_outputs("report", step)
                 continue
 
-        mode = str(step.get("mode", "summary"))
         args = _flatten_kv(
             "",
             {k: v for k, v in step.items()
              if k not in ("mode", "enabled", "skip_if_exists")}
         )
         sh([sys.executable, str(mgr), mode, *args])
+        _describe_outputs("report", step)
 
 
 def run_misc(sec: Dict[str, Any]) -> None:
@@ -326,20 +471,23 @@ def run_misc(sec: Dict[str, Any]) -> None:
     if not sec.get("enabled"):
         return
 
-    for step in sec.get("steps", []):
-        if step is None:
-            continue
+    steps = [s for s in sec.get("steps", []) if s is not None]
+    total = len(steps)
+
+    for idx, step in enumerate(steps, 1):
+        script = step.get("script")
+        _progress("misc", idx, total, script or "(missing script)")
         if step.get("enabled") is False:
-            print(f"[misc] skip (disabled): {step.get('script')}")
+            print(f"[misc] skip (disabled): {script}")
             continue
 
         if step.get("skip_if_exists"):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
-                print(f"[misc] skip (exists): {step.get('script')} → {outp}")
+                print(f"[misc] skip (exists): {script} → {outp}")
+                _describe_outputs("misc", step)
                 continue
 
-        script = step.get("script")
         if not script:
             print("[misc] skip: missing 'script' path")
             continue
@@ -351,6 +499,7 @@ def run_misc(sec: Dict[str, Any]) -> None:
              if k not in ("script", "enabled", "skip_if_exists")}
         )
         sh([sys.executable, str(path), *args])
+        _describe_outputs("misc", step)
 
 # ---------------- main ----------------
 
