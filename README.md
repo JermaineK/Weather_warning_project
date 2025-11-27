@@ -30,3 +30,4 @@ python -m venv .venv
 
 # Install deps
 pip install -r requirements.txt
+```
