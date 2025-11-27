@@ -300,16 +300,18 @@ def main():
         for job in jobs:
             if job["kind"] == "single":
                 # filename like: era5_YYYYMM_<suffix or vars-joined>.nc
+                prefix = "era5"
                 if job["suffix"]:
                     tag = job["suffix"]
                 else:
                     var_tag = "-".join(job["vars"]) if len(job["vars"]) <= 3 else f"{len(job['vars'])}vars"
                     tag = var_tag
             else:
-                # pressure-level tag is more fixed/short (e.g. 'uv')
+                # Pressure-level files get a clear prefix for globs (era5_pl_YYYYMM_<tag>.nc)
+                prefix = "era5_pl"
                 tag = job["suffix"] or "pl"
 
-            fname = f"era5_{yyyy}{mm}_{tag}.nc"
+            fname = f"{prefix}_{yyyy}{mm}_{tag}.nc"
             out_path = out_dir / fname
 
             if out_path.exists() and not args.overwrite:

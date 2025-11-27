@@ -86,14 +86,48 @@ def _resolve_script(path: Union[str, Path]) -> Path:
 def _candidate_out_path(step: Dict[str, Any]) -> Path | None:
     """
     Try to discover an output path field to check for existence.
-    We check common keys used across our scripts.
-    For out_dir we do NOT skip, since that's usually a folder.
+    We check common keys used across our scripts so skip_if_exists is uniform.
     """
-    for k in ("out", "outfile", "out_csv", "out_md", "out_png"):
+    preferred_keys = (
+        "out",
+        "outfile",
+        "outfile_gz",
+        "out_csv",
+        "out_csv_gz",
+        "out_parquet",
+        "out_md",
+        "out_png",
+        "out_dir",
+        "outdir",
+        "out_prefix",
+    )
+    for k in preferred_keys:
         v = step.get(k)
         if isinstance(v, str) and v.strip():
             return Path(v)
+    # Fallback: any key starting with "out" that looks like a path string
+    for k, v in step.items():
+        if not isinstance(v, str) or not v.strip():
+            continue
+        if str(k).startswith("out"):
+            return Path(v)
     return None
+
+
+def _maybe_skip(tag: str, step: Dict[str, Any]) -> bool:
+    """Return True if the step should be skipped due to existing output."""
+    if not step.get("skip_if_exists"):
+        return False
+
+    if step.get("overwrite"):
+        return False
+
+    outp = _candidate_out_path(step)
+    if outp and outp.exists():
+        label = step.get("mode") or step.get("script") or tag
+        print(f"[{tag}] skip (exists): {label} → {outp}")
+        return True
+    return False
 
 # ---------------- section runners ----------------
 
@@ -103,6 +137,8 @@ def run_fetch(sec: Dict[str, Any]) -> None:
     mgr = _mgr(["fetch_subprocess", "fetch_manager.py"])
     for step in sec.get("steps", []):
         if step is None or step.get("enabled") is False:
+            continue
+        if _maybe_skip("fetch", step):
             continue
         mode = str(step.get("mode", "ibtracs"))
         args = _flatten_kv("", {k: v for k, v in step.items()
@@ -119,11 +155,8 @@ def run_features(sec: Dict[str, Any]) -> None:
         if step.get("enabled") is False:
             print(f"[features] skip (disabled): {step.get('mode')}")
             continue
-        if step.get("skip_if_exists"):
-            outp = _candidate_out_path(step)
-            if outp and outp.exists():
-                print(f"[features] skip (exists): {step.get('mode')} → {outp}")
-                continue
+        if _maybe_skip("features", step):
+            continue
         mode = str(step.get("mode", "build"))
         args = _flatten_kv(
             "",
@@ -139,8 +172,10 @@ def run_data_stage(sec: Dict[str, Any]) -> None:
     for step in sec.get("steps", []):
         if step is None or step.get("enabled") is False:
             continue
+        if _maybe_skip("data_stage", step):
+            continue
         mode = str(step.get("mode", "stage"))
-        args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled")})
+        args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled","skip_if_exists")})
         sh([sys.executable, str(mgr), mode, *args])
 
 def run_sweep(sec: Dict[str, Any]) -> None:
@@ -150,14 +185,16 @@ def run_sweep(sec: Dict[str, Any]) -> None:
     for step in sec.get("steps", []):
         if step is None or step.get("enabled") is False:
             continue
+        if _maybe_skip("sweep", step):
+            continue
         mode = str(step.get("mode", "run"))
         if mode == "chain":
             recipe = step.get("recipe", "run+pick")
-            extra = {k: v for k, v in step.items() if k not in ("mode", "recipe","enabled")}
+            extra = {k: v for k, v in step.items() if k not in ("mode", "recipe","enabled","skip_if_exists")}
             args = _flatten_kv("", extra)
             sh([sys.executable, str(mgr), "chain", recipe, *args])
         else:
-            args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled")})
+            args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled","skip_if_exists")})
             sh([sys.executable, str(mgr), "tool", mode, *args])
 
 def run_score(sec: Dict[str, Any]) -> None:
@@ -167,7 +204,9 @@ def run_score(sec: Dict[str, Any]) -> None:
     for job in sec.get("jobs", []):
         if job is None or job.get("enabled") is False:
             continue
-        args = _flatten_kv("", {k:v for k,v in job.items() if k!="enabled"})
+        if _maybe_skip("score", job):
+            continue
+        args = _flatten_kv("", {k:v for k,v in job.items() if k not in ("enabled","skip_if_exists")})
         sh([sys.executable, str(scorer), *args])
 
 def run_alerts_logic(sec: Dict[str, Any]) -> None:
@@ -181,11 +220,8 @@ def run_alerts_logic(sec: Dict[str, Any]) -> None:
             print(f"[alerts_logic] skip (disabled): {step.get('mode')}")
             continue
 
-        if step.get("skip_if_exists"):
-            outp = _candidate_out_path(step)
-            if outp and outp.exists():
-                print(f"[alerts_logic] skip (exists): {step.get('mode')} → {outp}")
-                continue
+        if _maybe_skip("alerts_logic", step):
+            continue
 
         mode = str(step.get("mode", "denoise"))
         args = _flatten_kv(
@@ -202,8 +238,10 @@ def run_eval(sec: Dict[str, Any]) -> None:
     for step in sec.get("steps", []):
         if step is None or step.get("enabled") is False:
             continue
+        if _maybe_skip("eval", step):
+            continue
         mode = str(step.get("mode", "hourly-rollup"))
-        args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled")})
+        args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled","skip_if_exists")})
         sh([sys.executable, str(mgr), mode, *args])
 
 def run_seeds(sec: Dict[str, Any]) -> None:
@@ -231,24 +269,24 @@ def run_seeds(sec: Dict[str, Any]) -> None:
     tool = _mgr(["seeds_subprocess", "seeds_tracks.py"])
 
     A = sec.get("from_alerts")
-    if A and A.get("enabled", True):
+    if A and A.get("enabled", True) and not _maybe_skip("seeds", A):
         sh([sys.executable, str(tool), "from-alerts",
-            *_flatten_kv("", {k:v for k,v in A.items() if k!="enabled"})])
+            *_flatten_kv("", {k:v for k,v in A.items() if k not in ("enabled","skip_if_exists")})])
 
     B = sec.get("outcomes")
-    if B and B.get("enabled", True):
+    if B and B.get("enabled", True) and not _maybe_skip("seeds", B):
         sh([sys.executable, str(tool), "proto-outcomes",
-            *_flatten_kv("", {k:v for k,v in B.items() if k!="enabled"})])
+            *_flatten_kv("", {k:v for k,v in B.items() if k not in ("enabled","skip_if_exists")})])
 
     C = sec.get("starts")
-    if C and C.get("enabled", True):
+    if C and C.get("enabled", True) and not _maybe_skip("seeds", C):
         sh([sys.executable, str(tool), "starts-vs-tracks",
-            *_flatten_kv("", {k:v for k,v in C.items() if k!="enabled"})])
+            *_flatten_kv("", {k:v for k,v in C.items() if k not in ("enabled","skip_if_exists")})])
 
     D = sec.get("analyze")
-    if D and D.get("enabled", True):
+    if D and D.get("enabled", True) and not _maybe_skip("seeds", D):
         sh([sys.executable, str(tool), "analyze",
-            *_flatten_kv("", {k:v for k,v in D.items() if k!="enabled"})])
+            *_flatten_kv("", {k:v for k,v in D.items() if k not in ("enabled","skip_if_exists")})])
 
 def run_report(sec: Dict[str, Any]) -> None:
     """
@@ -290,11 +328,8 @@ def run_report(sec: Dict[str, Any]) -> None:
             print(f"[report] skip (disabled): {step.get('mode')}")
             continue
 
-        if step.get("skip_if_exists"):
-            outp = _candidate_out_path(step)
-            if outp and outp.exists():
-                print(f"[report] skip (exists): {step.get('mode')} → {outp}")
-                continue
+        if _maybe_skip("report", step):
+            continue
 
         mode = str(step.get("mode", "summary"))
         args = _flatten_kv(
@@ -333,11 +368,8 @@ def run_misc(sec: Dict[str, Any]) -> None:
             print(f"[misc] skip (disabled): {step.get('script')}")
             continue
 
-        if step.get("skip_if_exists"):
-            outp = _candidate_out_path(step)
-            if outp and outp.exists():
-                print(f"[misc] skip (exists): {step.get('script')} → {outp}")
-                continue
+        if _maybe_skip("misc", step):
+            continue
 
         script = step.get("script")
         if not script:

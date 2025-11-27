@@ -6,7 +6,10 @@ reports_and_maps_manager.py
 One-stop orchestrator to bundle maps + summary + sanity checks
 into a per-run folder like:
 
-  results/reports/20251122_run001/
+  results/reports/251122_run001/
+
+Folders increment (run001, run002, …) per day so you can stack runs
+for comparisons without overwriting prior outputs.
 
 It wires together:
   - report_make_maps.py
@@ -46,15 +49,33 @@ HERE = Path(__file__).resolve().parent
 # --------------------- run-folder helpers ---------------------
 
 
+def _normalize_date_str(date_str: str | None) -> str:
+    """Return YYMMDD date string.
+
+    Accepts explicit YYMMDD or YYYYMMDD (trimmed to YYMMDD) to keep
+    backwards compatibility with older docs/CLI habits.
+    """
+    if date_str is None:
+        return datetime.utcnow().strftime("%y%m%d")
+
+    clean = str(date_str).strip()
+    if clean.isdigit() and len(clean) == 8:
+        clean = clean[2:]
+
+    if not (clean.isdigit() and len(clean) == 6):
+        raise ValueError("run-date must be YYMMDD or YYYYMMDD (digits only)")
+
+    return clean
+
+
 def make_run_dir(root: Path, date_str: str | None) -> Path:
     """
     Create a new run directory under `root` with pattern:
-      YYYYMMDD_runNNN
+      YYMMDD_runNNN
 
     Returns the newly created directory.
     """
-    if date_str is None:
-        date_str = datetime.utcnow().strftime("%Y%m%d")
+    date_str = _normalize_date_str(date_str)
 
     root.mkdir(parents=True, exist_ok=True)
 
@@ -115,12 +136,12 @@ def main() -> int:
     ap.add_argument(
         "--run-root",
         default="results/reports",
-        help="Root folder under which per-run folders YYYYMMDD_runNNN are created.",
+        help="Root folder under which per-run folders YYMMDD_runNNN are created.",
     )
     ap.add_argument(
         "--run-date",
         default=None,
-        help="Date prefix for run folder (YYYYMMDD). Default: today (UTC).",
+        help="Date prefix for run folder (YYMMDD or YYYYMMDD). Default: today (UTC).",
     )
 
     # Key inputs shared across reports
