@@ -37,6 +37,7 @@ fetch:
       start: *start
       end: *end
       area: *area
+      normalize_lon: *norm
       out: data/tracks/tracks_subset.csv
 
     - mode: era5
