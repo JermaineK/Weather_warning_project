@@ -9,3 +9,4 @@ cartopy
 scipy
 joblib
 pyyaml>=6.0
+requests

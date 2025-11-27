@@ -31,3 +31,17 @@ python -m venv .venv
 # Install deps
 pip install -r requirements.txt
 ```
+
+## Earthdata credentials
+
+Some data harvest scripts (and `test_earthdata_auth.py`) rely on NASA Earthdata
+authentication. To prepare your own credentials:
+
+1. Create a free Earthdata Login account: https://urs.earthdata.nasa.gov/
+2. Sign in once at https://disc.gsfc.nasa.gov/ so the GES DISC application is authorized.
+3. Add a `.netrc` entry (Linux/macOS: `~/.netrc`; Windows: `%USERPROFILE%\.netrc`):
+
+       machine urs.earthdata.nasa.gov login <USERNAME> password <PASSWORD>
+
+4. Lock down permissions (`chmod 600 ~/.netrc` on Linux/macOS).
+5. Verify with the checker: `python test_earthdata_auth.py` (requires network access).
