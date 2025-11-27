@@ -73,13 +73,24 @@ logs/**
 *.log
 
 ########################
-## CONFIG FILES       ##
-########################
-*.yaml
-*.yml
-
-########################
 ## IDE CONFIGS        ##
 ########################
 .vscode/
 .idea/
+
+#########################
+## RAW ERA5 / EXTERNAL ##
+#########################
+data_era5/**
+data_raw/**
+external_data/**
+
+# Global big binary formats we don't want in Git at all
+*.parquet
+*.pq
+*.pqt
+*.nc
+*.grib
+*.h5
+*.npz
+*.npy
