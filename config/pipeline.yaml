@@ -43,6 +43,17 @@ fetch:
       suffix: oper
       overwrite: false
 
+    - mode: era5-pl
+      start: *start
+      end: *end
+      hours: *hours
+      area: *area
+      pl_vars: "u v"
+      pl_levels: "1000,925,850,700,500"
+      target_dir: data_era5/extracted
+      pl_suffix: uv
+      overwrite: false
+
     - mode: era5-merge-single
       in_glob: "data_era5/extracted/**/era5_*.nc"
       out_dir: "data_era5/extracted"
