@@ -75,6 +75,12 @@ def _flatten_kv(prefix: str, obj: Any) -> List[str]:
 def _mgr(path_parts: Iterable[str]) -> Path:
     return HERE.joinpath(*path_parts).resolve()
 
+
+def _resolve_script(path: Union[str, Path]) -> Path:
+    """Resolve a script path relative to the repo root."""
+    p = Path(path)
+    return p if p.is_absolute() else HERE.joinpath(p).resolve()
+
 # ---------------- common helper ----------------
 
 def _candidate_out_path(step: Dict[str, Any]) -> Path | None:
@@ -298,6 +304,54 @@ def run_report(sec: Dict[str, Any]) -> None:
         )
         sh([sys.executable, str(mgr), mode, *args])
 
+
+def run_misc(sec: Dict[str, Any]) -> None:
+    """
+    Optional runner for standalone scripts that are not part of a *_subprocess
+    manager. Each step must provide a `script` path (relative to repo root or
+    absolute) plus any CLI flags as key/value pairs.
+
+    Example YAML:
+
+      misc:
+        enabled: true
+        steps:
+          - script: one_off_processes/predict_raw_scores.py
+            enabled: true
+            model: models/grid_logit_perlead.pkl
+            features: data/grid_labelled_FMA_gka_realthermo.csv.gz
+            out: results/predictions.csv.gz
+            skip_if_exists: true
+    """
+    if not sec.get("enabled"):
+        return
+
+    for step in sec.get("steps", []):
+        if step is None:
+            continue
+        if step.get("enabled") is False:
+            print(f"[misc] skip (disabled): {step.get('script')}")
+            continue
+
+        if step.get("skip_if_exists"):
+            outp = _candidate_out_path(step)
+            if outp and outp.exists():
+                print(f"[misc] skip (exists): {step.get('script')} → {outp}")
+                continue
+
+        script = step.get("script")
+        if not script:
+            print("[misc] skip: missing 'script' path")
+            continue
+
+        path = _resolve_script(script)
+        args = _flatten_kv(
+            "",
+            {k: v for k, v in step.items()
+             if k not in ("script", "enabled", "skip_if_exists")}
+        )
+        sh([sys.executable, str(path), *args])
+
 # ---------------- main ----------------
 
 SECTION_ORDER = [
@@ -311,6 +365,7 @@ SECTION_ORDER = [
     # runtime removed
     "seeds",
     "report",
+    "misc",
 ]
 
 def main() -> int:
@@ -346,6 +401,7 @@ def main() -> int:
     if "eval" in order:         run_eval(cfg.get("eval", {}))
     if "seeds" in order:        run_seeds(cfg.get("seeds", {}))
     if "report" in order:       run_report(cfg.get("report", {}))
+    if "misc" in order:         run_misc(cfg.get("misc", {}))
 
     print("\n[orchestrator] Complete.")
     return 0

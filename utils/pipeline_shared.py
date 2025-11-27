@@ -3,6 +3,8 @@ from pathlib import Path
 import pandas as pd
 import subprocess, sys
 
+from utils import io_common
+
 def sh(cmd, check=True):
     print("$ " + " ".join(map(str, cmd)))
     return subprocess.run(cmd, check=check)
@@ -10,7 +12,7 @@ def sh(cmd, check=True):
 def exists(p): return Path(p).exists()
 
 def sanitize_time_file(path, time_col="time"):
-    df = pd.read_csv(path, compression="infer")
+    df = io_common.read_any(path, compression="infer", parse_dates=(time_col,))
     if time_col not in df.columns:
         bom = "\ufeff" + time_col
         if bom in df.columns:

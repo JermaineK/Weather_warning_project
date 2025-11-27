@@ -34,6 +34,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import xarray as xr
+from utils import io_common
 
 pd.options.mode.copy_on_write = True
 
@@ -183,13 +184,12 @@ def load_any_table(path: str) -> pd.DataFrame:
     if p.endswith((".parquet", ".parq", ".pq")):
         df = pd.read_parquet(path)
     else:
-        df = pd.read_csv(
+        df = io_common.read_any(
             path,
             compression="infer",
-            low_memory=False,
             encoding_errors="replace",
             on_bad_lines="skip",
-            parse_dates=["time"],
+            parse_dates=("time",),
         )
     if "time" in df.columns:
         df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
