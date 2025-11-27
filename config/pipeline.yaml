@@ -33,6 +33,12 @@ defaults:
 fetch:
   enabled: true
   steps:
+    - mode: ibtracs
+      start: *start
+      end: *end
+      area: *area
+      out: data/tracks/tracks_subset.csv
+
     - mode: era5
       start: *start
       end: *end
