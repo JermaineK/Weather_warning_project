@@ -9,6 +9,8 @@ import argparse
 import pandas as pd
 from pathlib import Path
 
+from utils import io_common
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path", help="CSV/CSV.GZ or Parquet")
@@ -20,7 +22,11 @@ def main():
     if low.endswith((".parquet",".parq",".pq")):
         df = pd.read_parquet(p)
     else:
-        df = pd.read_csv(p, nrows=max(args.nrows, 200_000), low_memory=False, compression="infer")
+        df = io_common.read_any(
+            p,
+            nrows=max(args.nrows, 200_000),
+            compression="infer",
+        )
 
     cols = list(df.columns)
     print(f"\n{p} — columns ({len(cols)}):")

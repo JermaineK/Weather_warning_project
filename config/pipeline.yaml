@@ -7,6 +7,17 @@ report:
   out_md: results/reports/summary_auto.md
 report_pdf: true
 
+# Optional: standalone helpers not covered by the *_subprocess managers.
+misc:
+  enabled: false
+  steps:
+    # Example: run one-off scoring/prediction helpers from YAML
+    # - script: one_off_processes/predict_raw_scores.py
+    #   model: models/grid_logit_perlead.pkl
+    #   features: data/grid_labelled_FMA_gka_realthermo.csv.gz
+    #   out: results/predictions.csv.gz
+    #   skip_if_exists: true
+
 # -------- Global defaults (use anchors so everything is controlled here) --------
 defaults:
   start: &start "2025-02-01"
