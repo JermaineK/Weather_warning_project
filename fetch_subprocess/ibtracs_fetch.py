@@ -51,7 +51,8 @@ def _download_or_cache(url: str, cache_path: Path) -> Path:
         raise
 
 def _to_utc_naive(series) -> pd.Series:
-    t = pd.to_datetime(series, utc=True, errors="coerce")
+    # ibtracs ISO_TIME is consistent, but explicit format avoids elementwise parsing warnings
+    t = pd.to_datetime(series, utc=True, errors="coerce", format="mixed")
     # FIX: drop timezone to get naive UTC
     return t.dt.tz_localize(None)
 
@@ -116,7 +117,7 @@ def _dedup_per_sid_time(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = df.sort_values(key, kind="mergesort")
     agg = {
-        "lat":"first","lon":"first","NAME":"first","BASIN":"first",
+        "lat":"first","lon":"first","NAME":"first","NAME_UP":"first","BASIN":"first",
         "vmax_kt":"max","pmin_hPa":"min"
     }
     return df.groupby(key, as_index=False).agg(agg)
