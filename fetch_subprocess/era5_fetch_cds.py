@@ -305,11 +305,13 @@ def main():
                 else:
                     var_tag = "-".join(job["vars"]) if len(job["vars"]) <= 3 else f"{len(job['vars'])}vars"
                     tag = var_tag
+                prefix = "era5"
             else:
-                # pressure-level tag is more fixed/short (e.g. 'uv')
+                # pressure-level tag is more fixed/short (e.g. 'uv') and keeps a pl_ prefix
                 tag = job["suffix"] or "pl"
+                prefix = "era5_pl"
 
-            fname = f"era5_{yyyy}{mm}_{tag}.nc"
+            fname = f"{prefix}_{yyyy}{mm}_{tag}.nc"
             out_path = out_dir / fname
 
             if out_path.exists() and not args.overwrite:
