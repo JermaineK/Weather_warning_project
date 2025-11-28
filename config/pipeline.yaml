@@ -119,6 +119,7 @@ features:
       features: data/features_merged_patched.csv.gz
       labels:   data/tracks/tracks_subset.csv
       out:      data/grid_labelled_base.csv.gz
+      features_chunk_rows: 100000
 
     - mode: gka
       enabled: true
