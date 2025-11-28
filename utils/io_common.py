@@ -24,7 +24,14 @@ def _csv_kwargs(extra_kw):
 
     usecols = kw.get("usecols")
     if "parse_dates" in kw:
-        parse = kw.get("parse_dates") or []
+        parse = kw.get("parse_dates")
+        if parse is True:
+            parse = list(READ_DATE_COLS)
+        elif isinstance(parse, (tuple, set)):
+            parse = list(parse)
+        elif isinstance(parse, str):
+            parse = [parse]
+        parse = parse or []
         if usecols:
             parse = [c for c in parse if c in usecols]
         if parse:
@@ -44,7 +51,7 @@ def read_any(path: str, parse_dates: tuple[str,...]=READ_DATE_COLS, **kw) -> pd.
         return pd.read_parquet(path, **kw)
 
     if "parse_dates" not in kw and parse_dates:
-        kw["parse_dates"] = parse_dates
+        kw["parse_dates"] = list(parse_dates)
     kw = _csv_kwargs(kw)
 
     try:
