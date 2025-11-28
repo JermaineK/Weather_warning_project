@@ -329,6 +329,8 @@ def parse_args():
                     help="Lon mode: ' -180..180', '-180..180', '0..360', 'none'")
     ap.add_argument("--area", default=None,
                     help='Optional AOI "latN,lonW,latS,lonE" applied when reading ERA5.')
+    ap.add_argument("--overwrite", action="store_true",
+                    help="Allow replacing an existing output file.")
     # kept for compatibility; we currently do exact (time,lat,lon) join
     ap.add_argument("--nearest", action="store_true",
                     help="(Currently a no-op: exact (time,lat,lon) merge is used.)")
@@ -341,6 +343,10 @@ def main():
     args = parse_args()
     feat_path = Path(args.features)
     out_path = Path(args.out)
+
+    if out_path.exists() and not args.overwrite:
+        print(f"[integrate] skip: {out_path} exists (use --overwrite to regenerate)")
+        return
 
     thermo_glob = args.thermo_glob or args.nc_glob
     if not thermo_glob:
