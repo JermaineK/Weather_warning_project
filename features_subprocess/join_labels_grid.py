@@ -37,6 +37,27 @@ def read_any(path: str, usecols=None) -> pd.DataFrame:
         on_bad_lines="skip",
     )
 
+
+def iter_features(path: str | Path, chunksize: int | None):
+    """Yield feature chunks, streaming CSV when requested."""
+
+    low = str(path).lower()
+    if low.endswith((".parquet", ".parq", ".pq")) or not chunksize:
+        yield read_any(path)
+        return
+
+    reader = pd.read_csv(
+        path,
+        compression="infer",
+        low_memory=False,
+        encoding_errors="replace",
+        on_bad_lines="skip",
+        chunksize=chunksize,
+    )
+
+    for chunk in reader:
+        yield chunk
+
 def write_any_csv_append(path: str | Path, df: pd.DataFrame, header: bool) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -399,6 +420,12 @@ def parse_args():
     # Accept any string, trim inside, to tolerate YAML values like ' -180..180'
     ap.add_argument("--normalize-lon", default="-180..180")
     ap.add_argument("--chunk-hours", type=int, default=72)
+    ap.add_argument(
+        "--features-chunk-rows",
+        type=int,
+        default=2_000_000,
+        help="Stream features CSV in row chunks to reduce memory (0 disables streaming).",
+    )
 
     # Optional explicit label columns
     ap.add_argument("--labels-time-col", default=None)
@@ -428,52 +455,13 @@ def main():
         }
     ).dropna(subset=["time", "lat", "lon"]).reset_index(drop=True)
 
-    # Read features (in-memory, chunk time later)
-    feat = read_any(args.features)
-    need_f = {"time", "lat", "lon"}
-    if not need_f.issubset(set(feat.columns)):
-        raise ValueError(
-            f"Features file must contain columns: {sorted(need_f)} "
-            f"(got {sorted(feat.columns)[:12]}...)"
-        )
-
-    # Normalize coordinates (does not drop arbitrary columns)
-    feat = feat.copy()
-    feat["time"] = to_utc_naive(feat["time"])
-    feat["lat"]  = pd.to_numeric(feat["lat"], errors="coerce")
-    feat["lon"]  = _norm_lon(feat["lon"], lon_mode)
-    feat = feat.dropna(subset=["time", "lat", "lon"]).reset_index(drop=True)
-
-    if feat.empty:
-        raise ValueError("Features became empty after parsing/normalization.")
-
-    # === Pin the feature schema so every chunk writes the same header ===
-    feature_cols = list(feat.columns)  # includes physics vars + any extras
-    for core in ["time", "lat", "lon"]:
-        if core in feature_cols:
-            feature_cols.remove(core)
-    feature_cols = ["time", "lat", "lon"] + feature_cols
-
-    print(f"[schema] preserving {len(feature_cols)} feature columns:")
-    print(
-        "         " + ", ".join(feature_cols[:20]) +
-        (" ..." if len(feature_cols) > 20 else "")
-    )
-
     # PREGEN horizons
     pregen_hours = parse_hours_spec(args.pregen_hours)
     if pregen_hours:
         pregen_hours = _apply_step(pregen_hours, int(args.pregen_step or 1))
     legacy_pregen_h = float(args.pregen_future_h) if (not pregen_hours) else None
 
-    # Sort and chunk by time
-    feat.sort_values("time", inplace=True, ignore_index=True)
     lab.sort_values("time", kind="mergesort", inplace=True, ignore_index=True)
-
-    tmin = feat["time"].min()
-    tmax = feat["time"].max()
-    step = pd.Timedelta(hours=max(1, int(args.chunk_hours)))
-    lo_t = tmin
 
     # Padding for time slices (windows + max pregen horizon)
     pad_back = pd.Timedelta(hours=max(args.storm_time_h, args.near_time_h, 0.0))
@@ -483,6 +471,7 @@ def main():
     )
 
     wrote_header = False
+    feature_cols = None
 
     # Pre-compute label column order for output
     label_cols = ["storm_point", "storm_window", "storm", "near_storm"]
@@ -490,75 +479,120 @@ def main():
         label_cols += [f"pregen_h{h}" for h in sorted(pregen_hours)]
     label_cols += ["pregen", "t_to_storm_min_h"]
 
-    final_order = feature_cols + label_cols
+    step = pd.Timedelta(hours=max(1, int(args.chunk_hours)))
 
-    while lo_t <= tmax:
-        hi_t = min(lo_t + step - pd.Timedelta(seconds=1), tmax)
-        chunk = feat.loc[(feat["time"] >= lo_t) & (feat["time"] <= hi_t)].copy()
-        lab_slice = lab.loc[
-            (lab["time"] >= (lo_t - pad_back)) & (lab["time"] <= (hi_t + pad_fwd))
-        ].copy()
-
-        if lab_slice.empty:
-            chunk = chunk.reindex(columns=feature_cols)
-
-            n_chunk = len(chunk)
-            label_dict = {
-                "storm_point":        np.zeros(n_chunk, dtype=np.int8),
-                "storm_window":       np.zeros(n_chunk, dtype=np.int8),
-                "storm":              np.zeros(n_chunk, dtype=np.int8),
-                "near_storm":         np.zeros(n_chunk, dtype=np.int8),
-                "t_to_storm_min_h":   np.full(n_chunk, np.nan, dtype=float),
-            }
-            if pregen_hours:
-                for h in pregen_hours:
-                    label_dict[f"pregen_h{h}"] = np.zeros(n_chunk, dtype=np.int8)
-                label_dict["pregen"] = np.zeros(n_chunk, dtype=np.int8)
-            else:
-                label_dict["pregen"] = np.zeros(n_chunk, dtype=np.int8)
-
-            labels_df = pd.DataFrame(label_dict, index=chunk.index)
-            for c in ("storm_point", "storm_window", "storm", "near_storm", "pregen"):
-                labels_df[c] = labels_df[c].astype(np.int8, copy=False)
-            if pregen_hours:
-                for h in pregen_hours:
-                    col = f"pregen_h{h}"
-                    labels_df[col] = labels_df[col].astype(np.int8, copy=False)
-
-            labeled = pd.concat([chunk, labels_df], axis=1, copy=False)
-        else:
-            chunk = chunk.reindex(columns=feature_cols)
-            labeled = _label_chunk(
-                chunk,
-                lab_slice,
-                float(args.storm_radius_deg),
-                float(args.storm_time_h),
-                float(args.near_radius_deg),
-                float(args.near_time_h),
-                float(args.pregen_radius_deg),
-                pregen_hours,
-                legacy_pregen_h,
+    for raw_chunk in iter_features(args.features, int(args.features_chunk_rows or 0)):
+        need_f = {"time", "lat", "lon"}
+        if raw_chunk is None or raw_chunk.empty:
+            continue
+        if not need_f.issubset(set(raw_chunk.columns)):
+            raise ValueError(
+                f"Features file must contain columns: {sorted(need_f)} "
+                f"(got {sorted(raw_chunk.columns)[:12]}...)"
             )
 
-        labeled = labeled.reindex(columns=final_order)
+        # Normalize coordinates (does not drop arbitrary columns)
+        chunk = raw_chunk.copy()
+        chunk["time"] = to_utc_naive(chunk["time"])
+        chunk["lat"]  = pd.to_numeric(chunk["lat"], errors="coerce")
+        chunk["lon"]  = _norm_lon(chunk["lon"], lon_mode)
+        chunk = chunk.dropna(subset=["time", "lat", "lon"]).reset_index(drop=True)
 
-        write_any_csv_append(args.out, labeled, header=(not wrote_header))
-        wrote_header = True
+        if chunk.empty:
+            continue
 
-        print(
-            f"[label] wrote {len(labeled):,} rows  "
-            f"{lo_t:%Y-%m-%d %H:%M} → {hi_t:%Y-%m-%d %H:%M}  "
-            f"feat={len(chunk):,}  tracks={len(lab_slice):,}",
-            flush=True,
-        )
+        if feature_cols is None:
+            feature_cols = list(chunk.columns)  # includes physics vars + any extras
+            for core in ["time", "lat", "lon"]:
+                if core in feature_cols:
+                    feature_cols.remove(core)
+            feature_cols = ["time", "lat", "lon"] + feature_cols
 
-        del chunk, lab_slice, labeled
-        lo_t = hi_t + pd.Timedelta(seconds=1)
+            print(f"[schema] preserving {len(feature_cols)} feature columns:")
+            print(
+                "         " + ", ".join(feature_cols[:20]) +
+                (" ..." if len(feature_cols) > 20 else "")
+            )
+
+            final_order = feature_cols + label_cols
+
+        chunk = chunk.reindex(columns=feature_cols)
+        chunk.sort_values("time", inplace=True, ignore_index=True)
+
+        tmin = chunk["time"].min()
+        tmax = chunk["time"].max()
+        lo_t = tmin
+
+        while lo_t <= tmax:
+            hi_t = min(lo_t + step - pd.Timedelta(seconds=1), tmax)
+            slice_chunk = chunk.loc[(chunk["time"] >= lo_t) & (chunk["time"] <= hi_t)].copy()
+            lab_slice = lab.loc[
+                (lab["time"] >= (lo_t - pad_back)) & (lab["time"] <= (hi_t + pad_fwd))
+            ].copy()
+
+            if lab_slice.empty:
+                n_chunk = len(slice_chunk)
+                label_dict = {
+                    "storm_point":        np.zeros(n_chunk, dtype=np.int8),
+                    "storm_window":       np.zeros(n_chunk, dtype=np.int8),
+                    "storm":              np.zeros(n_chunk, dtype=np.int8),
+                    "near_storm":         np.zeros(n_chunk, dtype=np.int8),
+                    "t_to_storm_min_h":   np.full(n_chunk, np.nan, dtype=float),
+                }
+                if pregen_hours:
+                    for h in pregen_hours:
+                        label_dict[f"pregen_h{h}"] = np.zeros(n_chunk, dtype=np.int8)
+                    label_dict["pregen"] = np.zeros(n_chunk, dtype=np.int8)
+                else:
+                    label_dict["pregen"] = np.zeros(n_chunk, dtype=np.int8)
+
+                labels_df = pd.DataFrame(label_dict, index=slice_chunk.index)
+                for c in ("storm_point", "storm_window", "storm", "near_storm", "pregen"):
+                    labels_df[c] = labels_df[c].astype(np.int8, copy=False)
+                if pregen_hours:
+                    for h in pregen_hours:
+                        col = f"pregen_h{h}"
+                        labels_df[col] = labels_df[col].astype(np.int8, copy=False)
+
+                labeled = pd.concat([slice_chunk, labels_df], axis=1, copy=False)
+            else:
+                labeled = _label_chunk(
+                    slice_chunk,
+                    lab_slice,
+                    float(args.storm_radius_deg),
+                    float(args.storm_time_h),
+                    float(args.near_radius_deg),
+                    float(args.near_time_h),
+                    float(args.pregen_radius_deg),
+                    pregen_hours,
+                    legacy_pregen_h,
+                )
+
+            labeled = labeled.reindex(columns=final_order)
+
+            write_any_csv_append(args.out, labeled, header=(not wrote_header))
+            wrote_header = True
+
+            print(
+                f"[label] wrote {len(labeled):,} rows  "
+                f"{lo_t:%Y-%m-%d %H:%M} → {hi_t:%Y-%m-%d %H:%M}  "
+                f"feat={len(slice_chunk):,}  tracks={len(lab_slice):,}",
+                flush=True,
+            )
+
+            del slice_chunk, lab_slice, labeled
+            lo_t = hi_t + pd.Timedelta(seconds=1)
 
     # quick label diagnostics (small readback)
     try:
-        probe = read_any(args.out)
-        if {"time", "storm_point", "storm_window"}.issubset(probe.columns):
+        probe = None
+        out_low = str(args.out).lower()
+        if out_low.endswith(('.csv', '.csv.gz', '.tsv', '.tsv.gz', '.txt', '.txt.gz', '.gz')):
+            probe = pd.read_csv(args.out, nrows=5000, low_memory=False, encoding_errors="replace")
+        elif out_low.endswith((".parquet", ".parq", ".pq")):
+            probe = pd.read_parquet(args.out)
+
+        if probe is not None and {"time", "storm_point", "storm_window"}.issubset(probe.columns):
             _by_hour_stats(
                 "storm_point",
                 pd.to_numeric(probe["storm_point"], errors="coerce").fillna(0).to_numpy(),
