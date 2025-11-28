@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Union
 from collections import Counter
 
+from utils import table_format
+
 try:
     import yaml
 except Exception:
@@ -32,6 +34,7 @@ except Exception:
     raise
 
 HERE = Path(__file__).resolve().parent
+PREFERRED_TABLE_FORMAT: str | None = None
 
 # ---------------- shell helpers ----------------
 
@@ -72,6 +75,12 @@ def _flatten_kv(prefix: str, obj: Any) -> List[str]:
         return out
     out += [f"--{prefix.replace('_','-')}", str(obj)]
     return out
+
+
+def _apply_table_format(step: Dict[str, Any]) -> Dict[str, Any]:
+    if not PREFERRED_TABLE_FORMAT:
+        return step
+    return table_format.rewrite_step_paths(step, PREFERRED_TABLE_FORMAT, convert_existing=True)
 
 def _mgr(path_parts: Iterable[str]) -> Path:
     return HERE.joinpath(*path_parts).resolve()
@@ -208,6 +217,7 @@ def run_fetch(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_table_format(step)
         mode = str(step.get("mode", "ibtracs"))
         _progress("fetch", idx, total, mode)
         if step.get("enabled") is False:
@@ -226,6 +236,7 @@ def run_features(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_table_format(step)
         mode = str(step.get("mode", "build"))
         _progress("features", idx, total, mode)
         if step.get("enabled") is False:
@@ -253,6 +264,7 @@ def run_data_stage(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_table_format(step)
         mode = str(step.get("mode", "stage"))
         _progress("data_stage", idx, total, mode)
         if step.get("enabled") is False:
@@ -270,6 +282,7 @@ def run_sweep(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_table_format(step)
         mode = str(step.get("mode", "run"))
         _progress("sweep", idx, total, mode)
         if step.get("enabled") is False:
@@ -293,6 +306,7 @@ def run_score(sec: Dict[str, Any]) -> None:
     jobs = [j for j in sec.get("jobs", []) if j is not None]
     total = len(jobs)
     for idx, job in enumerate(jobs, 1):
+        job = _apply_table_format(job)
         _progress("score", idx, total, job.get("mode", "score"))
         if job.get("enabled") is False:
             print(f"[score] skip (disabled): {job.get('mode')}")
@@ -309,6 +323,7 @@ def run_alerts_logic(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_table_format(step)
         mode = str(step.get("mode", "denoise"))
         _progress("alerts_logic", idx, total, mode)
         if step.get("enabled") is False:
@@ -338,6 +353,7 @@ def run_eval(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_table_format(step)
         mode = str(step.get("mode", "hourly-rollup"))
         _progress("eval", idx, total, mode)
         if step.get("enabled") is False:
@@ -382,6 +398,7 @@ def run_seeds(sec: Dict[str, Any]) -> None:
     total = len(steps)
 
     for idx, (name, cfg) in enumerate(steps, 1):
+        cfg = _apply_table_format(cfg)
         _progress("seeds", idx, total, name)
         if cfg.get("enabled", True) is False:
             print(f"[seeds] skip (disabled): {name}")
@@ -427,6 +444,7 @@ def run_report(sec: Dict[str, Any]) -> None:
     for idx, step in enumerate(steps, 1):
         if step is None:
             continue
+        step = _apply_table_format(step)
         mode = str(step.get("mode", "summary"))
         _progress("report", idx, len(steps), mode)
         if step.get("enabled") is False:
@@ -476,6 +494,7 @@ def run_misc(sec: Dict[str, Any]) -> None:
 
     for idx, step in enumerate(steps, 1):
         script = step.get("script")
+        step = _apply_table_format(step)
         _progress("misc", idx, total, script or "(missing script)")
         if step.get("enabled") is False:
             print(f"[misc] skip (disabled): {script}")
@@ -530,6 +549,11 @@ def main() -> int:
     cfg_path = Path(ns.config).resolve()
     cfg_text = cfg_path.read_text(encoding="utf-8")
     cfg = yaml.safe_load(cfg_text) or {}
+
+    global PREFERRED_TABLE_FORMAT
+    PREFERRED_TABLE_FORMAT = table_format.normalize_preference(cfg.get("table_format"))
+    if PREFERRED_TABLE_FORMAT:
+        print(f"[table-format] preference → {PREFERRED_TABLE_FORMAT}")
 
     workdir = cfg.get("workdir")
     if workdir:
