@@ -2,7 +2,7 @@
 run_name: coral_sea_demo
 workdir: .
 reports_dir: results/reports
-table_format: csv.gz  # align with existing artifacts to avoid conversions during this run
+table_format: parquet  # set to parquet or csv.gz; conversion copies are auto-built when switching
 report:
   enabled: true
   out_md: results/reports/summary_auto.md

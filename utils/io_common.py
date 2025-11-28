@@ -54,47 +54,21 @@ def read_any(path: str, parse_dates: tuple[str,...]=READ_DATE_COLS, **kw) -> pd.
         kw["parse_dates"] = list(parse_dates)
     kw = _csv_kwargs(kw)
 
-    def _read_csv_allow_missing_dates(kwargs):
-        try:
-            return pd.read_csv(path, **kwargs)
-        except TypeError:
-            # Older pandas versions do not support dtype_backend; retry without it
-            fallback = dict(kwargs)
-            fallback.pop("dtype_backend", None)
-            return pd.read_csv(path, **fallback)
-        except ValueError as e:
-            if "Missing column provided to 'parse_dates'" in str(e):
-                no_dates = dict(kwargs)
-                no_dates.pop("parse_dates", None)
-                return _read_csv_allow_missing_dates(no_dates)
-            raise
-
+    # First attempt with the preferred engine (often Arrow). If we exhaust
+    # memory, progressively fall back to lighter-weight parsing options.
     try:
-        return _read_csv_allow_missing_dates(dict(kw))
+        return pd.read_csv(path, **kw)
+    except TypeError:
+        # Older pandas versions do not support dtype_backend; retry without it
+        kw.pop("dtype_backend", None)
+        return pd.read_csv(path, **kw)
     except MemoryError:
         # The Arrow CSV engine can exhaust memory when reading large gzip files;
         # fall back to the default pandas engine which streams decompression.
         kw.pop("engine", None)
         kw.pop("dtype_backend", None)
         kw.setdefault("low_memory", True)
-        try:
-            return _read_csv_allow_missing_dates(dict(kw))
-        except (MemoryError, pd.errors.ParserError, ValueError):
-            # If the C parser still fails with OOM or bad rows, drop to the
-            # Python engine and stream the file in chunks to limit peak memory
-            # usage. Also tolerate missing parse_dates columns.
-            kw["engine"] = "python"
-            kw.pop("chunksize", None)
-            kw.pop("memory_map", None)
-            try:
-                iter_df = pd.read_csv(path, chunksize=200_000, **kw)
-            except ValueError as e:
-                if "Missing column provided to 'parse_dates'" in str(e):
-                    kw.pop("parse_dates", None)
-                    iter_df = pd.read_csv(path, chunksize=200_000, **kw)
-                else:
-                    raise
-            return pd.concat(iter_df, ignore_index=True)
+        return pd.read_csv(path, **kw)
 
 def write_any(path: str, df: pd.DataFrame) -> None:
     p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)

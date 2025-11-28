@@ -80,11 +80,6 @@ def _flatten_kv(prefix: str, obj: Any) -> List[str]:
 def _apply_table_format(step: Dict[str, Any]) -> Dict[str, Any]:
     if not PREFERRED_TABLE_FORMAT:
         return step
-    # Avoid rewriting/auto-converting tables for disabled steps; those paths
-    # are not needed for the current run and may be large enough to trigger
-    # memory pressure during conversion.
-    if isinstance(step, dict) and step.get("enabled") is False:
-        return step
     return table_format.rewrite_step_paths(step, PREFERRED_TABLE_FORMAT, convert_existing=True)
 
 def _mgr(path_parts: Iterable[str]) -> Path:
