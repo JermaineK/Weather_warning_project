@@ -196,15 +196,18 @@ def load_any_table(path: str) -> pd.DataFrame:
             compression="infer",
             encoding_errors="replace",
             on_bad_lines="skip",
-            parse_dates=("time",),
+            parse_dates=["time"],
         )
     if "time" in df.columns:
         df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
     return df
 
 
-def write_any_table(path: str, df: pd.DataFrame) -> None:
+def write_any_table(path: str, df: pd.DataFrame, overwrite: bool = True) -> None:
     p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+    if p.exists() and not overwrite:
+        print(f"[integrate] exists and overwrite disabled: {p}", flush=True)
+        return
     low = p.name.lower()
     if low.endswith((".parquet", ".parq", ".pq")):
         df.to_parquet(p, index=False)
@@ -329,6 +332,8 @@ def parse_args():
                     help="Lon mode: ' -180..180', '-180..180', '0..360', 'none'")
     ap.add_argument("--area", default=None,
                     help='Optional AOI "latN,lonW,latS,lonE" applied when reading ERA5.')
+    ap.add_argument("--overwrite", action="store_true",
+                    help="Replace existing output instead of skipping.")
     # kept for compatibility; we currently do exact (time,lat,lon) join
     ap.add_argument("--nearest", action="store_true",
                     help="(Currently a no-op: exact (time,lat,lon) merge is used.)")
@@ -341,6 +346,10 @@ def main():
     args = parse_args()
     feat_path = Path(args.features)
     out_path = Path(args.out)
+
+    if out_path.exists() and not args.overwrite:
+        print(f"[integrate] exists and overwrite disabled: {out_path}", flush=True)
+        return
 
     thermo_glob = args.thermo_glob or args.nc_glob
     if not thermo_glob:
@@ -415,7 +424,7 @@ def main():
               f"feat_rows_in_range={mask.sum():,} thermo_rows={len(thermo_df):,}", flush=True)
 
     # done
-    write_any_table(str(out_path), feat)
+    write_any_table(str(out_path), feat, overwrite=args.overwrite)
     print(f"[integrate] wrote {out_path} rows={len(feat):,}", flush=True)
 
 
