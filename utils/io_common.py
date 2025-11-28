@@ -57,7 +57,15 @@ def read_any(path: str, parse_dates: tuple[str,...]=READ_DATE_COLS, **kw) -> pd.
     try:
         return pd.read_csv(path, **kw)
     except TypeError:
+        # Older pandas versions do not support dtype_backend; retry without it
         kw.pop("dtype_backend", None)
+        return pd.read_csv(path, **kw)
+    except MemoryError:
+        # The Arrow CSV engine can exhaust memory when reading large gzip files;
+        # fall back to the default pandas engine which streams decompression.
+        kw.pop("engine", None)
+        kw.pop("dtype_backend", None)
+        kw.setdefault("low_memory", True)
         return pd.read_csv(path, **kw)
 
 def write_any(path: str, df: pd.DataFrame) -> None:
