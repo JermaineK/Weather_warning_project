@@ -54,6 +54,8 @@ def read_any(path: str, parse_dates: tuple[str,...]=READ_DATE_COLS, **kw) -> pd.
         kw["parse_dates"] = list(parse_dates)
     kw = _csv_kwargs(kw)
 
+    # First attempt with the preferred engine (often Arrow). If we exhaust
+    # memory, progressively fall back to lighter-weight parsing options.
     try:
         return pd.read_csv(path, **kw)
     except TypeError:
@@ -66,16 +68,7 @@ def read_any(path: str, parse_dates: tuple[str,...]=READ_DATE_COLS, **kw) -> pd.
         kw.pop("engine", None)
         kw.pop("dtype_backend", None)
         kw.setdefault("low_memory", True)
-        try:
-            return pd.read_csv(path, **kw)
-        except (MemoryError, pd.errors.ParserError):
-            # If the C parser still fails with OOM, drop to the Python engine and
-            # stream the file in chunks to limit peak memory usage.
-            kw["engine"] = "python"
-            kw.pop("chunksize", None)
-            kw.pop("memory_map", None)
-            iter_df = pd.read_csv(path, chunksize=200_000, **kw)
-            return pd.concat(iter_df, ignore_index=True)
+        return pd.read_csv(path, **kw)
 
 def write_any(path: str, df: pd.DataFrame) -> None:
     p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
