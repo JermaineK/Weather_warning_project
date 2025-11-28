@@ -54,6 +54,8 @@ def read_any(path: str, parse_dates: tuple[str,...]=READ_DATE_COLS, **kw) -> pd.
         kw["parse_dates"] = list(parse_dates)
     kw = _csv_kwargs(kw)
 
+    # First attempt with the preferred engine (often Arrow). If we exhaust
+    # memory, progressively fall back to lighter-weight parsing options.
     try:
         return pd.read_csv(path, **kw)
     except TypeError:
