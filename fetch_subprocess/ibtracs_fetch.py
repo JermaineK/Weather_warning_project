@@ -62,6 +62,24 @@ def _norm_lon(x: pd.Series, frame: str) -> pd.Series:
         return (v % 360 + 360) % 360
     return ((v + 180) % 360) - 180  # default −180..180
 
+
+def _canon_lon_frame(raw: Optional[str]) -> str:
+    """Normalize lon frame strings, tolerating YAML anchors/spacing."""
+    if raw is None:
+        return "-180..180"
+    s = str(raw).strip()
+    if s.startswith("*"):
+        # tolerate unresolved YAML aliases like "*norm"
+        s = s.lstrip("*").strip()
+    s = s.replace("…", "..")
+    no_space = s.replace(" ", "")
+    if no_space == "0..360":
+        return "0..360"
+    if no_space == "-180..180":
+        return "-180..180"
+    print(f"[warn] unknown normalize_lon '{raw}'; defaulting to -180..180", file=sys.stderr)
+    return "-180..180"
+
 def _parse_area(aoi: str) -> Tuple[float, float, float, float]:
     latN, lonW, latS, lonE = [float(s.strip()) for s in aoi.split(",")]
     return latN, lonW, latS, lonE
@@ -138,7 +156,7 @@ def main():
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
     ap.add_argument("--area", default=None, help='latN,lonW,latS,lonE (dateline-aware)')
-    ap.add_argument("--normalize-lon", choices=["-180..180","0..360"], default=None)
+    ap.add_argument("--normalize-lon", choices=["-180..180","0..360"," -180..180"], default=None)
     ap.add_argument("--names", default="")
     ap.add_argument("--basins", default="")
     ap.add_argument("--min-wind", type=float, default=None, help="Minimum vmax (in chosen units).")
@@ -154,11 +172,7 @@ def main():
     if not start or not end:
         raise ValueError("Provide --start/--end or --yaml defaults.start/end.")
     area_str = args.area or y.get("area")
-    raw_norm = args.normalize_lon or y.get("normalize_lon") or "-180..180"
-    lon_frame = str(raw_norm).lstrip("*").strip()
-    if lon_frame not in ("-180..180", "0..360"):
-        print(f"[warn] normalize_lon={raw_norm!r} not understood; defaulting to -180..180", file=sys.stderr)
-        lon_frame = "-180..180"
+    lon_frame = _canon_lon_frame(args.normalize_lon or y.get("normalize_lon"))
 
     csv_path = _download_or_cache(args.url, Path(args.cache_file))
 
