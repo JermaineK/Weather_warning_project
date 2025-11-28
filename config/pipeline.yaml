@@ -32,7 +32,7 @@ defaults:
 # 0) Fetch — enabled to harvest ERA5 before merging existing files
 # =====================================================================
 fetch:
-  enabled: true
+  enabled: false
   steps:
     - mode: ibtracs
       start: *start
@@ -75,7 +75,7 @@ features:
   enabled: true
   steps:
     - mode: build
-      enabled: true
+      enabled: false
       nc_glob: data_era5/extracted/**/era5_single_*_*.nc
       out: data/features_eoi.parquet
       normalize_lon: *norm
@@ -87,7 +87,7 @@ features:
       emit_grid_index: true
 
     - mode: bulk-shear
-      enabled: true
+      enabled: false
       pl_glob: data_era5/extracted/**/era5_pl_*_uv.nc
       out: data/features_bulk_shear.parquet
       low_pair: 1000,925
@@ -97,7 +97,7 @@ features:
       area: *area
 
     - mode: join-features
-      enabled: true
+      enabled: false
       left:  data/features_eoi.parquet
       right: data/features_bulk_shear.parquet
       "on": "time, lat, lon"
@@ -105,7 +105,7 @@ features:
       overwrite: true
 
     - mode: patch
-      enabled: true
+      enabled: false
       in:  data/features_merged.parquet
       out: data/features_merged_patched.csv.gz
       neighbor_step: 0.0
@@ -116,14 +116,14 @@ features:
 
     # Optional legacy join-to-labels; not required for the GKA+thermo chain
     - mode: join
-      enabled: true
+      enabled: false
       features: data/features_merged_patched.csv.gz
       labels:   data/tracks/tracks_subset.csv
       out:      data/grid_labelled_base.csv.gz
       features_chunk_rows: 100000
 
     - mode: gka
-      enabled: true
+      enabled: false
       infile:  data/features_merged_patched.csv.gz
       outfile: data/grid_labelled_FMA_gka.csv.gz
       overwrite: true
