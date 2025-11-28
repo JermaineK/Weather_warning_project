@@ -24,10 +24,19 @@ def _csv_kwargs(extra_kw):
 
     usecols = kw.get("usecols")
     if "parse_dates" in kw:
-        parse = kw.get("parse_dates") or []
-        if usecols:
-            parse = [c for c in parse if c in usecols]
-        if parse:
+        parse = kw.get("parse_dates")
+        if isinstance(parse, str):
+            parse = [parse]
+        elif isinstance(parse, (tuple, set)):
+            parse = list(parse)
+        if isinstance(parse, list):
+            if usecols:
+                parse = [c for c in parse if c in usecols]
+            if parse:
+                kw["parse_dates"] = parse
+            else:
+                kw.pop("parse_dates", None)
+        elif parse in (True, False):
             kw["parse_dates"] = parse
         else:
             kw.pop("parse_dates", None)
@@ -47,11 +56,27 @@ def read_any(path: str, parse_dates: tuple[str,...]=READ_DATE_COLS, **kw) -> pd.
         kw["parse_dates"] = parse_dates
     kw = _csv_kwargs(kw)
 
+    # First attempt with the preferred engine (often Arrow). If we exhaust
+    # memory, progressively fall back to lighter-weight parsing options.
     try:
         return pd.read_csv(path, **kw)
     except TypeError:
         kw.pop("dtype_backend", None)
         return pd.read_csv(path, **kw)
+    except (MemoryError, pd.errors.ParserError):
+        # Drop Arrow preferences and retry with pandas' C engine.
+        retry_kw = dict(kw)
+        retry_kw.pop("dtype_backend", None)
+        retry_kw.pop("engine", None)
+        retry_kw.setdefault("low_memory", True)
+        try:
+            return pd.read_csv(path, **retry_kw)
+        except (MemoryError, pd.errors.ParserError):
+            # Stream in chunks to avoid parser tokenization OOMs.
+            stream_kw = dict(retry_kw)
+            chunksize = stream_kw.pop("chunksize", None) or 200_000
+            frames = pd.read_csv(path, chunksize=chunksize, iterator=True, **stream_kw)
+            return pd.concat(frames, ignore_index=True)
 
 def write_any(path: str, df: pd.DataFrame) -> None:
     p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)

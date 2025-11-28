@@ -154,7 +154,11 @@ def main():
     if not start or not end:
         raise ValueError("Provide --start/--end or --yaml defaults.start/end.")
     area_str = args.area or y.get("area")
-    lon_frame = (args.normalize_lon or y.get("normalize_lon") or "-180..180")
+    raw_norm = args.normalize_lon or y.get("normalize_lon") or "-180..180"
+    lon_frame = str(raw_norm).lstrip("*").strip()
+    if lon_frame not in ("-180..180", "0..360"):
+        print(f"[warn] normalize_lon={raw_norm!r} not understood; defaulting to -180..180", file=sys.stderr)
+        lon_frame = "-180..180"
 
     csv_path = _download_or_cache(args.url, Path(args.cache_file))
 
