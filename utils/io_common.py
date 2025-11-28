@@ -16,6 +16,10 @@ def _csv_kwargs(extra_kw):
     if importlib.util.find_spec("pyarrow") is not None:
         kw.setdefault("engine", "pyarrow")
 
+    # pandas' pyarrow CSV engine does not support memory_map
+    if kw.get("engine") == "pyarrow":
+        kw.pop("memory_map", None)
+
     kw.update(extra_kw)
 
     usecols = kw.get("usecols")
