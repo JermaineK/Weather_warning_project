@@ -45,6 +45,25 @@ def _csv_kwargs(extra_kw):
     return kw
 
 
+def _read_csv_with_missing_date_guard(path: str, kw: dict) -> pd.DataFrame:
+    """Read a CSV while gracefully handling absent date columns.
+
+    Some downstream tables omit optional date columns like ``match_time`` or
+    ``obs_time``. When ``parse_dates`` requests columns that are absent,
+    pandas raises ``ValueError``. To keep IO resilient (and avoid re-reading
+    decompressed gzip blobs), retry without ``parse_dates`` when that happens.
+    """
+
+    try:
+        return pd.read_csv(path, **kw)
+    except ValueError as err:
+        if "parse_dates" in kw and "Missing column provided to 'parse_dates'" in str(err):
+            stripped = dict(kw)
+            stripped.pop("parse_dates", None)
+            return pd.read_csv(path, **stripped)
+        raise
+
+
 def read_any(path: str, parse_dates: tuple[str,...]=READ_DATE_COLS, **kw) -> pd.DataFrame:
     p = str(path).lower()
     if p.endswith((".parquet",".parq",".pq")):
@@ -57,18 +76,20 @@ def read_any(path: str, parse_dates: tuple[str,...]=READ_DATE_COLS, **kw) -> pd.
     # First attempt with the preferred engine (often Arrow). If we exhaust
     # memory, progressively fall back to lighter-weight parsing options.
     try:
-        return pd.read_csv(path, **kw)
+        return _read_csv_with_missing_date_guard(path, kw)
     except TypeError:
         # Older pandas versions do not support dtype_backend; retry without it
+        kw = dict(kw)
         kw.pop("dtype_backend", None)
-        return pd.read_csv(path, **kw)
+        return _read_csv_with_missing_date_guard(path, kw)
     except MemoryError:
         # The Arrow CSV engine can exhaust memory when reading large gzip files;
         # fall back to the default pandas engine which streams decompression.
+        kw = dict(kw)
         kw.pop("engine", None)
         kw.pop("dtype_backend", None)
         kw.setdefault("low_memory", True)
-        return pd.read_csv(path, **kw)
+        return _read_csv_with_missing_date_guard(path, kw)
 
 def write_any(path: str, df: pd.DataFrame) -> None:
     p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
