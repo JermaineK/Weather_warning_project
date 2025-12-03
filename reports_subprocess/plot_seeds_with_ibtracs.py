@@ -169,7 +169,7 @@ def main():
     # ---- IBTrACS
     ib = read_any(args.ibtracs)
 
-    # Time column detection (ISO → parts → generic)
+    # Time column detection (ISO -> parts -> generic)
     tcol = pick_ci(ib, ["iso_time","time","datetime","date_time","obs_time"])
     if tcol is None:
         # try common parts

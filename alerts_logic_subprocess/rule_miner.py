@@ -40,7 +40,7 @@ def future_max_label(df: pd.DataFrame, label_col: str, hours: int) -> pd.Series:
 
     def _one(g: pd.DataFrame) -> pd.Series:
         g = g.sort_values("time")
-        # reverse → rolling future max; shift(1) to exclude current instant
+        # reverse -> rolling future max; shift(1) to exclude current instant
         rev = g.set_index("time")[label_col].astype(int).iloc[::-1]
         fut = rev.rolling(win, min_periods=1).max().shift(1)
         fut = fut.iloc[::-1].reindex(g["time"]).fillna(0).astype(int)
@@ -95,7 +95,7 @@ def main():
         "--C",
         type=float,
         default=0.5,
-        help="Inverse regularization strength (smaller → sparser)",
+        help="Inverse regularization strength (smaller -> sparser)",
     )
     ap.add_argument("--out", default="models/rule_l1.pkl")
     args = ap.parse_args()
@@ -315,7 +315,7 @@ def main():
         },
         args.out,
     )
-    print(f"\nSaved sparse rule model → {args.out}")
+    print(f"\nSaved sparse rule model -> {args.out}")
 
 
 if __name__ == "__main__":

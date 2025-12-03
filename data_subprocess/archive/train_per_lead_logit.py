@@ -23,6 +23,11 @@ Extras:
   • Stable cell grouping via rounded lat/lon (--round-geo).
   • Reproducible seed, class-imbalance warning, odds-ratio dump.
 
+Memory safety helpers:
+  • --sample-frac: uniform subsampling of the full table.
+  • --neg-frac (shifted mode): keep all positives, sample this fraction of negatives.
+  • Hard guard: refuses to train on >10M rows unless you downscale.
+
 Output bundle (joblib pickle):
   {
     "per_lead_models": { <lead_h>: sklearn Pipeline, ... },
@@ -44,6 +49,13 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import roc_auc_score, average_precision_score
 import joblib
+
+try:
+    import pyarrow as pa  # type: ignore
+    import pyarrow.parquet as pq  # type: ignore
+except Exception:
+    pa = None
+    pq = None
 
 
 # ---------- Diagnostics helpers ----------
@@ -83,6 +95,146 @@ def read_any(path):
     return pd.read_csv(p, low_memory=False)
 
 
+# Agent: stream parquet to apply sampling before materializing to avoid OOM.
+def _stream_parquet_with_sampling(path: str, columns: list[str] | None, batch_rows: int,
+                                  seed: int, sample_frac: float,
+                                  neg_frac: float, label_col: str | None,
+                                  pandas_batch_rows: int = 20_000):
+    """
+    Stream parquet in batches and apply sampling to reduce peak memory use.
+
+    Returns: (df, uniform_applied, neg_applied)
+    If streaming is unavailable (missing pyarrow.dataset), returns (None, False, False).
+    """
+    if pq is None or pa is None:
+        return None, False, False
+    try:
+        import pyarrow.dataset as ds  # type: ignore
+    except Exception:
+        return None, False, False
+
+    rng = np.random.default_rng(seed)
+    uniform_applied = bool(sample_frac and 0 < sample_frac < 1)
+    neg_applied = bool(neg_frac and 0 < neg_frac < 1 and label_col)
+
+    dataset = ds.dataset(path, format="parquet")
+    scan_cols = columns if columns else None
+
+    # Cap batch size to keep to_pandas manageable.
+    BATCH_CAP = max(5_000, min(int(pandas_batch_rows), 20_000))
+    batch_size = batch_rows if batch_rows and batch_rows > 0 else BATCH_CAP
+    if batch_size > BATCH_CAP:
+        batch_size = BATCH_CAP
+        print(f"[stream-load] capping parquet batch size to {batch_size} rows to reduce memory", flush=True)
+
+    scanner = None
+    # pyarrow APIs vary: FileSystemDataset may not have .scan in older versions.
+    if hasattr(dataset, "scan"):
+        try:
+            scanner = dataset.scan(columns=scan_cols)
+        except Exception:
+            scanner = None
+    if scanner is None:
+        try:
+            scanner = ds.Scanner.from_dataset(dataset, columns=scan_cols, batch_size=batch_size)
+        except Exception:
+            return None, False, False
+
+    dfs = []
+    total_rows = 0
+    kept_rows = 0
+
+    try:
+        batches = scanner.to_batches(batch_size=batch_size)
+    except TypeError:
+        # Some pyarrow versions don't support batch_size kwarg on to_batches.
+        batches = scanner.to_batches()
+
+    for batch in batches:
+        # slice very large batches into pandas-sized chunks to avoid huge allocations
+        n_batch = len(batch)
+        slice_rows = min(batch_size, BATCH_CAP)
+        for offset in range(0, n_batch, slice_rows):
+            sub = batch.slice(offset, min(slice_rows, n_batch - offset))
+            try:
+                pdf = sub.to_pandas(ignore_metadata=True, split_blocks=True, self_destruct=True)
+            except TypeError:
+                pdf = sub.to_pandas(ignore_metadata=True)
+            total_rows += len(pdf)
+
+            if uniform_applied:
+                mask = rng.random(len(pdf)) < sample_frac
+                pdf = pdf.loc[mask]
+
+            if neg_applied and label_col in pdf.columns:
+                ybase = pd.to_numeric(pdf[label_col], errors="coerce").fillna(0)
+                pos_mask = ybase > 0
+                neg_mask = ~pos_mask
+                if neg_mask.any():
+                    neg_idx = np.where(neg_mask.to_numpy())[0]
+                    neg_keep = rng.random(len(neg_idx)) < neg_frac
+                    keep_mask = pos_mask.to_numpy()
+                    keep_mask[neg_idx] = neg_keep
+                    pdf = pdf.loc[keep_mask]
+
+            kept_rows += len(pdf)
+            if not pdf.empty:
+                dfs.append(pdf)
+
+    if not dfs:
+        return pd.DataFrame(columns=columns or dataset.schema.names), uniform_applied, neg_applied
+
+    df = pd.concat(dfs, ignore_index=True)
+    print(
+        f"[stream-load] read {total_rows:,} rows in batches "
+        f"({batch_size}); kept {kept_rows:,} after sampling",
+        flush=True,
+    )
+    return df, uniform_applied, neg_applied
+
+
+def _parquet_numeric_columns(path: str, required: set[str]) -> list[str]:
+    """
+    Inspect parquet schema and pick numeric columns plus required ones to
+    reduce memory footprint when loading huge files.
+
+    Uses pyarrow's Arrow schema (pf.schema_arrow) so it is robust across
+    pyarrow versions where pf.schema fields may be ColumnSchema without .type.
+    """
+    if pq is None or pa is None:
+        # No pyarrow: caller will just read all columns.
+        return []
+
+    try:
+        pf = pq.ParquetFile(path)
+    except Exception:
+        # If anything goes wrong, fall back to "no pruning".
+        return []
+
+    cols: list[str] = []
+
+    try:
+        # Arrow Schema: fields have .name and .type
+        schema = pf.schema_arrow
+    except Exception:
+        # Older pyarrow: give up on pruning
+        return []
+
+    for field in schema:
+        name = field.name
+        if name in required:
+            cols.append(name)
+            continue
+
+        t = field.type
+        # Treat integer / float (including all bit widths) as numeric
+        if pa.types.is_integer(t) or pa.types.is_floating(t):
+            cols.append(name)
+
+    # Always include required columns even if type detection failed
+    return sorted(set(cols) | set(required))
+
+
 # ---------- parsing ----------
 
 def parse_range_or_list(spec: str):
@@ -114,7 +266,7 @@ BASE_RESERVED = {
     "storm", "near_storm", "pregen", "alert", "alert_final", "event", "target", "label", "y",
     "number", "expver",
     "_grp", "_grp_round",
-    "row_id",
+    "row_id", "id", "ID",
     "storm_hit", "storm_window", "storm_point"  # common downstream target/meta cols
 }
 
@@ -213,10 +365,90 @@ def main():
                     help="Decimals to round lat/lon for stable grouping (default 4)")
     ap.add_argument("--eval", action="store_true",
                     help="Do leakage-safe eval (day-grouped split) and write metrics CSV")
+    ap.add_argument("--columns-from-schema", action="store_true",
+                    help="For parquet: load only numeric columns + required (time,lat,lon,label) to reduce memory.")
+    ap.add_argument("--load-numeric-only", action="store_true",
+                    help="Alias for --columns-from-schema (kept for clarity).")
+    ap.add_argument("--sample-frac", type=float, default=0.0,
+                    help="Optional uniform fraction (0<frac<=1) to sample rows for training/eval.")
+    ap.add_argument("--neg-frac", type=float, default=0.0,
+                    help="In shifted mode: keep all positives and sample this fraction (0<neg-frac<=1) of negatives.")
+    ap.add_argument("--chunk-rows", type=int, default=0, help="Alias for orchestrator-injected chunk sizes (ignored).")
+    ap.add_argument("--chunksize", type=int, default=0, help="Alias for orchestrator-injected chunk sizes (ignored).")
+    ap.add_argument("--parquet-rows", type=int, default=0, help="Alias for orchestrator-injected chunk sizes (ignored).")
+    ap.add_argument("--pandas-batch-rows", type=int, default=50_000,
+                    help="Max rows per pandas materialization when streaming parquet to limit peak memory.")
+    ap.add_argument("--fit-max-rows", type=int, default=0,
+                    help="Uniformly subsample to this many rows before fitting to avoid OOM (0=disabled).")
 
     args = ap.parse_args()
 
-    df = read_any(args.labelled)
+    direct_mode = args.label_prefix is not None and args.hours is not None
+    shifted_mode = args.label_col is not None and args.leads is not None
+
+    # Optional column pruning for parquet
+    cols = None
+    parquet_in = str(args.labelled).lower().endswith((".parquet", ".pq", ".pqt"))
+    numeric_only = args.columns_from_schema or args.load_numeric_only or parquet_in
+    if numeric_only and parquet_in and pq is not None:
+        required = {"time", "lat", "lon"}
+        if args.label_col:
+            required.add(args.label_col)
+        cols = _parquet_numeric_columns(str(args.labelled), required)
+        print(f"[load] parquet column prune enabled; reading {len(cols)} columns", flush=True)
+
+    sampled_uniform = False
+    sampled_neg = False
+    df = None
+
+    batch_rows = max(args.parquet_rows, args.chunk_rows, args.chunksize)
+    if parquet_in and batch_rows and pq is not None:
+        df, sampled_uniform, sampled_neg = _stream_parquet_with_sampling(
+            str(args.labelled),
+            cols,
+            batch_rows,
+            seed=args.seed,
+            sample_frac=args.sample_frac,
+            neg_frac=(args.neg_frac if shifted_mode else 0.0),
+            label_col=(args.label_col if shifted_mode else None),
+            pandas_batch_rows=args.pandas_batch_rows,
+        )
+
+    if df is None:
+        df = pd.read_parquet(args.labelled, columns=cols) if cols else read_any(args.labelled)
+
+    # Optional uniform sampling to bound memory
+    if (not sampled_uniform) and args.sample_frac and 0 < args.sample_frac < 1:
+        df = df.sample(frac=args.sample_frac, random_state=args.seed).reset_index(drop=True)
+        print(f"[sample] kept {len(df):,} rows at frac={args.sample_frac}", flush=True)
+
+    # Downcast floats to float32 to reduce footprint
+    float_cols = df.select_dtypes(include=["float64", "float32"]).columns
+    df[float_cols] = df[float_cols].astype("float32")
+
+    # Fill NaNs in numeric columns to keep sklearn happy without exploding memory.
+    # Preserve t_to_storm_min_h semantics: missing/non-finite => large sentinel (no future storm).
+    tts_col = "t_to_storm_min_h" if "t_to_storm_min_h" in df.columns else None
+    if tts_col:
+        tts = pd.to_numeric(df[tts_col], errors="coerce")
+        nonfinite = ~np.isfinite(tts)
+        if nonfinite.any():
+            sentinel = np.float32(1e6)
+            df.loc[nonfinite, tts_col] = sentinel
+            print(f"[impute] filled {int(nonfinite.sum()):,} t_to_storm_min_h NaNs with {sentinel}", flush=True)
+
+    num_cols = df.select_dtypes(include=[np.number]).columns
+    if tts_col:
+        num_cols = [c for c in num_cols if c != tts_col]
+    if num_cols:
+        na_counts = df[num_cols].isna().sum().sum()
+        if na_counts:
+            df[num_cols] = df[num_cols].fillna(0.0)
+            print(f"[impute] filled {int(na_counts):,} numeric NaNs with 0.0", flush=True)
+
+    if args.fit_max_rows and args.fit_max_rows > 0 and len(df) > args.fit_max_rows:
+        df = df.sample(n=int(args.fit_max_rows), random_state=args.seed).reset_index(drop=True)
+        print(f"[fit-cap] trimmed to {len(df):,} rows for fitting (--fit-max-rows)", flush=True)
 
     # time to datetime, sort for stable operations
     required_cols = {"time", "lat", "lon"}
@@ -227,20 +459,48 @@ def main():
     df = df.dropna(subset=["time", "lat", "lon"]).copy()
     df = df.sort_values(["lat", "lon", "time"]).reset_index(drop=True)
 
-    # Stable group ids
-    df["_grp_round"] = pd.factorize(
-        list(zip(df["lat"].round(args.round_geo),
-                 df["lon"].round(args.round_geo)))
-    )[0]
-    df["_day"] = pd.to_datetime(df["time"]).dt.floor("D")
-
-    # Determine mode
+    # Determine mode from args
     direct_mode = args.label_prefix is not None and args.hours is not None
     shifted_mode = args.label_col is not None and args.leads is not None
     if direct_mode and shifted_mode:
         raise ValueError("Choose exactly one mode: either (--label-prefix & --hours) OR (--label-col & --leads).")
     if not direct_mode and not shifted_mode:
         raise ValueError("Specify a mode: (--label-prefix & --hours) for direct, or (--label-col & --leads) for shifted.")
+
+    # If shifted mode: coerce base label only
+    if shifted_mode:
+        if args.label_col not in df.columns:
+            raise ValueError(
+                f"Column '{args.label_col}' missing from {args.labelled}. "
+                f"Columns seen: {list(df.columns)[:20]} ..."
+            )
+        yraw = pd.to_numeric(df[args.label_col], errors="coerce").fillna(0)
+        df[args.label_col] = (yraw > 0).astype(int)
+
+        if args.neg_frac and 0 < args.neg_frac < 1:
+            print(
+                "[warn] --neg-frac is not applied in time-aware shifted mode "
+                "(it would destroy future-window positives). "
+                "Use --sample-frac or --fit-max-rows instead.",
+                flush=True,
+            )
+
+    # Hard memory safety gate: refuse to train on huge tables unless explicitly downscaled
+    MAX_SAFE_ROWS = 10_000_000
+    if len(df) > MAX_SAFE_ROWS and not (args.sample_frac and 0 < args.sample_frac < 1) \
+       and not (args.neg_frac and 0 < args.neg_frac < 1):
+        raise RuntimeError(
+            f"Labelled dataset has {len(df):,} rows; this is likely to exhaust memory.\n"
+            f"Use --sample-frac (uniform) and/or --neg-frac (shifted mode) to downscale, "
+            f"or pre-filter the dataset."
+        )
+
+    # Stable group ids (after any sampling)
+    df["_grp_round"] = pd.factorize(
+        list(zip(df["lat"].round(args.round_geo),
+                 df["lon"].round(args.round_geo)))
+    )[0]
+    df["_day"] = pd.to_datetime(df["time"]).dt.floor("D")
 
     models: Dict[int, Pipeline] = {}
     trained: List[int] = []
@@ -262,6 +522,9 @@ def main():
         feats = pick_features(df, exclude)
         diag_header(df, f"direct hours={hours[0]}..{hours[-1]}")
 
+        # Precompute feature matrix once to avoid repeated allocations
+        X_full = df[feats].to_numpy(dtype=np.float32, copy=False)
+
         last_pos = None
         last_y = None
 
@@ -282,11 +545,11 @@ def main():
             if pos / len(y_arr) < 0.005:
                 print(f"[warn] lead={H:>3d}h prevalence is very low ({pos/len(y_arr):.4f}); expect fragile metrics.")
 
-            X = df[feats].to_numpy(dtype=float)
+            X = X_full
             y = y_arr.astype(int)
 
             pipe = Pipeline([
-                ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                ("scaler", StandardScaler(with_mean=True, with_std=True, copy=False)),
                 ("lr", LogisticRegression(
                     C=args.C, max_iter=200, class_weight=args.class_weight,
                     solver="lbfgs", penalty="l2", random_state=args.seed
@@ -318,7 +581,7 @@ def main():
                 "pos": int(pos),
                 "neg": int(neg),
                 "label_col": col,
-            })
+            }
             print(f"[fit] lead={H:>3d}h (direct) | n={len(df):>6d} | pos={pos:>6d} | neg={neg:>6d}")
 
         meta = {
@@ -338,16 +601,7 @@ def main():
 
     # ===== Mode B: SHIFTED (time-aware default) =====
     else:
-        if args.label_col not in df.columns:
-            raise ValueError(
-                f"Column '{args.label_col}' missing from {args.labelled}. "
-                f"Columns seen: {list(df.columns)[:20]} ..."
-            )
-
-        # coerce label to binary int
-        yraw = pd.to_numeric(df[args.label_col], errors="coerce").fillna(0)
-        df[args.label_col] = (yraw > 0).astype(int)
-
+        # df[args.label_col] has already been coerced to 0/1 above (shifted_mode branch)
         leads = parse_range_or_list(args.leads)
         if not leads:
             raise ValueError("No valid --leads provided.")
@@ -360,6 +614,9 @@ def main():
             f"shifted(base={args.label_col}) leads={leads[0]}..{leads[-1]}  time-aware={'no' if args.step_shift else 'yes'}"
         )
 
+        # Precompute feature matrix once
+        X_full = df[feats].to_numpy(dtype=np.float32, copy=False)
+
         last_pos = None
         last_y = None
 
@@ -368,7 +625,7 @@ def main():
                 # LEGACY FIXED-STEP SHIFT (compat/debug only)
                 rounded_L, k = nearest_step_hours(L, args.dt_hours)
                 if k == 0:
-                    print(f"[skip] lead={L}h < dt={args.dt_hours}h → zero-step shift; skipping.")
+                    print(f"[skip] lead={L}h < dt={args.dt_hours}h -> zero-step shift; skipping.")
                     continue
 
                 df_shift = df[["time", "lat", "lon", args.label_col] + feats + ["_grp_round"]].copy()
@@ -383,7 +640,7 @@ def main():
                 df_shift["yL"] = df_shift["yL"].astype(int)
 
                 y_arr = df_shift["yL"].to_numpy(dtype=int)
-                X = df_shift[feats].to_numpy(dtype=float)
+                X = df_shift[feats].to_numpy(dtype=np.float32, copy=False)
                 n_here = len(df_shift)
                 pos = int(y_arr.sum())
                 neg = int(n_here - pos)
@@ -395,7 +652,7 @@ def main():
                 last_pos, last_y = pos, y_arr
 
                 if pos < args.min_positives:
-                    print(f"[skip] lead={L:>3d}h (→ {rounded_L:>3d}h): positives={pos} < {args.min_positives}")
+                    print(f"[skip] lead={L:>3d}h (-> {rounded_L:>3d}h): positives={pos} < {args.min_positives}")
                     continue
 
                 y_for_fit = y_arr
@@ -418,11 +675,11 @@ def main():
                 if pos / len(y_arr) < 0.005:
                     print(f"[warn] lead={L:>3d}h prevalence is very low ({pos/len(y_arr):.4f}); expect fragile metrics.")
 
-                X = df[feats].to_numpy(dtype=float)
+                X = X_full
                 y_for_fit = y_arr.astype(int)
 
             pipe = Pipeline([
-                ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                ("scaler", StandardScaler(with_mean=True, with_std=True, copy=False)),
                 ("lr", LogisticRegression(
                     C=args.C, max_iter=200, class_weight=args.class_weight,
                     solver="lbfgs", penalty="l2", random_state=args.seed
@@ -456,7 +713,7 @@ def main():
                 "label_col": args.label_col,
             }
             if args.step_shift:
-                print(f"[fit] lead={L:>3d}h (→ {rounded_L:>3d}h, steps={k}) | n={len(X):>6d} | pos={pos:>6d} | neg={neg:>6d}")
+                print(f"[fit] lead={L:>3d}h (-> {rounded_L:>3d}h, steps={k}) | n={len(X):>6d} | pos={pos:>6d} | neg={neg:>6d}")
             else:
                 print(f"[fit] lead={L:>3d}h (time-aware) | n={len(X):>6d} | pos={pos:>6d} | neg={neg:>6d}")
 

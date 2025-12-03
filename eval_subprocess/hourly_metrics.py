@@ -185,7 +185,7 @@ def main():
         df = df.loc[(df["lat"] <= latN) & (df["lat"] >= latS) &
                     (df["lon"] >= lonW) & (df["lon"] <= lonE)].reset_index(drop=True)
 
-    # Normalize time → UTC-naive floor-hour
+    # Normalize time -> UTC-naive floor-hour
     t = pd.to_datetime(df["time"], utc=True, errors="coerce")
     df["_hour"] = t.dt.tz_convert(None).dt.floor("H")
 

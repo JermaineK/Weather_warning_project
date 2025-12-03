@@ -11,9 +11,9 @@ Key points
 ----------
 * Input features: CSV/CSV.GZ/Parquet, with columns at least: time, lat, lon
 * ERA5 thermo: one or more NetCDFs (e.g. era5_single_YYYYMM_oper.nc)
-* Matching is on (time, lat, lon) using ERA5’s own grid coordinates
-* No fragile integer index tricks; a preserved __idx column is used when
-  writing merged thermo values back into the big features DataFrame.
+* Matching is on (time, lat, lon) using ERA5's own grid coordinates
+* Streaming, chunked merge to keep memory bounded; exact (time,lat,lon)
+  joins only (no nearest-neighbour yet).
 
 CLI (example)
 -------------
@@ -34,6 +34,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import xarray as xr
 
 # Ensure repository root (containing utils/) is importable when run as a script.
@@ -208,12 +210,149 @@ def write_any_table(path: str, df: pd.DataFrame, overwrite: bool = True) -> None
     if p.exists() and not overwrite:
         print(f"[integrate] exists and overwrite disabled: {p}", flush=True)
         return
-    low = p.name.lower()
-    if low.endswith((".parquet", ".parq", ".pq")):
+    fmt = _detect_table_format(p)
+    if fmt == "parquet":
         df.to_parquet(p, index=False)
     else:
-        comp = "gzip" if (low.endswith(".csv.gz") or p.suffix.lower() == ".gz") else "infer"
+        comp = "gzip" if fmt == "csv.gz" else "infer"
         df.to_csv(p, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
+
+
+def _detect_table_format(path: Path) -> str:
+    """
+    Return 'parquet', 'csv', or 'csv.gz' based on suffixes.
+    Guard against ambiguous combos like '.parquet.gz' that would silently
+    trigger CSV writes with a parquet-looking name.
+    """
+    suffixes = "".join(path.suffixes[-2:]).lower()
+    if suffixes in (".parquet.gz", ".parq.gz", ".pq.gz"):
+        raise SystemExit(f"[integrate] Ambiguous extension for {path}; use .parquet or .csv.gz explicitly.")
+    if suffixes == ".parquet" or path.suffix.lower() in (".parquet", ".parq", ".pq"):
+        return "parquet"
+    if suffixes == ".csv.gz":
+        return "csv.gz"
+    if path.suffix.lower() == ".csv":
+        return "csv"
+    if path.suffix.lower() == ".gz":
+        # treat bare .gz as CSV.GZ to avoid mislabelling parquet payloads
+        return "csv.gz"
+    raise SystemExit(f"[integrate] Unsupported table format for {path}")
+
+
+def _iter_feature_chunks(path: Path, chunk_rows: int, parquet_rows: int | None = None):
+    """
+    Stream the feature table in chunks to keep memory bounded.
+    Parquet is streamed via pyarrow batches; CSV/CSV.GZ via pandas chunks.
+    """
+    fmt = _detect_table_format(path)
+    if fmt == "parquet":
+        pf = pq.ParquetFile(path)
+        batch_size = parquet_rows if parquet_rows and parquet_rows > 0 else chunk_rows
+        for batch in pf.iter_batches(batch_size=batch_size):
+            yield batch.to_pandas()
+        return
+
+    csv_kw = io_common._csv_kwargs(path, {"parse_dates": ["time"], "chunksize": chunk_rows})  # type: ignore[attr-defined]
+    # Chunked reads are not supported by pandas' pyarrow engine; fall back to default.
+    csv_kw.pop("engine", None)
+    csv_kw.pop("dtype_backend", None)
+    reader = io_common._read_csv_with_missing_date_guard(path, csv_kw)  # type: ignore[attr-defined]
+    chunks = reader if not isinstance(reader, pd.DataFrame) else [reader]
+    for chunk in chunks:
+        yield chunk
+
+
+class _ChunkedWriter:
+    """
+    Minimal streaming writer for CSV(.gz) and Parquet outputs.
+    Agent: keep memory usage low by writing chunk-by-chunk instead of buffering
+    the whole feature table.
+    """
+
+    def __init__(self, path: Path, overwrite: bool):
+        self.path = path
+        self.format = _detect_table_format(path)
+        self._writer = None
+        self._wrote_header = False
+        if path.exists():
+            if overwrite:
+                path.unlink()
+            else:
+                raise SystemExit(f"[integrate] exists and overwrite disabled: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, df: pd.DataFrame):
+        if self.format == "parquet":
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if self._writer is None:
+                self._writer = pq.ParquetWriter(self.path, table.schema, compression="snappy")
+            self._writer.write_table(table)
+        else:
+            comp = "gzip" if self.format == "csv.gz" else "infer"
+            mode = "w" if not self._wrote_header else "a"
+            df.to_csv(
+                self.path,
+                index=False,
+                compression=comp,
+                date_format="%Y-%m-%d %H:%M:%S",
+                mode=mode,
+                header=not self._wrote_header,
+            )
+            self._wrote_header = True
+
+    def close(self):
+        if self._writer is not None:
+            self._writer.close()
+
+
+def _prepare_feat_chunk(df: pd.DataFrame, lon_mode: str) -> pd.DataFrame:
+    """Normalize time/lat/lon for a feature chunk and ensure thermo columns exist."""
+    out = df.copy()
+    out["time"] = pd.to_datetime(out["time"], utc=True, errors="coerce").dt.tz_localize(None)
+    out["lat"] = pd.to_numeric(out["lat"], errors="coerce").astype("float32")
+    out["lon"] = reframe_lon_vals(pd.to_numeric(out["lon"], errors="coerce").to_numpy(), lon_mode).astype("float32")
+    out = out.dropna(subset=["time", "lat", "lon"])
+
+    for col in ("u10", "v10", "msl", "t2m"):
+        if col not in out.columns:
+            out[col] = np.nan
+    return out
+
+
+def _apply_thermo_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Overwrite thermo columns with merged thermo values (if present).
+    Existing values are replaced to mirror legacy behaviour.
+    """
+    for col in ("u10", "v10", "msl", "t2m"):
+        thermo_col = f"{col}_thermo"
+        if thermo_col in df.columns:
+            df[col] = pd.to_numeric(df[thermo_col], errors="coerce")
+            df.drop(columns=[thermo_col], inplace=True)
+        elif col not in df.columns:
+            df[col] = np.nan
+        else:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _select_thermo_slice(thermo_ranges, tmin, tmax):
+    """
+    Return thermo DataFrame(s) overlapping [tmin, tmax]. Keeps per-NC slices
+    separate to avoid materializing the full thermo table for every chunk.
+    """
+    relevant = []
+    for t0, t1, df in thermo_ranges:
+        if (tmin is not None and t0 is not None and t1 is not None and t1 < tmin) or (
+            tmax is not None and t0 is not None and t0 > tmax
+        ):
+            continue
+        relevant.append(df)
+    if not relevant:
+        return None
+    if len(relevant) == 1:
+        return relevant[0]
+    return pd.concat(relevant, ignore_index=True)
 
 
 # ---------- thermo flattening ----------
@@ -292,7 +431,7 @@ def flatten_era5_single(path: str,
     if ren:
         df = df.rename(columns=ren)
 
-    # auto-convert MSL Pa→hPa if needed
+    # auto-convert MSL Pa->hPa if needed
     if "msl" in df.columns:
         try:
             med = float(np.nanmedian(df["msl"].to_numpy()))
@@ -332,6 +471,12 @@ def parse_args():
                     help="Lon mode: ' -180..180', '-180..180', '0..360', 'none'")
     ap.add_argument("--area", default=None,
                     help='Optional AOI "latN,lonW,latS,lonE" applied when reading ERA5.')
+    ap.add_argument("--chunk-rows", type=int, default=0,
+                    help="Rows per chunk when streaming features. Default auto-scales with available RAM.")
+    ap.add_argument("--chunksize", type=int, default=0,
+                    help="Alias for --chunk-rows (kept for orchestrator compatibility).")
+    ap.add_argument("--parquet-rows", type=int, default=0,
+                    help="Preferred batch size when streaming parquet input/output.")
     ap.add_argument("--overwrite", action="store_true",
                     help="Replace existing output instead of skipping.")
     # kept for compatibility; we currently do exact (time,lat,lon) join
@@ -347,9 +492,8 @@ def main():
     feat_path = Path(args.features)
     out_path = Path(args.out)
 
-    if out_path.exists() and not args.overwrite:
-        print(f"[integrate] exists and overwrite disabled: {out_path}", flush=True)
-        return
+    if feat_path.resolve() == out_path.resolve():
+        raise SystemExit("[integrate] Input and output paths must differ to avoid corruption.")
 
     thermo_glob = args.thermo_glob or args.nc_glob
     if not thermo_glob:
@@ -361,71 +505,86 @@ def main():
 
     area_box = parse_area(args.area)
     lon_mode = _canon_norm(args.normalize_lon)
+    in_fmt = _detect_table_format(feat_path)
+    out_fmt = _detect_table_format(out_path)
+    csv_rows, parq_rows = io_common.recommend_chunk_rows()  # type: ignore[attr-defined]
+    chunk_pref = args.chunk_rows or args.chunksize
+    parquet_pref = args.parquet_rows
+    chunk_rows = chunk_pref or (parq_rows if in_fmt == "parquet" else csv_rows)
+    if chunk_rows <= 0:
+        chunk_rows = parq_rows if in_fmt == "parquet" else csv_rows
+    parquet_rows = parquet_pref or chunk_rows
 
     print(f"[integrate] features: {feat_path}")
-    print(f"[integrate] thermo glob: {thermo_glob} → {len(nc_files)} files")
+    print(f"[integrate] thermo glob: {thermo_glob} -> {len(nc_files)} files")
     print(f"[integrate] lon mode: {lon_mode}  AOI: {area_box}", flush=True)
+    print(f"[integrate] feature format: {in_fmt}  out format: {out_fmt}  chunk_rows: {chunk_rows:,}")
     if args.nearest:
         print("[integrate] --nearest requested; using exact (time,lat,lon) join for now.", flush=True)
 
-    # Load feature table once
-    feat = load_any_table(str(feat_path))
-    if not {"time","lat","lon"}.issubset(feat.columns):
-        raise SystemExit("Feature table must include columns: time, lat, lon")
-
-    # normalize coords same way as thermo
-    feat["time"] = pd.to_datetime(feat["time"], utc=True, errors="coerce").dt.tz_localize(None)
-    feat["lat"]  = pd.to_numeric(feat["lat"], errors="coerce").astype("float32")
-    feat["lon"]  = reframe_lon_vals(pd.to_numeric(feat["lon"], errors="coerce").to_numpy(), lon_mode).astype("float32")
-    feat = feat.dropna(subset=["time","lat","lon"]).reset_index(drop=True)
-
-    # stable ordering, preserve index for later
-    feat.sort_values(["time","lat","lon"], kind="mergesort", inplace=True, ignore_index=True)
-
-    # We'll add thermo columns if missing
-    for c in ("u10","v10","msl","t2m"):
-        if c not in feat.columns:
-            feat[c] = np.nan
-
-    # Process each ERA5 file month-by-month
+    thermo_ranges = []
+    thermo_rows_total = 0
     for i, nc in enumerate(nc_files, start=1):
         thermo_df = flatten_era5_single(nc, lon_mode, area_box, engine=args.engine)
         if thermo_df.empty:
             print(f"[integrate] {Path(nc).name}: no thermo rows after AOI; skipping", flush=True)
             continue
-
-        # restrict features to time range of this thermo chunk
         tmin = thermo_df["time"].min()
         tmax = thermo_df["time"].max()
-        mask = (feat["time"] >= tmin) & (feat["time"] <= tmax)
-        if not mask.any():
-            print(f"[integrate] {Path(nc).name}: no feature rows in [{tmin}, {tmax}]; skipping", flush=True)
+        thermo_ranges.append((tmin, tmax, thermo_df))
+        thermo_rows_total += len(thermo_df)
+        print(f"[integrate] {i}/{len(nc_files)} {Path(nc).name}: thermo rows {len(thermo_df):,} [{tmin}, {tmax}]", flush=True)
+
+    if not thermo_ranges:
+        raise SystemExit("[integrate] No thermo data to merge; aborting.")
+
+    writer = _ChunkedWriter(out_path, overwrite=args.overwrite)
+    col_order = None
+    rows_written = 0
+
+    for i, raw_chunk in enumerate(_iter_feature_chunks(feat_path, chunk_rows, parquet_rows=parquet_rows), start=1):
+        if raw_chunk is None or len(raw_chunk) == 0:
+            continue
+        if not {"time", "lat", "lon"}.issubset(raw_chunk.columns):
+            raise SystemExit("Feature table must include columns: time, lat, lon")
+
+        chunk = _prepare_feat_chunk(raw_chunk, lon_mode)
+        if chunk.empty:
             continue
 
-        feat_chunk = feat.loc[mask, ["time","lat","lon"]].copy()
-        feat_chunk["__idx"] = feat_chunk.index  # preserve original indices into main feat
+        tmin = chunk["time"].min()
+        tmax = chunk["time"].max()
+        thermo_slice = _select_thermo_slice(thermo_ranges, tmin, tmax)
+        if thermo_slice is not None:
+            merged = chunk.merge(
+                thermo_slice,
+                on=["time", "lat", "lon"],
+                how="left",
+                suffixes=("", "_thermo"),
+            )
+        else:
+            merged = chunk.copy()
+        merged = _apply_thermo_columns(merged)
 
-        # Merge thermo onto this time-slice
-        merged = feat_chunk.merge(
-            thermo_df,
-            on=["time","lat","lon"],
-            how="left",
-            suffixes=("","_thermo")
-        )
+        if col_order is None:
+            col_order = list(merged.columns)
+        else:
+            missing = [c for c in col_order if c not in merged.columns]
+            for c in missing:
+                merged[c] = np.nan
+            extra = [c for c in merged.columns if c not in col_order]
+            if extra:
+                col_order.extend(extra)
+        merged = merged[col_order]
 
-        # Write back into feat, using preserved __idx
-        idx = merged["__idx"].to_numpy()
-        for col in ("u10","v10","msl","t2m"):
-            if col in merged.columns:
-                vals = pd.to_numeric(merged[col], errors="coerce").to_numpy()
-                feat.loc[idx, col] = vals
+        writer.write(merged)
+        rows_written += len(merged)
+        if i % 5 == 0:
+            print(f"[integrate] chunk {i}: rows={len(merged):,} written_total={rows_written:,}", flush=True)
+        del raw_chunk, chunk, merged, thermo_slice
 
-        print(f"[integrate] {i}/{len(nc_files)} {Path(nc).name}: "
-              f"feat_rows_in_range={mask.sum():,} thermo_rows={len(thermo_df):,}", flush=True)
-
-    # done
-    write_any_table(str(out_path), feat, overwrite=args.overwrite)
-    print(f"[integrate] wrote {out_path} rows={len(feat):,}", flush=True)
+    writer.close()
+    print(f"[integrate] wrote {out_path} rows={rows_written:,} thermo_rows={thermo_rows_total:,}", flush=True)
 
 
 if __name__ == "__main__":

@@ -47,6 +47,21 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+try:
+    import pyarrow.parquet as pq  # type: ignore
+except Exception:
+    pq = None
+
+
+def _is_probably_parquet(path: Path) -> bool:
+    try:
+        with path.open("rb") as f:
+            head = f.read(4)
+            f.seek(-4, 2)
+            tail = f.read(4)
+        return head == b"PAR1" or tail == b"PAR1"
+    except Exception:
+        return False
 
 
 # ---------------- small utilities ----------------
@@ -167,9 +182,17 @@ def main():
                     help="Temperature scaling (higher = flatter logistic).")
 
     ap.add_argument("--chunk-rows", type=int, default=400000)
+    ap.add_argument("--chunksize", type=int, default=None,
+                    help="Alias for --chunk-rows (compatibility with orchestrator hints).")
+    ap.add_argument("--parquet-rows", type=int, default=None,
+                    help="Alias for --chunk-rows when using parquet (compatibility only).")
     ap.add_argument("--keep-features", action="store_true")
 
     args = ap.parse_args()
+    if args.chunksize and not args.chunk_rows:
+        args.chunk_rows = args.chunksize
+    if args.parquet_rows and not args.chunk_rows:
+        args.chunk_rows = args.parquet_rows
 
     src = Path(args.scoring_src)
     if not src.exists():
@@ -179,8 +202,23 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     compression = "gzip" if out.suffix.endswith("gz") else "infer"
 
-    # sample
-    sample = pd.read_csv(src, nrows=min(args.chunk_rows, 20000), compression="infer")
+    # sample (robust to parquet or encoding issues)
+    if (src.suffix.lower() in {".parquet", ".parq", ".pq"} or _is_probably_parquet(src)) and pq is not None:
+        pf = pq.ParquetFile(src)
+        batches = pf.iter_batches(batch_size=min(args.chunk_rows, 20000))
+        try:
+            sample = next(batches).to_pandas()
+        except StopIteration:
+            sample = pd.DataFrame()
+    else:
+        sample = pd.read_csv(
+            src,
+            nrows=min(args.chunk_rows, 20000),
+            compression="infer",
+            low_memory=False,
+            encoding_errors="replace",
+            on_bad_lines="skip",
+        )
     feat_cols = detect_feature_columns(sample, id_col=args.id_col,
                                        explicit_cols=args.feature_cols)
     weights = load_weights(args.weights_json, feat_cols, args.default_weight)
@@ -188,12 +226,20 @@ def main():
     _print(f"[init] features={feat_cols}")
     _print(f"[init] weights default={args.default_weight}")
     _print(f"[init] shift={args.shift} temp={args.temp}")
-    _print(f"[init] writing → {out}")
+    _print(f"[init] writing -> {out}")
 
-    rdr = pd.read_csv(src, chunksize=args.chunk_rows, compression="infer",
-                      low_memory=False)
-    if not hasattr(rdr, "__iter__"):
-        rdr = [rdr]
+    # Iterator over chunks (CSV or Parquet)
+    if (src.suffix.lower() in {".parquet", ".parq", ".pq"} or _is_probably_parquet(src)) and pq is not None:
+        pf = pq.ParquetFile(src)
+        def _iter():
+            for batch in pf.iter_batches(batch_size=int(args.chunk_rows)):
+                yield batch.to_pandas()
+        rdr = _iter()
+    else:
+        rdr = pd.read_csv(src, chunksize=args.chunk_rows, compression="infer",
+                          low_memory=False, encoding_errors="replace", on_bad_lines="skip")
+        if not hasattr(rdr, "__iter__"):
+            rdr = [rdr]
 
     first = True
     total = 0
@@ -235,7 +281,7 @@ def main():
         if i % 10 == 0:
             _print(f"[chunk {i}] total={total:,}")
 
-    _print(f"[done] wrote {total:,} rows → {out}")
+    _print(f"[done] wrote {total:,} rows -> {out}")
 
 
 if __name__ == "__main__":

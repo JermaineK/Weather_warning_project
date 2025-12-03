@@ -110,7 +110,7 @@ def future_max_timeaware(group: pd.DataFrame, label_col: str, hours: int) -> np.
     t_end = t_sorted + h_ns
     end_pos = np.searchsorted(t_sorted, t_end, side="right")
 
-    # Use (i+1 .. end_pos-1) → implements strict future (no current hour).
+    # Use (i+1 .. end_pos-1) -> implements strict future (no current hour).
     any_future_sorted = (ps[end_pos] - ps[np.arange(len(y_sorted)) + 1]) > 0
     return any_future_sorted[inv].astype(np.int8)
 
@@ -210,7 +210,7 @@ def main():
         # Choose model
         if mtype == "per_lead":
             if h not in per_lead_models:
-                print(f"  WARNING: no model for lead {h}h → skipping.")
+                print(f"  WARNING: no model for lead {h}h -> skipping.")
                 continue
             pipe = per_lead_models[h]
             X = df[features].to_numpy(float)
@@ -232,7 +232,7 @@ def main():
         out_df = pd.DataFrame(out_rows).sort_values("lead_h")
         Path(args.save_csv).parent.mkdir(parents=True, exist_ok=True)
         out_df.to_csv(args.save_csv, index=False)
-        print(f"\nSaved → {args.save_csv}")
+        print(f"\nSaved -> {args.save_csv}")
 
 
 if __name__ == "__main__":

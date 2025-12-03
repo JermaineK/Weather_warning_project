@@ -60,4 +60,4 @@ res = res[["feature","expected_sign","r_pearson","p_pearson","r_spearman","p_spe
 out = "results/bootstrap_significance.csv"
 res.to_csv(out, index=False)
 print(res.to_string(index=False))
-print(f"\nSaved → {out}")
+print(f"\nSaved -> {out}")

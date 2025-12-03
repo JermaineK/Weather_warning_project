@@ -4,11 +4,11 @@
 """
 reporting_and_results.py — thin orchestrator for end-of-pipeline reporting.
 
-Subcommands → script it calls (in reports_subprocess/):
-  summary        → report_generate_summary.py
-  sanity         → report_sanity_checks.py
-  debug-snaps    → report_debug_snaps.py
-  maps           → report_make_maps.py
+Subcommands -> script it calls (in reports_subprocess/):
+  summary        -> report_generate_summary.py
+  sanity         -> report_sanity_checks.py
+  debug-snaps    -> report_debug_snaps.py
+  maps           -> report_make_maps.py
 
 Everything after the subcommand is forwarded unchanged.
 """

@@ -3,10 +3,10 @@
 """
 two_stage_score.py
 
-Stage 1 (context): score all rows → risk_ctx
-Keep the top quantile per hour (vectorized) → ctx_keep ∈ {0,1}
+Stage 1 (context): score all rows -> risk_ctx
+Keep the top quantile per hour (vectorized) -> ctx_keep ∈ {0,1}
 
-Stage 2 (pregen): score only kept rows → risk_pregen (others 0)
+Stage 2 (pregen): score only kept rows -> risk_pregen (others 0)
 
 Extras:
 - Works with CSV or Parquet labelled files
@@ -81,7 +81,7 @@ def load_bundle(bundle_path, wanted_lead=None):
 # ---------- main ----------
 
 def main():
-    ap = argparse.ArgumentParser(description="Two-stage scoring: context filter → pregen scoring.")
+    ap = argparse.ArgumentParser(description="Two-stage scoring: context filter -> pregen scoring.")
     ap.add_argument("--labelled", required=True, help="CSV(.gz)/Parquet with feature superset")
     ap.add_argument("--model-context", required=True, help="joblib bundle (per-lead or classic)")
     ap.add_argument("--model-pregen",  required=True, help="joblib bundle (per-lead or classic)")

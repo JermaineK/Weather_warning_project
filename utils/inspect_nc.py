@@ -358,9 +358,9 @@ def main():
         out_df.to_csv(out_path, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
 
     H = out_df["lat"].nunique(); W = out_df["lon"].nunique(); T = out_df["time"].nunique()
-    print(f"[ok] wrote {len(out_df):,} rows → {out_path}  (H={H} x W={W} x T={T})")
+    print(f"[ok] wrote {len(out_df):,} rows -> {out_path}  (H={H} x W={W} x T={T})")
     if args.emit_grid_index:
-        print("  (ilat/ilon present → stable grid IDs across hours)")
+        print("  (ilat/ilon present -> stable grid IDs across hours)")
 
 if __name__ == "__main__":
     main()

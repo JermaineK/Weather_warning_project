@@ -45,7 +45,7 @@ def make_mask(df: pd.DataFrame, feat: str, sign: str, thr: float) -> np.ndarray:
     return m
 
 def apply_persistence(df: pd.DataFrame, base_mask: np.ndarray, hours: int) -> np.ndarray:
-    """Require >=hours consecutive alert hours per (lat,lon). hours<=1 → no-op."""
+    """Require >=hours consecutive alert hours per (lat,lon). hours<=1 -> no-op."""
     if hours <= 1:
         return base_mask
     out = np.zeros(len(df), dtype=bool)
@@ -155,7 +155,7 @@ def main():
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(out, index=False, date_format="%Y-%m-%d %H:%M:%S")
-    print(f"Wrote → {out}")
+    print(f"Wrote -> {out}")
 
 if __name__ == "__main__":
     main()

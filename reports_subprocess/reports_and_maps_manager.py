@@ -97,6 +97,17 @@ def run_step(tag: str, script: Path, args: List[str]) -> Tuple[bool, int]:
     return ok, res.returncode
 
 
+def _parse_leads(spec: str) -> List[int]:
+    parts = [p.strip() for p in spec.split(",") if p.strip()] if spec else []
+    leads = []
+    for p in parts:
+        try:
+            leads.append(int(p))
+        except Exception:
+            continue
+    return leads
+
+
 # --------------------- main orchestration ---------------------
 
 
@@ -199,6 +210,93 @@ def main() -> int:
         action="store_true",
         help="Skip final sanity checks step.",
     )
+
+    # Slow-tick diagnostics (optional)
+    ap.add_argument(
+        "--run-slowtick",
+        action="store_true",
+        help="Run slowtick_diagnostics.py on alerts (optional diagnostic stage).",
+    )
+    ap.add_argument(
+        "--slowtick-alerts-dir",
+        default="results/alerts_throttled",
+        help="Alerts directory for slow-tick diagnostics.",
+    )
+    ap.add_argument(
+        "--slowtick-run-name",
+        default=None,
+        help="Run name used in alerts filenames (defaults to --run-name).",
+    )
+    ap.add_argument(
+        "--slowtick-leads",
+        default="24,48,72,120,240",
+        help="Comma-separated lead hours to include in diagnostics.",
+    )
+    ap.add_argument(
+        "--slowtick-flag-col",
+        default="alert_final",
+        help="Flag column to use (tries fallbacks if missing).",
+    )
+    ap.add_argument(
+        "--slowtick-out-subdir",
+        default="slowtick",
+        help="Subdirectory under the run folder for slow-tick outputs.",
+    )
+    ap.add_argument(
+        "--slowtick-normalize-lon",
+        choices=["none", "-180..180", "0..360"],
+        default="-180..180",
+        help="Longitude normalization for diagnostics input.",
+    )
+    ap.add_argument(
+        "--slowtick-area",
+        default=None,
+        help='Optional AOI "latN,lonW,latS,lonE" for diagnostics.',
+    )
+    ap.add_argument(
+        "--slowtick-time-format",
+        default=None,
+        help="Optional strptime for parsing alert times.",
+    )
+    ap.add_argument(
+        "--slowtick-prefer",
+        choices=["throttled", "denoised", "base"],
+        default="throttled",
+        help="Preferred alerts stage if multiple files exist.",
+    )
+    ap.add_argument(
+        "--slowtick-save-timeseries",
+        action="store_true",
+        help="Save hourly global coverage time series.",
+    )
+    ap.add_argument(
+        "--slowtick-save-hemi-timeseries",
+        action="store_true",
+        help="Save hourly N/S coverage time series.",
+    )
+    ap.add_argument(
+        "--slowtick-bootstrap-B",
+        type=int,
+        default=500,
+        help="Bootstrap reps for CIs (knee/parity).",
+    )
+    ap.add_argument(
+        "--slowtick-min-hours-per-lead",
+        type=int,
+        default=8,
+        help="Minimum hourly points required per lead.",
+    )
+    ap.add_argument(
+        "--slowtick-fft-gap-fill",
+        type=int,
+        default=2,
+        help="Fill NaN gaps up to this length before FFT (hours).",
+    )
+    ap.add_argument(
+        "--slowtick-debug",
+        action="store_true",
+        help="Verbose file/range debug for diagnostics.",
+    )
     ap.add_argument(
         "--strict",
         action="store_true",
@@ -290,6 +388,42 @@ def main() -> int:
     ok, code = run_step("summary", script, step_args)
     if not ok and args.strict:
         return code
+
+    # --- Optional: slow-tick diagnostics on alerts ---
+    if args.run_slowtick:
+        leads = _parse_leads(args.slowtick_leads)
+        if not leads:
+            print("[manager] slowtick: no valid leads parsed; skipping.")
+        else:
+            script = HERE / "slowtick_diagnostics.py"
+            out_dir = Path(args.slowtick_out_subdir)
+            if not out_dir.is_absolute():
+                out_dir = run_dir / out_dir
+            step_args = [
+                "--alerts-dir", args.slowtick_alerts_dir,
+                "--run-name", args.slowtick_run_name or args.run_name,
+                "--leads", *map(str, leads),
+                "--flag-col", args.slowtick_flag_col,
+                "--out-dir", str(out_dir),
+                "--normalize-lon", args.slowtick_normalize_lon,
+                "--prefer", args.slowtick_prefer,
+                "--bootstrap-B", str(args.slowtick_bootstrap_B),
+                "--min-hours-per-lead", str(args.slowtick_min_hours_per_lead),
+                "--fft-gap-fill", str(args.slowtick_fft_gap_fill),
+            ]
+            if args.slowtick_area:
+                step_args += ["--area", args.slowtick_area]
+            if args.slowtick_time_format:
+                step_args += ["--time-format", args.slowtick_time_format]
+            if args.slowtick_save_timeseries:
+                step_args.append("--save-timeseries")
+            if args.slowtick_save_hemi_timeseries:
+                step_args.append("--save-hemi-timeseries")
+            if args.slowtick_debug:
+                step_args.append("--debug")
+            ok, code = run_step("slowtick-diag", script, step_args)
+            if not ok and args.strict:
+                return code
 
     # --- STEP 6: sanity checks over key artifacts ---
     if not args.skip_sanity:

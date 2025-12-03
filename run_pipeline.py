@@ -26,15 +26,36 @@ from typing import Any, Dict, Iterable, List, Union
 from collections import Counter
 
 from utils import table_format
+from utils import env_check
 
 try:
-    import yaml
+    import yaml  # type: ignore
 except Exception:
-    print("Please `pip install pyyaml`.", file=sys.stderr)
-    raise
+    # Fallback shim: if PyYAML is not available, provide a minimal safe_load
+    # that attempts to parse the config as JSON. This keeps the script usable
+    # in environments without pyyaml while encouraging installation for full YAML support.
+    import json
+
+    class _YAMLShim:
+        @staticmethod
+        def safe_load(s):
+            s = s or ""
+            if not s.strip():
+                return {}
+            try:
+                return json.loads(s)
+            except Exception:
+                print(
+                    "Warning: failed to parse config as JSON; install 'pyyaml' for full YAML support (pip install pyyaml).",
+                    file=sys.stderr,
+                )
+                return {}
+
+    yaml = _YAMLShim()
 
 HERE = Path(__file__).resolve().parent
 PREFERRED_TABLE_FORMAT: str | None = None
+ENV_HINTS: Dict[str, Any] | None = None
 
 # ---------------- shell helpers ----------------
 
@@ -49,10 +70,10 @@ def sh(cmd: List[Union[str, Path]], check: bool = True) -> int:
 def _flatten_kv(prefix: str, obj: Any) -> List[str]:
     """
     Turn a nested structure into CLI flags.
-    - scalars:          {"thr": 0.8}                  → ["--thr", "0.8"]
-    - lists (scalars):  {"leads": [24,48]}            → ["--leads", "24,48"]
-    - dict nested:      {"pick": {"metric": "F1"}}    → ["--pick.metric", "F1"]
-    - truthy booleans:  {"write_parquet": True}       → ["--write-parquet"]
+    - scalars:          {"thr": 0.8}                  -> ["--thr", "0.8"]
+    - lists (scalars):  {"leads": [24,48]}            -> ["--leads", "24,48"]
+    - dict nested:      {"pick": {"metric": "F1"}}    -> ["--pick.metric", "F1"]
+    - truthy booleans:  {"write_parquet": True}       -> ["--write-parquet"]
     - falsy booleans:   skipped
     """
     out: List[str] = []
@@ -81,6 +102,29 @@ def _apply_table_format(step: Dict[str, Any]) -> Dict[str, Any]:
     if not PREFERRED_TABLE_FORMAT:
         return step
     return table_format.rewrite_step_paths(step, PREFERRED_TABLE_FORMAT, convert_existing=True)
+
+def _apply_runtime_hints(step: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Inject recommended chunk sizes when a step has chunk-related keys unset.
+    Keys recognised: chunk_rows/chunk-rows, chunksize, parquet_rows/parquet-rows.
+    """
+    if ENV_HINTS is None:
+        return step
+    csv_rows = ENV_HINTS.get("csv_rows")
+    parq_rows = ENV_HINTS.get("parquet_rows")
+
+    def set_if_missing(key: str, val):
+        if key not in step or step[key] in (None, "", 0):
+            step[key] = val
+
+    if csv_rows:
+        set_if_missing("chunk_rows", csv_rows)
+        set_if_missing("chunk-rows", csv_rows)
+        set_if_missing("chunksize", csv_rows)
+    if parq_rows:
+        set_if_missing("parquet_rows", parq_rows)
+        set_if_missing("parquet-rows", parq_rows)
+    return step
 
 def _mgr(path_parts: Iterable[str]) -> Path:
     return HERE.joinpath(*path_parts).resolve()
@@ -201,7 +245,7 @@ def _describe_inputs(tag: str, step: Dict[str, Any]) -> None:
         if not matches:
             print(f"[{tag} input] glob={g} (no matches)")
             continue
-        print(f"[{tag} input] glob={g} → {len(matches)} matches (showing up to 3)")
+        print(f"[{tag} input] glob={g} -> {len(matches)} matches (showing up to 3)")
         for mp in matches[:3]:
             _describe_path(tag, "input", mp)
 
@@ -217,6 +261,7 @@ def run_fetch(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_runtime_hints(step)
         step = _apply_table_format(step)
         mode = str(step.get("mode", "ibtracs"))
         _progress("fetch", idx, total, mode)
@@ -236,6 +281,7 @@ def run_features(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_runtime_hints(step)
         step = _apply_table_format(step)
         mode = str(step.get("mode", "build"))
         _progress("features", idx, total, mode)
@@ -246,7 +292,7 @@ def run_features(sec: Dict[str, Any]) -> None:
         if step.get("skip_if_exists"):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
-                print(f"[features] skip (exists): {mode} → {outp}")
+                print(f"[features] skip (exists): {mode} -> {outp}")
                 _describe_outputs("features", step)
                 continue
         args = _flatten_kv(
@@ -264,6 +310,7 @@ def run_data_stage(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_runtime_hints(step)
         step = _apply_table_format(step)
         mode = str(step.get("mode", "stage"))
         _progress("data_stage", idx, total, mode)
@@ -282,6 +329,7 @@ def run_sweep(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_runtime_hints(step)
         step = _apply_table_format(step)
         mode = str(step.get("mode", "run"))
         _progress("sweep", idx, total, mode)
@@ -306,6 +354,7 @@ def run_score(sec: Dict[str, Any]) -> None:
     jobs = [j for j in sec.get("jobs", []) if j is not None]
     total = len(jobs)
     for idx, job in enumerate(jobs, 1):
+        job = _apply_runtime_hints(job)
         job = _apply_table_format(job)
         _progress("score", idx, total, job.get("mode", "score"))
         if job.get("enabled") is False:
@@ -323,6 +372,7 @@ def run_alerts_logic(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_runtime_hints(step)
         step = _apply_table_format(step)
         mode = str(step.get("mode", "denoise"))
         _progress("alerts_logic", idx, total, mode)
@@ -334,7 +384,7 @@ def run_alerts_logic(sec: Dict[str, Any]) -> None:
         if step.get("skip_if_exists"):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
-                print(f"[alerts_logic] skip (exists): {mode} → {outp}")
+                print(f"[alerts_logic] skip (exists): {mode} -> {outp}")
                 _describe_outputs("alerts_logic", step)
                 continue
 
@@ -353,6 +403,7 @@ def run_eval(sec: Dict[str, Any]) -> None:
     steps = [s for s in sec.get("steps", []) if s is not None]
     total = len(steps)
     for idx, step in enumerate(steps, 1):
+        step = _apply_runtime_hints(step)
         step = _apply_table_format(step)
         mode = str(step.get("mode", "hourly-rollup"))
         _progress("eval", idx, total, mode)
@@ -444,6 +495,7 @@ def run_report(sec: Dict[str, Any]) -> None:
     for idx, step in enumerate(steps, 1):
         if step is None:
             continue
+        step = _apply_runtime_hints(step)
         step = _apply_table_format(step)
         mode = str(step.get("mode", "summary"))
         _progress("report", idx, len(steps), mode)
@@ -455,7 +507,7 @@ def run_report(sec: Dict[str, Any]) -> None:
         if step.get("skip_if_exists"):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
-                print(f"[report] skip (exists): {mode} → {outp}")
+                print(f"[report] skip (exists): {mode} -> {outp}")
                 _describe_outputs("report", step)
                 continue
 
@@ -503,7 +555,7 @@ def run_misc(sec: Dict[str, Any]) -> None:
         if step.get("skip_if_exists"):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
-                print(f"[misc] skip (exists): {script} → {outp}")
+                print(f"[misc] skip (exists): {script} -> {outp}")
                 _describe_outputs("misc", step)
                 continue
 
@@ -553,12 +605,19 @@ def main() -> int:
     global PREFERRED_TABLE_FORMAT
     PREFERRED_TABLE_FORMAT = table_format.normalize_preference(cfg.get("table_format"))
     if PREFERRED_TABLE_FORMAT:
-        print(f"[table-format] preference → {PREFERRED_TABLE_FORMAT}")
+        print(f"[table-format] preference -> {PREFERRED_TABLE_FORMAT}")
+
+    global ENV_HINTS
+    ENV_HINTS = env_check.summarize()
+    if ENV_HINTS:
+        print(f"[env] available_gb={ENV_HINTS.get('available_gb'):.2f} "
+              f"csv_rows={ENV_HINTS.get('csv_rows')} parquet_rows={ENV_HINTS.get('parquet_rows')} "
+              f"cpu_count={ENV_HINTS.get('cpu_count')}")
 
     workdir = cfg.get("workdir")
     if workdir:
         wd = Path(workdir).resolve()
-        print(f"[cwd] → {wd}")
+        print(f"[cwd] -> {wd}")
         wd.mkdir(parents=True, exist_ok=True)
         os.chdir(wd)
 

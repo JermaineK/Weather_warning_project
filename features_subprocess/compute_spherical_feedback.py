@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# compute_spherical_feedback.py — robust neighbor stencil + enhanced SFI (memory safe; no lightning/rain)
+# compute_spherical_feedback.py - robust neighbor stencil + enhanced SFI (streaming/memory-safe; no lightning/rain)
 
 import argparse
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# Ensure repository root (containing utils/) is importable when run as a script.
+import sys
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils import io_common
 
 pd.options.mode.copy_on_write = True
+
 
 # ----------------------- CLI -----------------------
 def parse_args():
@@ -18,11 +31,10 @@ def parse_args():
             "a thermo×shear coupling, and composite SFI indices."
         )
     )
-    # friendly aliases (for features_manager passthrough)
-    ap.add_argument("--infile",    dest="labelled", required=False, help="grid_labelled_*.{csv,parquet}[.gz]")
-    ap.add_argument("--labelled",  dest="labelled", required=False, help="Alias of --infile")
-    ap.add_argument("--outfile",   dest="out",      required=False, help="Output path")
-    ap.add_argument("--out",       dest="out",      required=False, help="Alias of --outfile")
+    ap.add_argument("--infile", dest="labelled", required=False, help="grid_labelled_*.{csv,parquet}[.gz]")
+    ap.add_argument("--labelled", dest="labelled", required=False, help="Alias of --infile")
+    ap.add_argument("--outfile", dest="out", required=False, help="Output path")
+    ap.add_argument("--out", dest="out", required=False, help="Alias of --outfile")
 
     # neighborhood geometry
     ap.add_argument("--neighbor-step", type=float, default=0.0,
@@ -30,17 +42,22 @@ def parse_args():
     ap.add_argument("--radius-cells", type=int, default=1,
                     help="Neighborhood radius in grid cells (1=8-neighbors)")
 
-    # lead correlation (optional; still supported if pregen exists)
-    ap.add_argument("--lead-hours", type=int, default=24,
-                    help="Optional lead window for quick corr against 'pregen' if present")
-
     # harmonize with pipeline knobs
     ap.add_argument("--normalize-lon", default="-180..180",
                     help="Accepts ' -180..180', '-180..180', '0..360', 'none'")
     ap.add_argument("--area", default=None,
                     help='Optional AOI "latN,lonW,latS,lonE" applied before processing')
+    ap.add_argument("--chunk-rows", type=int, default=0,
+                    help="Rows per chunk when streaming input (auto if 0).")
+    ap.add_argument("--chunksize", type=int, default=0,
+                    help="Alias for --chunk-rows (pipeline compatibility).")
+    ap.add_argument("--parquet-rows", type=int, default=0,
+                    help="Preferred batch size when streaming parquet input/output.")
+    # Kept for compatibility; lead correlations are not computed in this streamer.
+    ap.add_argument("--lead-hours", type=int, default=24,
+                    help="Accepted for backward compatibility; currently unused in streaming mode.")
 
-    # weights for SFI2 (you can tune in YAML)
+    # weights for SFI2 (tunable)
     ap.add_argument("--w-center", type=float, default=0.40, help="Weight for sph_center")
     ap.add_argument("--w-radial", type=float, default=0.25, help="Weight for sph_radial_abs")
     ap.add_argument("--w-vdrstd", type=float, default=0.20, help="Weight for sph_vdr_std")
@@ -55,32 +72,97 @@ def parse_args():
         args.out = str(p.with_name("spherical_feedback.csv.gz"))
     return args
 
-# ----------------------- I/O helpers -----------------------
-def load_any(path: str, parse_time=True) -> pd.DataFrame:
-    lower = str(path).lower()
-    if lower.endswith((".parquet", ".pq", ".pqt")):
-        df = pd.read_parquet(path)
-    else:
-        df = pd.read_csv(
-            path,
-            compression="infer",
-            low_memory=False,
-            encoding_errors="replace",
-            on_bad_lines="skip",
-            parse_dates=["time"] if parse_time else None,
-        )
-    if parse_time and "time" in df.columns:
-        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
-    return df
 
-def write_any(path: str, df: pd.DataFrame) -> None:
-    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
-    low = p.name.lower()
-    if low.endswith((".parquet", ".pq", ".pqt")):
-        df.to_parquet(p, index=False)
+# ----------------------- I/O helpers -----------------------
+def _detect_table_format(path: Path) -> str:
+    suf = "".join(path.suffixes[-2:]).lower()
+    if suf in {".parquet", ".pq", ".pqt"} or path.suffix.lower() in {".parquet", ".pq", ".pqt"}:
+        return "parquet"
+    if suf == ".csv.gz":
+        return "csv.gz"
+    if path.suffix.lower() == ".csv":
+        return "csv"
+    if path.suffix.lower() == ".gz":
+        return "csv.gz"
+    raise SystemExit(f"[spherical] Unsupported table format for {path}")
+
+
+def _peek_columns(path: Path) -> List[str]:
+    fmt = _detect_table_format(path)
+    if fmt == "parquet":
+        pf = pq.ParquetFile(path)
+        return pf.schema.names
+    head = pd.read_csv(path, nrows=5, compression="infer", low_memory=False)
+    return list(head.columns)
+
+
+def _iter_input_chunks(path: Path, usecols: Sequence[str], chunk_rows: int, parquet_rows: int | None = None) -> Iterable[pd.DataFrame]:
+    fmt = _detect_table_format(path)
+    if fmt == "parquet":
+        pf = pq.ParquetFile(path)
+        batch_size = parquet_rows if parquet_rows and parquet_rows > 0 else chunk_rows
+        for batch in pf.iter_batches(batch_size=batch_size, columns=list(usecols)):
+            yield batch.to_pandas()
     else:
-        comp = "gzip" if (low.endswith(".csv.gz") or p.suffix.lower()==".gz") else "infer"
-        df.to_csv(p, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
+        kw = {
+            "compression": "infer",
+            "low_memory": False,
+            "encoding_errors": "replace",
+            "on_bad_lines": "skip",
+            "usecols": list(usecols),
+            "chunksize": chunk_rows,
+            "parse_dates": ["time"],
+        }
+        kw = io_common._csv_kwargs(path, kw)  # type: ignore[attr-defined]
+        kw.pop("engine", None)  # chunked reads need pandas engine
+        kw.pop("dtype_backend", None)
+        reader = io_common._read_csv_with_missing_date_guard(path, kw)  # type: ignore[attr-defined]
+        chunks = reader if not isinstance(reader, pd.DataFrame) else [reader]
+        for chunk in chunks:
+            yield chunk
+
+
+class _ChunkedWriter:
+    """
+    Stream-friendly writer to keep memory bounded.
+    """
+    def __init__(self, path: Path, overwrite: bool):
+        self.path = path
+        self.format = _detect_table_format(path)
+        self._writer = None
+        self._wrote_header = False
+        if path.exists():
+            if overwrite:
+                path.unlink()
+            else:
+                raise SystemExit(f"[spherical] exists and overwrite disabled: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, df: pd.DataFrame):
+        if df is None or len(df) == 0:
+            return
+        if self.format == "parquet":
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if self._writer is None:
+                self._writer = pq.ParquetWriter(self.path, table.schema, compression="snappy")
+            self._writer.write_table(table)
+        else:
+            comp = "gzip" if self.format == "csv.gz" else "infer"
+            mode = "w" if not self._wrote_header else "a"
+            df.to_csv(
+                self.path,
+                index=False,
+                compression=comp,
+                date_format="%Y-%m-%d %H:%M:%S",
+                mode=mode,
+                header=not self._wrote_header,
+            )
+            self._wrote_header = True
+
+    def close(self):
+        if self._writer is not None:
+            self._writer.close()
+
 
 # ----------------------- small utils -----------------------
 ALIASES = {
@@ -96,11 +178,13 @@ ALIASES = {
     "msl_d1h": ["msl_d1h"],
 }
 
+
 def bind_col(cols, choices):
     for c in choices:
         if c in cols:
             return c
     return None
+
 
 def robust01(x):
     x = np.asarray(x, float)
@@ -110,6 +194,7 @@ def robust01(x):
     den = (q99 - q1) if (q99 > q1) else 1.0
     return np.clip((x - q1) / (den + 1e-12), 0.0, 1.0)
 
+
 def infer_step(vals):
     v = np.sort(np.unique(np.asarray(vals, float)))
     if len(v) < 3:
@@ -118,8 +203,10 @@ def infer_step(vals):
     d = d[d > 0]
     return float(np.median(d)) if len(d) else 0.25
 
+
 def quantize(coord, step):
     return np.round(coord / max(step, 1e-9)).astype(np.int32)
+
 
 def norm_mode(s: str | None) -> str:
     if s is None:
@@ -133,6 +220,7 @@ def norm_mode(s: str | None) -> str:
         return "0..360"
     return "-180..180"
 
+
 def wrap_lon_vec(lon, mode: str):
     x = np.asarray(lon, float)
     if mode == "none":
@@ -144,11 +232,13 @@ def wrap_lon_vec(lon, mode: str):
     # default: -180..180
     return ((x + 180.0) % 360.0) - 180.0
 
+
 def parse_area(aoi: str | None):
     if not aoi:
         return None
     latN, lonW, latS, lonE = [float(z.strip()) for z in aoi.split(",")]
     return latN, lonW, latS, lonE
+
 
 def crop_aoi(df, aoi):
     if not aoi:
@@ -156,6 +246,47 @@ def crop_aoi(df, aoi):
     latN, lonW, latS, lonE = aoi
     return df.loc[(df["lat"] <= latN) & (df["lat"] >= latS) &
                   (df["lon"] >= lonW) & (df["lon"] <= lonE)].copy()
+
+
+def robust01_from_quantiles(x: np.ndarray, q1: float, q99: float) -> np.ndarray:
+    den = (q99 - q1) if (q99 > q1) else 1.0
+    return np.clip((np.asarray(x, float) - q1) / (den + 1e-12), 0.0, 1.0)
+
+
+def _compute_quantiles_from_temp(path: Path, cols: Sequence[str], batch_size: int) -> dict[str, Tuple[float, float]]:
+    """Exact 1/99 quantiles by fully scanning temp file columns (slower, no sampling)."""
+    fmt = _detect_table_format(path)
+    q = {}
+    for col in cols:
+        vals = []
+        if fmt == "parquet":
+            pf = pq.ParquetFile(path)
+            for batch in pf.iter_batches(columns=[col], batch_size=batch_size):
+                arr = batch.column(0).to_numpy()
+                if arr.size:
+                    vals.append(arr[np.isfinite(arr)])
+        else:
+            for chunk in pd.read_csv(
+                path,
+                usecols=[col],
+                compression="infer",
+                low_memory=False,
+                encoding_errors="replace",
+                on_bad_lines="skip",
+                chunksize=batch_size,
+            ):
+                arr = pd.to_numeric(chunk[col], errors="coerce").to_numpy()
+                if arr.size:
+                    vals.append(arr[np.isfinite(arr)])
+
+        if not vals:
+            q[col] = (0.0, 1.0)
+            continue
+        allv = np.concatenate(vals)
+        q[col] = tuple(np.nanpercentile(allv, [1, 99]).tolist())  # type: ignore[assignment]
+        del allv, vals
+    return q
+
 
 # ----------------------- core blocks -----------------------
 def per_time_neighbors_block(
@@ -212,7 +343,6 @@ def per_time_neighbors_block(
 
     # quantized grid map (only valid cells)
     if pos_idx_ok.size == 0:
-        # still populate optional quick terms from scalars
         out = {
             "center_norm": robust01(-center_raw),
             "radial_signed": np.tanh(radial_raw).astype(np.float32),
@@ -236,7 +366,7 @@ def per_time_neighbors_block(
     for k, pos in enumerate(pos_idx_ok):
         qi, qj = int(qlat[k]), int(qlon[k])
 
-        # center-ness from MSL (deeper than neighbors → positive after robust01(-·))
+        # center-ness from MSL (deeper than neighbors -> positive after robust01(-·))
         m0 = msl[pos]
 
         # wind radial alignment
@@ -250,7 +380,6 @@ def per_time_neighbors_block(
         m_sum = 0.0
         align_sum = 0.0
 
-        # extra accumulators for optional stats
         vdr_vals = [] if vdr is not None else None
         t2m_vals = [] if t2m is not None else None
 
@@ -260,10 +389,8 @@ def per_time_neighbors_block(
                 continue
             pos_n = pos_idx_ok[j_local]
 
-            # pressure
             m_sum += msl[pos_n]; n_m += 1
 
-            # radial alignment i -> j (dlon scaled by cosφ at i)
             dlat = (lat[pos_n] - lat[pos])
             dlon = (lon[pos_n] - lon[pos]) * cosphi[k]
             rn = np.hypot(dlat, dlon).astype(np.float32)
@@ -293,12 +420,10 @@ def per_time_neighbors_block(
         if t2m_vals is not None and len(t2m_vals) > 0:
             t2m_anom[pos] = (t2m[pos] - (np.nanmean(np.asarray(t2m_vals, dtype=np.float32))))
 
-    # normalize/squash primaries
     center_norm = robust01(-center_raw)
     radial_signed = np.tanh(radial_raw).astype(np.float32)
     radial_abs = np.abs(radial_signed).astype(np.float32)
 
-    # robust scales for secondaries
     vdr_std_n = robust01(vdr_std) if vdr is not None else np.zeros(nsub, dtype=np.float32)
     t2m_anom_pos = np.maximum(t2m_anom, 0.0)
     t2m_anom_n = robust01(t2m_anom_pos) if t2m is not None else np.zeros(nsub, dtype=np.float32)
@@ -317,172 +442,210 @@ def per_time_neighbors_block(
         "pdrop": pdrop.astype(np.float32),
     }
 
-def future_any_by_point(df, label_col, hours):
-    out = np.zeros(len(df), dtype=np.int8)
-    for (_, _), g in df.groupby(["lat", "lon"], sort=False):
-        y = pd.to_numeric(g[label_col], errors="coerce").fillna(0).astype(int).to_numpy()
-        rev = y[::-1]
-        s = pd.Series(rev)
-        fut = s.shift(1).rolling(window=int(hours), min_periods=1).max().fillna(0).astype(int).to_numpy()[::-1]
-        out[g.index] = fut
-    return out
 
-# ----------------------- main -----------------------
-def main():
-    args = parse_args()
-    lon_mode = norm_mode(args.normalize_lon)
-    aoi = parse_area(args.area)
+# ----------------------- streaming helpers -----------------------
+def _process_ready_hours(
+    buf: pd.DataFrame,
+    hours: Sequence[pd.Timestamp],
+    writer: _ChunkedWriter,
+    radius_cells: int,
+    neighbor_step: float,
+    ucol: str, vcol: str, mcol: str,
+    vdr_col: str | None,
+    t2m_col: str | None,
+    shear_col: str | None,
+    pdrop_col: str | None,
+    wC: float, wR: float, wV: float, wP: float, wT: float,
+    rows_written: int,
+    hours_done: int,
+) -> tuple[pd.DataFrame, int, int]:
+    if len(hours) == 0:
+        return buf, rows_written, hours_done
 
-    print("== Spherical Feedback Features ==", flush=True)
-    print(f"In       : {args.labelled}", flush=True)
+    step_lat = neighbor_step if neighbor_step > 0 else infer_step(buf["lat"].unique())
+    step_lon = neighbor_step if neighbor_step > 0 else infer_step(buf["lon"].unique())
 
-    # Load once; then slim early
-    df0 = load_any(args.labelled)
-    cols = set(df0.columns)
-
-    ucol = bind_col(cols, ALIASES["u"])
-    vcol = bind_col(cols, ALIASES["v"])
-    mcol = bind_col(cols, ALIASES["msl"])
-    if None in (ucol, vcol, mcol) or not {"time","lat","lon"}.issubset(cols):
-        found = sorted(list(cols))[:24]
-        raise ValueError(f"Missing required wind/pressure columns (need u,v,msl aliases). Found head: {found}")
-
-    # optional columns
-    vdr_col   = bind_col(cols, ALIASES["vdr"])
-    t2m_col   = bind_col(cols, ALIASES["t2m"])
-    shear_col = bind_col(cols, ALIASES["shear"])
-    pdrop_col = bind_col(cols, ALIASES["msl_d1h"])
-
-    # normalize coordinates; slim projection
-    keep_cols = ["time","lat","lon", ucol, vcol, mcol]
-    for opt in (vdr_col, t2m_col, shear_col, pdrop_col, "pregen"):
-        if isinstance(opt, str) and opt in df0.columns and opt not in keep_cols:
-            keep_cols.append(opt)
-
-    df = df0[keep_cols].copy()
-    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
-    df["lat"]  = pd.to_numeric(df["lat"], errors="coerce").astype(np.float32)
-    df["lon"]  = wrap_lon_vec(pd.to_numeric(df["lon"], errors="coerce"), lon_mode).astype(np.float32)
-    df[ucol]   = pd.to_numeric(df[ucol], errors="coerce").astype(np.float32)
-    df[vcol]   = pd.to_numeric(df[vcol], errors="coerce").astype(np.float32)
-    df[mcol]   = pd.to_numeric(df[mcol], errors="coerce").astype(np.float32)
-    if vdr_col:   df[vdr_col]   = pd.to_numeric(df[vdr_col], errors="coerce").astype(np.float32)
-    if t2m_col:   df[t2m_col]   = pd.to_numeric(df[t2m_col], errors="coerce").astype(np.float32)
-    if shear_col: df[shear_col] = pd.to_numeric(df[shear_col], errors="coerce").astype(np.float32)
-    if pdrop_col: df[pdrop_col] = pd.to_numeric(df[pdrop_col], errors="coerce").astype(np.float32)
-
-    df = df.dropna(subset=["time","lat","lon"]).reset_index(drop=True)
-    if aoi:
-        df = crop_aoi(df, aoi)
-    if df.empty:
-        raise ValueError("No rows after normalization/AOI filter.")
-
-    # hour bucket & sort
-    df.sort_values(["time", "lat", "lon"], kind="mergesort", inplace=True, ignore_index=True)
-    df["time_hr"] = pd.to_datetime(df["time"]).dt.floor("h")
-
-    # step inference
-    step_lat = args.neighbor_step if args.neighbor_step > 0 else infer_step(df["lat"].unique())
-    step_lon = args.neighbor_step if args.neighbor_step > 0 else infer_step(df["lon"].unique())
-    print(f"Radius(cells)={args.radius_cells}  Neighbor step={'auto' if args.neighbor_step<=0 else args.neighbor_step}°", flush=True)
-    print(f"LonMode={lon_mode}  step_lat≈{step_lat:.4f}°  step_lon≈{step_lon:.4f}°", flush=True)
-
-    # per-hour processing (memory-safe)
-    parts = {
-        "sph_center": [],
-        "sph_radial_signed": [],
-        "sph_radial_abs": [],
-        "sph_vdr_std": [],
-        "t2m_anom_local": [],
-        "thermo_shear": [],
-        "pdrop_nd": [],
-    }
-
-    hours = pd.Index(df["time_hr"].unique())
-    N = len(hours)
-    for k, th in enumerate(hours, start=1):
-        mask = (df["time_hr"] == th)
-        idx = df.index[mask]
-        sub = df.loc[mask, ["lat","lon", ucol, vcol, mcol] +
+    for th in sorted(hours):
+        mask = buf["time_hr"] == th
+        if not mask.any():
+            continue
+        sub = buf.loc[mask, ["time","lat","lon", ucol, vcol, mcol] +
                            ([vdr_col] if vdr_col else []) +
                            ([t2m_col] if t2m_col else []) +
                            ([shear_col] if shear_col else []) +
                            ([pdrop_col] if pdrop_col else [])]
 
         out = per_time_neighbors_block(
-            sub, step_lat, step_lon, args.radius_cells,
+            sub, step_lat, step_lon, radius_cells,
             ucol, vcol, mcol, vdr_col, t2m_col, shear_col, pdrop_col
         )
 
-        parts["sph_center"].append(pd.Series(out["center_norm"], index=idx))
-        parts["sph_radial_signed"].append(pd.Series(out["radial_signed"], index=idx))
-        parts["sph_radial_abs"].append(pd.Series(out["radial_abs"], index=idx))
-        parts["sph_vdr_std"].append(pd.Series(out["vdr_std"], index=idx))
-        parts["t2m_anom_local"].append(pd.Series(out["t2m_anom_local"], index=idx))
-        parts["thermo_shear"].append(pd.Series(out["thermo_shear"], index=idx))
-        parts["pdrop_nd"].append(pd.Series(out["pdrop"], index=idx))
+        res = pd.DataFrame({
+            "time": sub["time"].to_numpy(),
+            "lat": sub["lat"].to_numpy(),
+            "lon": sub["lon"].to_numpy(),
+            "sph_center": out["center_norm"],
+            "sph_radial_signed": out["radial_signed"],
+            "sph_radial_abs": out["radial_abs"],
+            "sph_vdr_std": out["vdr_std"],
+            "t2m_anom_local": out["t2m_anom_local"],
+            "pdrop_nd": out["pdrop"],
+            "thermo_shear": out["thermo_shear"],
+        }, index=sub.index).sort_index()
 
-        if (k % max(1, N // 10)) == 0 or k == N:
-            print(f"  … {k}/{N} hours", flush=True)
+        sfi_raw = (0.45 * res["sph_center"].to_numpy(dtype=np.float32) +
+                   0.35 * res["sph_radial_abs"].to_numpy(dtype=np.float32))
+        mix_raw = (wC * res["sph_center"].to_numpy(dtype=np.float32) +
+                   wR * res["sph_radial_abs"].to_numpy(dtype=np.float32) +
+                   wV * res["sph_vdr_std"].to_numpy(dtype=np.float32) +
+                   wP * res["pdrop_nd"].to_numpy(dtype=np.float32) +
+                   wT * res["thermo_shear"].to_numpy(dtype=np.float32))
+        res["SFI_raw"] = sfi_raw.astype(np.float32)
+        res["SFI2_raw"] = mix_raw.astype(np.float32)
 
-    # stitch
-    for key, lst in parts.items():
-        df[key] = pd.concat(lst).sort_index().astype(np.float32)
+        writer.write(res)
+        rows_written += len(res)
+        hours_done += 1
+        if (hours_done % 10) == 0:
+            print(f"  . hours processed={hours_done} rows_written={rows_written:,}", flush=True)
 
-    # SFI (original) — kept for continuity
-    sfi = 0.45 * df["sph_center"].to_numpy(dtype=np.float32) \
-        + 0.35 * df["sph_radial_abs"].to_numpy(dtype=np.float32) \
-        + 0.20 * np.zeros(len(df), dtype=np.float32)  # no lightning
-    df["SFI"] = robust01(sfi).astype(np.float32)
+    buf = buf.loc[~buf["time_hr"].isin(hours)].reset_index(drop=True)
+    return buf, rows_written, hours_done
 
-    # SFI2 (enhanced, tunable)
-    wC, wR, wV, wP, wT = args.w_center, args.w_radial, args.w_vdrstd, args.w_pdrop, args.w_thermo
-    mix = (wC * df["sph_center"].to_numpy(dtype=np.float32) +
-           wR * df["sph_radial_abs"].to_numpy(dtype=np.float32) +
-           wV * df["sph_vdr_std"].to_numpy(dtype=np.float32) +
-           wP * df["pdrop_nd"].to_numpy(dtype=np.float32) +
-           wT * df["thermo_shear"].to_numpy(dtype=np.float32))
-    df["SFI2"] = robust01(mix).astype(np.float32)
 
-    # quick correlations vs pregen (if present)
-    if "pregen" in df.columns:
-        y0 = pd.to_numeric(df["pregen"], errors="coerce").fillna(0).astype(int).to_numpy()
-        def pearson(x):
-            x = np.asarray(x, float)
-            xm = np.nanmean(x); xs = np.nanstd(x) + 1e-12
-            ym = y0.mean(); ys = y0.std() + 1e-12
-            return float(np.nanmean(((x - xm)/xs) * ((y0 - ym)/ys)))
-        print("\nPearson r vs pregen (coincident):", flush=True)
-        for c in ("sph_center","sph_radial_abs","sph_vdr_std","pdrop_nd","thermo_shear","SFI","SFI2"):
-            print(f"  {c:14s} r={pearson(df[c]):+.3f}")
+# ----------------------- main -----------------------
+def main():
+    args = parse_args()
+    lon_mode = norm_mode(args.normalize_lon)
+    aoi = parse_area(args.area)
+    in_path = Path(args.labelled)
+    out_path = Path(args.out)
 
-        if args.lead_hours and args.lead_hours > 0:
-            yL = future_any_by_point(df[["time","lat","lon","pregen"]], "pregen", int(args.lead_hours))
-            ym = yL.mean(); ys = yL.std() + 1e-12
-            print(f"\nPearson r vs pregen_future(+{args.lead_hours}h):", flush=True)
-            for c in ("sph_center","sph_radial_abs","sph_vdr_std","pdrop_nd","thermo_shear","SFI","SFI2"):
-                x = df[c].to_numpy()
-                xm = np.nanmean(x); xs = np.nanstd(x) + 1e-12
-                r = float(np.nanmean(((x - xm)/xs) * ((yL - ym)/ys)))
-                print(f"  {c:14s} r={r:+.3f}")
+    fmt_out = _detect_table_format(out_path)
+    if fmt_out == "parquet":
+        base = out_path.name
+        if base.endswith(".parquet"):
+            base = base[:-len(".parquet")]
+        tmp_path = out_path.with_name(f"{base}.tmp.parquet")
+    elif fmt_out == "csv.gz":
+        base = out_path.name
+        if base.endswith(".csv.gz"):
+            base = base[:-len(".csv.gz")]
+        tmp_path = out_path.with_name(f"{base}.tmp.csv.gz")
+    else:  # csv
+        base = out_path.stem
+        tmp_path = out_path.with_name(f"{base}.tmp.csv")
 
-    # small snapshot
-    try:
-        q = df[["sph_center","sph_radial_abs","sph_vdr_std","t2m_anom_local","pdrop_nd","thermo_shear","SFI","SFI2"]].quantile([0.05, 0.50, 0.95])
-        print("\nPercentiles (0.05 / 0.50 / 0.95):")
-        print(q)
-    except Exception:
-        pass
+    in_fmt = _detect_table_format(in_path)
+    csv_rows, parq_rows = io_common.recommend_chunk_rows()  # type: ignore[attr-defined]
+    chunk_pref = args.chunk_rows or args.chunksize
+    parquet_pref = args.parquet_rows
+    chunk_rows = chunk_pref or (parq_rows if in_fmt == "parquet" else csv_rows)
+    if chunk_rows <= 0:
+        chunk_rows = parq_rows if in_fmt == "parquet" else csv_rows
+    parquet_rows = parquet_pref or chunk_rows
 
-    # write slim artifact
-    keep = [
+    print("== Spherical Feedback Features ==", flush=True)
+    print(f"In       : {in_path}", flush=True)
+    print(f"Out (tmp): {tmp_path}", flush=True)
+    print(f"Chunk rows: {chunk_rows:,}  LonMode: {lon_mode}", flush=True)
+
+    cols_all = set(_peek_columns(in_path))
+    ucol = bind_col(cols_all, ALIASES["u"])
+    vcol = bind_col(cols_all, ALIASES["v"])
+    mcol = bind_col(cols_all, ALIASES["msl"])
+    if None in (ucol, vcol, mcol) or not {"time","lat","lon"}.issubset(cols_all):
+        found = sorted(list(cols_all))[:24]
+        raise ValueError(f"Missing required wind/pressure columns (need u,v,msl aliases). Found head: {found}")
+
+    vdr_col   = bind_col(cols_all, ALIASES["vdr"])
+    t2m_col   = bind_col(cols_all, ALIASES["t2m"])
+    shear_col = bind_col(cols_all, ALIASES["shear"])
+    pdrop_col = bind_col(cols_all, ALIASES["msl_d1h"])
+
+    keep_cols = ["time","lat","lon", ucol, vcol, mcol]
+    for opt in (vdr_col, t2m_col, shear_col, pdrop_col, "pregen"):
+        if isinstance(opt, str) and opt in cols_all and opt not in keep_cols:
+            keep_cols.append(opt)
+
+    writer_tmp = _ChunkedWriter(tmp_path, overwrite=True)
+    rows_written = 0
+    hours_done = 0
+    buf = pd.DataFrame()
+
+    for chunk in _iter_input_chunks(in_path, keep_cols, chunk_rows, parquet_rows=parquet_rows):
+        if chunk is None or len(chunk) == 0:
+            continue
+        chunk["time"] = pd.to_datetime(chunk["time"], utc=True, errors="coerce").dt.tz_localize(None)
+        chunk["lat"]  = pd.to_numeric(chunk["lat"], errors="coerce").astype(np.float32)
+        chunk["lon"]  = wrap_lon_vec(pd.to_numeric(chunk["lon"], errors="coerce"), lon_mode).astype(np.float32)
+        chunk[ucol]   = pd.to_numeric(chunk[ucol], errors="coerce").astype(np.float32)
+        chunk[vcol]   = pd.to_numeric(chunk[vcol], errors="coerce").astype(np.float32)
+        chunk[mcol]   = pd.to_numeric(chunk[mcol], errors="coerce").astype(np.float32)
+        if vdr_col:   chunk[vdr_col]   = pd.to_numeric(chunk[vdr_col], errors="coerce").astype(np.float32)
+        if t2m_col:   chunk[t2m_col]   = pd.to_numeric(chunk[t2m_col], errors="coerce").astype(np.float32)
+        if shear_col: chunk[shear_col] = pd.to_numeric(chunk[shear_col], errors="coerce").astype(np.float32)
+        if pdrop_col: chunk[pdrop_col] = pd.to_numeric(chunk[pdrop_col], errors="coerce").astype(np.float32)
+
+        chunk = chunk.dropna(subset=["time","lat","lon"])
+        if aoi:
+            chunk = crop_aoi(chunk, aoi)
+        if chunk.empty:
+            continue
+
+        chunk["time_hr"] = pd.to_datetime(chunk["time"]).dt.floor("h")
+        buf = pd.concat([buf, chunk], ignore_index=True)
+        buf.sort_values(["time","lat","lon"], kind="mergesort", inplace=True, ignore_index=True)
+
+        hours = buf["time_hr"].unique()
+        if len(hours) > 1:
+            ready_hours = hours[:-1]  # leave last hour in buffer in case spillover appears next chunk
+            buf, rows_written, hours_done = _process_ready_hours(
+                buf, ready_hours, writer_tmp,
+                args.radius_cells, args.neighbor_step,
+                ucol, vcol, mcol, vdr_col, t2m_col, shear_col, pdrop_col,
+                args.w_center, args.w_radial, args.w_vdrstd, args.w_pdrop, args.w_thermo,
+                rows_written, hours_done
+            )
+
+    if not buf.empty:
+        remaining_hours = buf["time_hr"].unique()
+        buf, rows_written, hours_done = _process_ready_hours(
+            buf, remaining_hours, writer_tmp,
+            args.radius_cells, args.neighbor_step,
+            ucol, vcol, mcol, vdr_col, t2m_col, shear_col, pdrop_col,
+            args.w_center, args.w_radial, args.w_vdrstd, args.w_pdrop, args.w_thermo,
+            rows_written, hours_done
+        )
+
+    writer_tmp.close()
+    if rows_written == 0:
+        raise SystemExit("[spherical] No rows processed; aborting.")
+
+    q = _compute_quantiles_from_temp(tmp_path, ["SFI_raw","SFI2_raw"], max(chunk_rows, 100_000))
+    sfi_q1, sfi_q99 = q["SFI_raw"]
+    mix_q1, mix_q99 = q["SFI2_raw"]
+    print(f"Quantiles (exact scan): SFI q1={sfi_q1:.4f} q99={sfi_q99:.4f} | SFI2 q1={mix_q1:.4f} q99={mix_q99:.4f}", flush=True)
+
+    writer_out = _ChunkedWriter(out_path, overwrite=True)
+    keep_final = [
         "time","lat","lon",
         "sph_center","sph_radial_signed","sph_radial_abs",
         "sph_vdr_std","t2m_anom_local","pdrop_nd","thermo_shear",
         "SFI","SFI2"
     ]
-    write_any(args.out, df[keep])
-    print(f"\nWrote {args.out}  | rows={len(df):,}", flush=True)
+
+    for chunk in _iter_input_chunks(tmp_path, keep_final + ["SFI_raw","SFI2_raw"], chunk_rows, parquet_rows=parquet_rows):
+        if chunk is None or len(chunk) == 0:
+            continue
+        chunk["SFI"] = robust01_from_quantiles(chunk["SFI_raw"], sfi_q1, sfi_q99).astype(np.float32)
+        chunk["SFI2"] = robust01_from_quantiles(chunk["SFI2_raw"], mix_q1, mix_q99).astype(np.float32)
+        writer_out.write(chunk[keep_final])
+
+    writer_out.close()
+    tmp_path.unlink(missing_ok=True)
+    print(f"\nWrote {out_path}  | rows={rows_written:,}", flush=True)
+
 
 if __name__ == "__main__":
     main()

@@ -268,7 +268,7 @@ def select_high_score_alerts_streaming(
     Streaming version: does NOT load full alerts CSV into memory.
 
     Steps:
-      1) If score_threshold is provided → use it directly.
+      1) If score_threshold is provided -> use it directly.
          Else: streaming reservoir-sample quantile to estimate score threshold.
       2) Second streaming pass: clean basic columns, ensure row_id, and
          keep only rows with score >= threshold.
@@ -636,8 +636,24 @@ def main():
         default=500_000,
         help="Chunk size when streaming alerts and rich file (default: 500k).",
     )
+    ap.add_argument(
+        "--chunksize",
+        type=int,
+        default=None,
+        help="Alias for --chunk-rows (compatibility with orchestrator hints).",
+    )
+    ap.add_argument(
+        "--parquet-rows",
+        type=int,
+        default=None,
+        help="Alias for --chunk-rows when using parquet (compatibility only).",
+    )
 
     args = ap.parse_args()
+    if args.chunksize and not args.chunk_rows:
+        args.chunk_rows = args.chunksize
+    if args.parquet_rows and not args.chunk_rows:
+        args.chunk_rows = args.parquet_rows
 
     alerts_path = Path(args.alerts_with_targets)
     rich_path = Path(args.rich)
@@ -692,7 +708,7 @@ def main():
         compression=compression,
         date_format="%Y-%m-%d %H:%M:%S",
     )
-    _print(f"[scan] wrote enriched highs → {out_enriched} rows={len(enriched)} "
+    _print(f"[scan] wrote enriched highs -> {out_enriched} rows={len(enriched)} "
            f"(threshold={thr:.4f}, total_alert_rows={total_rows})")
 
     # 5) Summarise candidate columns
@@ -711,7 +727,7 @@ def main():
     )
     out_summary.parent.mkdir(parents=True, exist_ok=True)
     summary.to_csv(out_summary, index=False)
-    _print(f"[scan] wrote feature summary → {out_summary} rows={len(summary)}")
+    _print(f"[scan] wrote feature summary -> {out_summary} rows={len(summary)}")
 
 
 if __name__ == "__main__":

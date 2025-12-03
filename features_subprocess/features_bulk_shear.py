@@ -114,7 +114,7 @@ def _levels_hpa(ds: xr.Dataset, lvl_name: str) -> np.ndarray:
     # unit sniff
     units = (ds.coords.get(lvl_name, ds.variables.get(lvl_name))).attrs.get("units", "").lower()
     if "pa" in units and "hpa" not in units:
-        # looks like Pa → convert
+        # looks like Pa -> convert
         vals = vals / 100.0
     else:
         # heuristic: big numbers mean Pa
@@ -150,17 +150,35 @@ def _wrap_lon(x, mode):
 
 # ---------------- IO helpers ----------------
 
-def _write_any(path: str, df: pd.DataFrame, overwrite=True):
+def _write_any(path: str, df: pd.DataFrame, overwrite=True, chunk_rows: int = 0, parquet_rows: int = 0):
     p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
     if p.exists() and not overwrite:
         print(f"[skip] exists: {p}")
         return
     low = p.name.lower()
     if low.endswith((".parquet", ".parq", ".pq", ".pqt")):
-        df.to_parquet(p, index=False)
+        if parquet_rows and parquet_rows > 0:
+            df.to_parquet(p, index=False, row_group_size=int(parquet_rows))
+        else:
+            df.to_parquet(p, index=False)
     else:
         comp = "gzip" if (low.endswith(".gz") or p.suffix.lower() == ".gz") else "infer"
-        df.to_csv(p, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
+        if chunk_rows and chunk_rows > 0:
+            first = True
+            step = int(chunk_rows)
+            for i in range(0, len(df), step):
+                sub = df.iloc[i : i + step]
+                sub.to_csv(
+                    p,
+                    index=False,
+                    mode="w" if first else "a",
+                    header=first,
+                    compression=comp,
+                    date_format="%Y-%m-%d %H:%M:%S",
+                )
+                first = False
+        else:
+            df.to_csv(p, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
 
 # ---------------- CLI ----------------
 
@@ -181,6 +199,10 @@ def parse_args():
     ap.add_argument("--v-name", default=None, help="explicit v variable name if not 'v'")
     ap.add_argument("--level-name", default=None, help="explicit level dim/coord name")
     ap.add_argument("--list", action="store_true", help="print dataset summary (dims/coords/vars) and exit")
+    # chunking knobs (used for streaming CSV write or parquet row groups)
+    ap.add_argument("--chunk-rows", type=int, default=0, help="Rows per CSV chunk when writing (0=all at once).")
+    ap.add_argument("--chunksize", type=int, default=0, help="Alias for --chunk-rows.")
+    ap.add_argument("--parquet-rows", type=int, default=0, help="Parquet row group size (0=default).")
     return ap.parse_args()
 
 # ---------------- main ----------------
@@ -214,7 +236,7 @@ def main():
     else:
         lvl_name = _detect_level_dim(ds, u_name, v_name)
 
-    # level values → hPa
+    # level values -> hPa
     levels_hpa = _levels_hpa(ds, lvl_name)
     low_a, low_b   = [float(x) for x in str(args.low_pair).split(",")]
     deep_a, deep_b = [float(x) for x in str(args.deep_pair).split(",")]
@@ -243,7 +265,11 @@ def main():
         except Exception:
             pass
 
-    _write_any(args.out, out, overwrite=args.overwrite)
+    # resolve chunk sizes
+    chunk_rows = args.chunk_rows or args.chunksize
+    parquet_rows = args.parquet_rows
+
+    _write_any(args.out, out, overwrite=args.overwrite, chunk_rows=chunk_rows, parquet_rows=parquet_rows)
     print(f"[bulk-shear] wrote {args.out} rows={len(out):,}  "
           f"(u='{u_name}', v='{v_name}', level='{lvl_name}', levels~{int(len(levels_hpa))} @hPa)")
 

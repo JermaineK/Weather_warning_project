@@ -205,7 +205,7 @@ The top-level pipeline fans out into manager scripts, which in turn dispatch to 
 ```
 run_pipeline.py
  ├─ run_fetch → fetch_subprocess/fetch_manager.py → era5_fetch_cds.py / era5_merge_singlelevels.py / ibtracs_fetch.py / prepare_besttrack_intensity.py (mode-driven)
- ├─ run_features → features_subprocess/features_manager.py → build_features_grid.py / features_patch.py / join_labels_grid.py / compute_gka_features.py / integrate_era5_thermo.py / compute_spherical_feedback.py / features_bulk_shear.py / features_join_features.py (mode-driven)
+run_features -> features_subprocess/features_manager.py -> build_features_grid.py / compute_gka_features.py / integrate_era5_thermo.py / compute_spherical_feedback.py / features_bulk_shear.py / features_join_features.py (mode-driven; label join now lives under data_subprocess)
  ├─ run_data_stage → data_subprocess/data_stage_manager.py (mode-driven)
  ├─ run_sweep → sweep_subprocess/sweep_manager.py (mode-driven; supports “chain” recipe)
  ├─ run_score → grid_score.py (per-job args)
@@ -1102,6 +1102,5 @@ Each new piece can then be activated from YAML with a new `mode` in the appropri
 ```
 
 ```
-
 
 

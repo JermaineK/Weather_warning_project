@@ -5,12 +5,12 @@ fetch_manager.py
 
 Front door for all data-fetch and track-preparation scripts:
 
-  - era5_fetch_cds.py              → "era5"        (single-levels; now with safe default --vars)
-  - era5_fetch_cds.py              → "era5-pl"     (pressure-levels preset: u/v at 1000..500 hPa)
-  - era5_fetch_cds.py              → "era5-both"   (single-levels + pressure-levels in one run)
-  - era5_merge_singlelevels.py     → "era5-merge-single" (merge per-month single-level .nc into union files)
-  - ibtracs_fetch.py               → "ibtracs"
-  - prepare_besttrack_intensity.py → "intensity"
+  - era5_fetch_cds.py              -> "era5"        (single-levels; now with safe default --vars)
+  - era5_fetch_cds.py              -> "era5-pl"     (pressure-levels preset: u/v at 1000..500 hPa)
+  - era5_fetch_cds.py              -> "era5-both"   (single-levels + pressure-levels in one run)
+  - era5_merge_singlelevels.py     -> "era5-merge-single" (merge per-month single-level .nc into union files)
+  - ibtracs_fetch.py               -> "ibtracs"
+  - prepare_besttrack_intensity.py -> "intensity"
 
 Environment-configurable defaults (optional)
 --------------------------------------------

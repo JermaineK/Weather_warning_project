@@ -5,11 +5,11 @@ sweep_manager.py
 
 Orchestrates all sweep / threshold-search tools:
 
-  run              → sweep_runner.py
-  gate             → sweep_gate_runner.py
-  best-f1          → best_f1.py
-  best-constrained → find_best_f1_thresholds_constrained.py
-  pick             → pick_best_from_sweep.py
+  run              -> sweep_runner.py
+  gate             -> sweep_gate_runner.py
+  best-f1          -> best_f1.py
+  best-constrained -> find_best_f1_thresholds_constrained.py
+  pick             -> pick_best_from_sweep.py
 
 Chain modes:
   run+pick
@@ -102,7 +102,7 @@ def _split_prefixed_args(prefix: str, all_extra: List[str]) -> List[str]:
     """
     Extract arguments that start with '--<prefix>.' and strip that prefix.
     Example:
-        --run.out results/x → forwarded to underlying script as --out results/x
+        --run.out results/x -> forwarded to underlying script as --out results/x
     """
     out: List[str] = []
     skip_next = False

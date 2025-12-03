@@ -47,7 +47,7 @@ from dateutil.parser import isoparse
 from dateutil.relativedelta import relativedelta
 from tqdm import tqdm  # noqa: F401  (kept for future progress bars)
 
-# ---- alias map → canonical ERA5 variable names (add more as needed) ----
+# ---- alias map -> canonical ERA5 variable names (add more as needed) ----
 VAR_ALIASES = {
     # single-levels
     "u10": "10m_u_component_of_wind",
@@ -333,11 +333,11 @@ def main():
 
             tmp = out_path.with_suffix(out_path.suffix + ".part")
             try:
-                print(f"[CDS] {job['kind']} {job['dataset']} {yyyy}-{mm} → {out_path}")
+                print(f"[CDS] {job['kind']} {job['dataset']} {yyyy}-{mm} -> {out_path}")
                 print(f"[CDS] request keys: {list(req.keys())}")
                 c.retrieve(job["dataset"], req, str(tmp))
 
-                # If we somehow got a zip, expand; else rename .part → final
+                # If we somehow got a zip, expand; else rename .part -> final
                 if tmp.suffix.lower() == ".zip":
                     nc_outs = extract_zip_if_needed(tmp, delete_zip=True)
                     if not nc_outs:

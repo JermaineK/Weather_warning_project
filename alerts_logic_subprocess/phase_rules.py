@@ -50,7 +50,7 @@ def impute_then_scale(df: pd.DataFrame, cols, scaler):
 def future_max_timeaware(df: pd.DataFrame, label_col: str, hours: int) -> pd.Series:
     """
     For each (lat,lon,time), 1 iff any label==1 occurs in (t, t+hours].
-    Reverse → rolling(time) → shift(1) → reverse. Returns Series aligned to df.index.
+    Reverse -> rolling(time) -> shift(1) -> reverse. Returns Series aligned to df.index.
     """
 
     def _lead(g: pd.DataFrame) -> pd.Series:
@@ -98,7 +98,7 @@ def rule_from_feature(
     steps: int = 25,
 ):
     """
-    1D threshold rule on a feature. dir_hint='pos' → (x >= thr), 'neg' → (x <= thr).
+    1D threshold rule on a feature. dir_hint='pos' -> (x >= thr), 'neg' -> (x <= thr).
     Returns best (F1, thr, P, R).
     """
     x = df[feature].to_numpy(float)
@@ -350,8 +350,8 @@ def main():
             for _, r in d.iterrows()
         )
 
-    print(f"\nSaved phase feature influence → {feat_out}")
-    print(f"Saved rule candidates        → {rules_out}\n")
+    print(f"\nSaved phase feature influence -> {feat_out}")
+    print(f"Saved rule candidates        -> {rules_out}\n")
     rules_df = pd.read_csv(rules_out)
     for h in leads:
         print(f"Top 1-feature rules @ lead {h}h")

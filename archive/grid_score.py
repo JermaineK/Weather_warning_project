@@ -4,12 +4,12 @@
 """
 grid_score.py — thin orchestrator that defers to the 5 scoring subprocesses.
 
-Available subcommands (→ script it calls):
-  predict-raw            → predict_raw_scores.py
-  per-lead               → score_per_lead.py
-  per-lead-logit-bundle  → score_per_lead_logit_bundle.py
-  all-leads-logit        → score_all_leads_logit.py
-  apply-thresholds       → apply_thresholds.py
+Available subcommands (-> script it calls):
+  predict-raw            -> predict_raw_scores.py
+  per-lead               -> score_per_lead.py
+  per-lead-logit-bundle  -> score_per_lead_logit_bundle.py
+  all-leads-logit        -> score_all_leads_logit.py
+  apply-thresholds       -> apply_thresholds.py
 
 Everything after the subcommand is passed through to the target script unchanged.
 
@@ -28,7 +28,7 @@ import subprocess
 from pathlib import Path
 from typing import List, Dict
 
-# Canonical subcommands → candidate filenames (first match wins)
+# Canonical subcommands -> candidate filenames (first match wins)
 SUBPROCESS_CANDIDATES: Dict[str, List[str]] = {
     "predict-raw": [
         "predict_raw_scores.py", "predict-raw-scores.py", "predictraw.py"

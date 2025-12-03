@@ -146,6 +146,17 @@ def _haversine_km(lat1, lon1, lat2, lon2) -> np.ndarray:
     return R * c
 
 
+def _is_probably_parquet(path: Path) -> bool:
+    try:
+        with path.open("rb") as f:
+            head = f.read(4)
+            f.seek(-4, 2)
+            tail = f.read(4)
+        return head == b"PAR1" or tail == b"PAR1"
+    except Exception:
+        return False
+
+
 # -------------------- core helpers --------------------
 
 def load_tracks(
@@ -162,7 +173,16 @@ def load_tracks(
       storm_vmax, storm_pmin, basin, source
     sorted by storm_time.
     """
-    df = pd.read_csv(path)
+    if path.suffix.lower() in {".parquet", ".parq", ".pq"}:
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(
+            path,
+            compression="infer",
+            low_memory=False,
+            encoding_errors="replace",
+            on_bad_lines="skip",
+        )
 
     # Harmonise time column
     if time_col_prefer in df.columns:
@@ -175,6 +195,7 @@ def load_tracks(
         raise ValueError(f"Tracks file {path} missing time/obs_time/time_h column.")
 
     df["storm_time"] = _to_utc_naive(df[tcol], None)
+    df["storm_time"] = pd.to_datetime(df["storm_time"], errors="coerce").astype("datetime64[ns]")
 
     # Basic required coords
     if "lat" not in df.columns or "lon" not in df.columns:
@@ -234,7 +255,7 @@ def load_tracks(
                     drop=True
                 )
                 _print(
-                    f"[ibtracs] filtered tracks by storms_list: {before} → {len(df)} rows"
+                    f"[ibtracs] filtered tracks by storms_list: {before} -> {len(df)} rows"
                 )
         else:
             _print(
@@ -259,16 +280,35 @@ def iter_alert_chunks(
     chunksize: int,
     usecols: Optional[List[str]] = None,
 ) -> Any:
+    if path.suffix.lower() in {".parquet", ".parq", ".pq"} or _is_probably_parquet(path):
+        # Parquet: stream row groups via pyarrow if available; fallback to whole read
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+
+            pf = pq.ParquetFile(path)
+            cols = usecols if usecols else None
+            for batch in pf.iter_batches(batch_size=chunksize, columns=cols):
+                yield batch.to_pandas()
+            return
+        except Exception:
+            pass
+        df = pd.read_parquet(path, columns=usecols if usecols else None)
+        yield df
+        return
+
     it = pd.read_csv(
         path,
         compression="infer",
         low_memory=False,
         chunksize=int(chunksize),
         usecols=usecols,
+        encoding_errors="replace",
+        on_bad_lines="skip",
     )
     if not hasattr(it, "__iter__"):
         it = [it]
-    return it
+    for ch in it:
+        yield ch
 
 
 def match_alerts_to_tracks_chunk(
@@ -298,6 +338,7 @@ def match_alerts_to_tracks_chunk(
     # Parse/clean alert coordinates
     A = chunk.copy()
     A[time_col] = _to_utc_naive(A[time_col], None)
+    A[time_col] = pd.to_datetime(A[time_col], errors="coerce").dt.tz_localize(None).astype("datetime64[ns]")
     A[lat_col] = pd.to_numeric(A[lat_col], errors="coerce")
     A[lon_col] = _norm_lon(pd.to_numeric(A[lon_col], errors="coerce"))
     A[score_col] = pd.to_numeric(A[score_col], errors="coerce")
@@ -308,15 +349,19 @@ def match_alerts_to_tracks_chunk(
     if A.empty:
         return A
 
-    # Sort by time for merge_asof; keep original order index
+    # Ensure storms time dtype matches alerts; sort both by time
+    storms_local = storms.copy()
+    storms_local["storm_time"] = pd.to_datetime(storms_local["storm_time"], errors="coerce").dt.tz_localize(None).astype("datetime64[ns]")
+
     A["_order_idx"] = np.arange(len(A), dtype="int64")
     A = A.sort_values(time_col).reset_index(drop=True)
+    storms_local = storms_local.sort_values("storm_time").reset_index(drop=True)
 
     # Merge nearest in time (within ±max_time_h)
     tol = pd.Timedelta(hours=float(max_time_h))
     matched = pd.merge_asof(
         A,
-        storms,
+        storms_local,
         left_on=time_col,
         right_on="storm_time",
         direction="nearest",
@@ -403,6 +448,18 @@ def main():
         default=200_000,
         help="Alerts chunk size for streaming (default: 200k).",
     )
+    ap.add_argument(
+        "--chunksize",
+        type=int,
+        default=None,
+        help="Alias for --chunk-rows (compatibility with orchestrator hints).",
+    )
+    ap.add_argument(
+        "--parquet-rows",
+        type=int,
+        default=None,
+        help="Alias for --chunk-rows when using parquet (compatibility only).",
+    )
 
     # Column name knobs for alerts
     ap.add_argument(
@@ -447,6 +504,10 @@ def main():
     )
 
     args = ap.parse_args()
+    if args.chunksize and not args.chunk_rows:
+        args.chunk_rows = args.chunksize
+    if args.parquet_rows and not args.chunk_rows:
+        args.chunk_rows = args.parquet_rows
 
     alerts_path = Path(args.alerts)
     tracks_path = Path(args.tracks)
@@ -471,7 +532,7 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     _print(
-        f"[ibtracs] matching alerts from {alerts_path} → {out_path}"
+        f"[ibtracs] matching alerts from {alerts_path} -> {out_path}"
     )
     _print(
         f"[ibtracs] max_time_h={args.max_time_h} max_lead_h={args.max_lead_h} max_dist_km={args.max_dist_km}"

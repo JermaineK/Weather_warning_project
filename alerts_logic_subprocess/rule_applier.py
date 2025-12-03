@@ -72,16 +72,16 @@ def build_leadband_labels(
         and t_to_storm_min_h > lead_h - band_width_h
 
     So with band_width_h = 24:
-      lead_h = 24  → (0, 24] h
-      lead_h = 48  → (24, 48] h
-      lead_h = 120 → (96, 120] h
+      lead_h = 24  -> (0, 24] h
+      lead_h = 48  -> (24, 48] h
+      lead_h = 120 -> (96, 120] h
     """
     if t_col not in df.columns:
         raise ValueError(f"t_to_storm column '{t_col}' not found in labelled data.")
 
     t = pd.to_numeric(df[t_col], errors="coerce").to_numpy(dtype=float)
 
-    # base sanity: NaNs and non-positive → no storm in future or outside horizon
+    # base sanity: NaNs and non-positive -> no storm in future or outside horizon
     mask = np.isfinite(t) & (t > 0.0)
 
     lo = float(lead_h - band_width_h)
@@ -327,7 +327,7 @@ def main():
 
     outdf = pd.DataFrame(rows).sort_values(["lead_h", "F1"], ascending=[True, False])
     outdf.to_csv(out_path, index=False)
-    print(f"\nSaved rule evaluation → {out_path}  rows={len(outdf)}", flush=True)
+    print(f"\nSaved rule evaluation -> {out_path}  rows={len(outdf)}", flush=True)
 
     # Pretty print top-5 per lead
     for h in leads:

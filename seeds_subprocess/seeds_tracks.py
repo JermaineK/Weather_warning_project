@@ -10,10 +10,10 @@ neat and lets each tool evolve independently.
 
 Current subcommands
 -------------------
-  analyze          → analyze_seeds.py      (seed diagnostics / summaries)
-  from-alerts      → from_alerts.py        (build hourly proto-seeds from alerts)
-  proto-outcomes   → proto_outcomes.py     (link proto-tracks and label outcomes vs IBTrACS)
-  starts-vs-tracks → starts_vs_tracks.py   (seed starts → patches → best-track lead-time diagnostics)
+  analyze          -> analyze_seeds.py      (seed diagnostics / summaries)
+  from-alerts      -> from_alerts.py        (build hourly proto-seeds from alerts)
+  proto-outcomes   -> proto_outcomes.py     (link proto-tracks and label outcomes vs IBTrACS)
+  starts-vs-tracks -> starts_vs_tracks.py   (seed starts -> patches -> best-track lead-time diagnostics)
 
 Examples
 --------
@@ -47,7 +47,7 @@ import subprocess
 from pathlib import Path
 from typing import List
 
-# ---------- subcommand → candidate script filenames ----------
+# ---------- subcommand -> candidate script filenames ----------
 CANDIDATES = {
     "analyze": [
         "analyze_seeds.py",
@@ -97,7 +97,7 @@ def find_script(subcommand: str, scripts_dir: Path) -> Path:
 
     Resolution order:
       1) CANDIDATES[subcommand] list, in order.
-      2) Generic names: <subcommand>.py and seeds_<subcommand>.py (with '-'→'_').
+      2) Generic names: <subcommand>.py and seeds_<subcommand>.py (with '-'->'_').
       3) Case-insensitive match over *.py in scripts_dir for all candidates above.
     """
     # 1) explicit mapping

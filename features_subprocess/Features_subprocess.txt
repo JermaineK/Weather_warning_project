@@ -1,6 +1,6 @@
 ---
-Features Pipeline — Mini README
-(build → patch → join → GKA → thermo → spherical → bulk-shear → join-features)
+Features Pipeline - Mini README
+(build -> bulk-shear -> join-features -> patch -> GKA -> thermo -> spherical)
 This directory contains the feature-generation pipeline for the storm-analysis dataset.
 Each script does one job only, and features_manager.py acts as the unified front door.
 The philosophy is: small tools, predictable flags, safe merges, no silent type surprises.
@@ -19,12 +19,7 @@ Build the base lat/lon/time grid & raw diagnostics
 
 patch
 features_patch.py
-Patch broken or missing columns in a features table
-
-
-join
-join_labels_grid.py
-Attach storm labels / pregen flags
+Patch / enrich: rolling means/stds, shear proxies, S3, tendencies (dS_dt, msl_d*), msl_grad.
 
 
 gka
@@ -63,44 +58,39 @@ A canonical feature build looks like:
 # 1. Base grid
 python features_manager.py build --out grid_base.parquet
 
-# 2. Patch / quick fixes
-python features_manager.py patch --in grid_base.parquet --out grid_base_patched.parquet
-
-# 3. Attach storm labels
-python features_manager.py join --features grid_base_patched.parquet \
-                                --labels labels.csv \
-                                --out grid_labelled.parquet
-
-# 4. GKA + geometric-kernel responses
-python features_manager.py gka --infile grid_labelled.parquet \
-                               --outfile grid_gka.parquet \
-                               --allow-S-from-S3
-
-# 5. Integrate ERA5 thermo
-python features_manager.py integrate-thermo \
-    --features grid_gka.parquet \
-    --thermo-glob "era5_single/*.nc" \
-    --out grid_gka_thermo.parquet
-
-# 6. Spherical-feedback features
-python features_manager.py spherical \
-    --infile grid_gka_thermo.parquet \
-    --out grid_sphfb.parquet
-
-# 7. Bulk shear (pressure-level)
+# 2. Bulk shear (pressure-level)
 python features_manager.py bulk-shear \
     --pl-glob "era5_pl_uv/*.nc" \
     --out bulk_shear.parquet \
     --low-pair 1000,925 \
     --deep-pair 1000,500 \
-    --s3-window 3
+    --s3-window 1
 
-# 8. Merge shear+S3 into the main table
+# 3. Join shear onto base grid
 python features_manager.py join-features \
-    --left grid_sphfb.parquet \
+    --left grid_base.parquet \
     --right bulk_shear.parquet \
     --on "time, lat, lon" \
-    --out grid_final.parquet
+    --out grid_base_with_shear.parquet
+
+# 4. Patch / rolling stats / shear proxies (now sees shear_low/deep)
+python features_manager.py patch --in grid_base_with_shear.parquet --out grid_base_patched.parquet
+
+# 5. GKA + geometric-kernel responses
+python features_manager.py gka --infile grid_base_patched.parquet \
+                               --outfile grid_gka.parquet \
+                               --allow-S-from-S3
+
+# 6. Integrate ERA5 thermo
+python features_manager.py integrate-thermo \
+    --features grid_gka.parquet \
+    --thermo-glob "era5_single/*.nc" \
+    --out grid_gka_thermo.parquet
+
+# 7. Spherical-feedback features
+python features_manager.py spherical \
+    --infile grid_gka_thermo.parquet \
+    --out grid_sphfb.parquet
 
 Everything remains column-aligned and lon-normalized across steps.
 

@@ -15,7 +15,7 @@ Options:
   --area                'latN,lonW,latS,lonE' crop (after lon normalization)
   --normalize-lon       none | -180..180 | 0..360  (default: -180..180)
   --wind-source         auto | USA | WMO           (choose which wind to prefer)
-  --time-offset-hours   Shift all times (e.g., -10 for local→UTC corrections)
+  --time-offset-hours   Shift all times (e.g., -10 for local->UTC corrections)
   --min-wind            Keep rows with vmax >= this (kt)
   --quiet               Reduce console output
 """
@@ -121,8 +121,8 @@ def _read_ibtracs_netcdf(path: str):
 def _combine_numeric_candidates(df: pd.DataFrame, candidates: List[str], mode: str) -> pd.Series:
     """
     Combine multiple numeric columns:
-      mode="max" → rowwise max across candidates
-      mode="min" → rowwise min across candidates
+      mode="max" -> rowwise max across candidates
+      mode="min" -> rowwise min across candidates
     Returns NaNs if no candidates present.
     """
     present = []
@@ -177,7 +177,7 @@ def main():
     if time_col is None or lat_col is None or lon_col is None:
         raise ValueError("Could not detect time/lat/lon in IBTrACS file.")
 
-    # Time → tz-naive UTC (+ optional offset)
+    # Time -> tz-naive UTC (+ optional offset)
     t = _to_naive_utc(df[time_col])
     if args.time_offset_hours:
         t = t + pd.to_timedelta(args.time_offset_hours, unit="h")
@@ -200,11 +200,11 @@ def main():
     pres_candidates = pres_cols or ["usa_pres", "wmo_pres", "min_slp", "central_pressure", "pmin", "pres"]
     pmin = _combine_numeric_candidates(df, pres_candidates, mode="min")
 
-    # Handle units (rough heuristic): if values look small, assume m/s → convert to kt
+    # Handle units (rough heuristic): if values look small, assume m/s -> convert to kt
     if vmax.notna().sum() > 10:
         p95 = np.nanpercentile(vmax.to_numpy(dtype=float), 95)
         if p95 < 60:  # likely m/s
-            vmax = vmax * 1.94384  # m/s → kt
+            vmax = vmax * 1.94384  # m/s -> kt
 
     # Name as a vector (not a scalar) if missing
     if name_col and name_col in df.columns:
@@ -248,7 +248,7 @@ def main():
             out = out.loc[(out["lon"] >= w) | (out["lon"] <= e)]
 
     if not args.quiet:
-        print(f"[besttrack] pre-drop rows: {n0:,}  → kept: {len(out):,}")
+        print(f"[besttrack] pre-drop rows: {n0:,}  -> kept: {len(out):,}")
 
     # Write (auto-compress if .gz)
     compression = "gzip" if str(args.out).lower().endswith(".gz") else "infer"
@@ -257,7 +257,7 @@ def main():
     if not args.quiet and len(out):
         tmin = out["obs_time"].min()
         tmax = out["obs_time"].max()
-        print(f"[besttrack] wrote {args.out} | rows={len(out):,} | time: {tmin} → {tmax}")
+        print(f"[besttrack] wrote {args.out} | rows={len(out):,} | time: {tmin} -> {tmax}")
 
 
 if __name__ == "__main__":

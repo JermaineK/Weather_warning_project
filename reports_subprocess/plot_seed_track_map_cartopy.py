@@ -89,7 +89,7 @@ def main():
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(args.out, dpi=args.dpi)
         plt.close()
-        print(f"[map] saved (simple) → {args.out}")
+        print(f"[map] saved (simple) -> {args.out}")
         return
 
     # cartopy path
@@ -133,7 +133,7 @@ def main():
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(args.out, dpi=args.dpi, bbox_inches="tight")
     plt.close()
-    print(f"[map] saved → {args.out}")
+    print(f"[map] saved -> {args.out}")
 
 
 if __name__ == "__main__":

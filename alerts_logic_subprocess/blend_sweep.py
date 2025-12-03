@@ -11,7 +11,7 @@ from sklearn.metrics import (
 
 def impute_then_scale(df: pd.DataFrame, feats, scaler):
     X = df[feats].copy()
-    # coerce to float, kill infs → NaN, then median-impute
+    # coerce to float, kill infs -> NaN, then median-impute
     for c in feats:
         X[c] = pd.to_numeric(X[c], errors="coerce")
     X = X.replace([np.inf, -np.inf], np.nan)
@@ -180,7 +180,7 @@ def main():
         k = max(1, int(len(hours) * args.subsample_hours))
         keep_hours = set(hours.sample(n=k, random_state=42))
         df = df[df["time"].dt.floor("H").isin(keep_hours)].copy()
-    print(f"Rows → {len(df):,}")
+    print(f"Rows -> {len(df):,}")
 
     # Load models
     mb = joblib.load(args.build)

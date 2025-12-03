@@ -121,7 +121,7 @@ def unwrap_models(bundle):
     if hasattr(bundle, "steps"):  # sklearn Pipeline
         try:
             last = bundle.steps[-1][1]
-            print("[unwrap] pipeline → last step")
+            print("[unwrap] pipeline -> last step")
             return unwrap_models(last)
         except Exception:
             pass

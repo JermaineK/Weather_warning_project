@@ -168,7 +168,7 @@ def main():
 
     if not args.quiet:
         tmin, tmax = out["issue_hour"].min(), out["issue_hour"].max()
-        print(f"[per-hour] wrote {out_path} rows={len(out)} time={tmin}→{tmax}")
+        print(f"[per-hour] wrote {out_path} rows={len(out)} time={tmin}->{tmax}")
 
 if __name__ == "__main__":
     main()

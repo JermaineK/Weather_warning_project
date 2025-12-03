@@ -75,7 +75,7 @@ from typing import Dict
 
 HERE = Path(__file__).resolve().parent
 
-# Canonical subcommand → script filename.
+# Canonical subcommand -> script filename.
 # Dash/underscore aliases are handled in find_script, so this map can stay small.
 SCRIPT_MAP: Dict[str, str] = {
     # core rule appliers / discovery
@@ -150,7 +150,7 @@ def find_script(cmd: str) -> Path:
 
 def build_forward_args(_ns: argparse.Namespace) -> list[str]:
     """
-    Manager-owned flags → forwarded argv.
+    Manager-owned flags -> forwarded argv.
 
     Intentionally minimal: we currently don't own any flags that need to be
     forwarded, but this helper is kept for future toggles if needed.

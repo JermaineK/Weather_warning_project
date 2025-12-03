@@ -202,7 +202,7 @@ def main():
         out = out.loc[out[flag_col] == 1].reset_index(drop=True)
 
     write_any(args.out, out)
-    print(f"[denoise] wrote {len(out):,} rows → {args.out}")
+    print(f"[denoise] wrote {len(out):,} rows -> {args.out}")
 
 if __name__ == "__main__":
     main()

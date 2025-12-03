@@ -14,13 +14,13 @@ Highlights:
 
 Usage examples
 --------------
-# Parquet → Parquet
+# Parquet -> Parquet
 python compute_gka_features.py \
   --infile data/grid_labelled_base.parquet \
   --outfile data/grid_labelled_FMA_gka.parquet \
   --allow-S-from-S3 --verbose --overwrite
 
-# CSV → CSV.GZ (streamed)
+# CSV -> CSV.GZ (streamed)
 python compute_gka_features.py \
   --infile data/grid_labelled_base.csv.gz \
   --outfile data/grid_labelled_FMA_gka.csv.gz \
@@ -36,6 +36,13 @@ import numpy as np
 import pandas as pd
 
 pd.options.mode.copy_on_write = True
+
+try:
+    import pyarrow as pa  # type: ignore
+    import pyarrow.parquet as pq  # type: ignore
+except Exception:
+    pa = None
+    pq = None
 
 # ---------------- configuration ----------------
 
@@ -243,11 +250,21 @@ def _compute_chunk_features(df: pd.DataFrame,
     else:
         out["gka_msl_nd"] = 0.0
 
-    # 6) knee ratio (S / S3)
+    # 6) knee ratio: prefer S/S3 if both exist; otherwise S vs median-S (per time if available)
+    S_arr = _safe_num(S).to_numpy(float) if S is not None else None
     if (S is not None) and (S3 is not None):
         S3v = _safe_num(S3).to_numpy(float)
         denom = np.where(np.abs(S3v) < 1e-9, 1e-9, S3v)
-        out["gka_knee_ratio"] = _safe_num(S).to_numpy(float) / denom
+        out["gka_knee_ratio"] = S_arr / denom
+    elif S_arr is not None and len(S_arr) > 0:
+        if "time" in out.columns:
+            t_codes = pd.factorize(out["time"])[0]
+            med_by_t = pd.Series(S_arr).groupby(t_codes).transform("median").to_numpy()
+            denom = np.where(np.abs(med_by_t) < 1e-6, 1e-6, med_by_t)
+        else:
+            med = np.nanmedian(S_arr)
+            denom = np.where(np.abs(med) < 1e-6, 1e-6, med)
+        out["gka_knee_ratio"] = S_arr / denom
     else:
         out["gka_knee_ratio"] = 0.0
 
@@ -297,8 +314,17 @@ def _comp_for_csv(path: str | Path) -> str:
 
 def _peek_columns(path: str | Path, verbose: bool=False) -> List[str]:
     if _is_parquet(path):
-        df = pd.read_parquet(path, engine="pyarrow")
-        cols = list(df.columns)
+        cols: List[str] = []
+        if pq is not None:
+            try:
+                pf = pq.ParquetFile(path)
+                cols = pf.schema.names
+            except Exception:
+                cols = []
+        if not cols:
+            # Fallback: read minimal rows (still lighter than full table)
+            df_head = pd.read_parquet(path, engine="pyarrow", columns=None)
+            cols = list(df_head.columns)
     else:
         head = pd.read_csv(path, nrows=5, low_memory=False)
         cols = list(head.columns)
@@ -306,13 +332,24 @@ def _peek_columns(path: str | Path, verbose: bool=False) -> List[str]:
         print(f"[GKA] peek columns ({len(cols)}): {cols[:40]}{' ...' if len(cols)>40 else ''}")
     return cols
 
-def _stream_input(path: str | Path, chunksize: int) -> Iterable[pd.DataFrame]:
-    """Yield DataFrames; parquet yields a single full frame."""
+def _stream_input(path: str | Path, chunksize: int, parquet_rows: int, verbose: bool=False) -> Iterable[pd.DataFrame]:
+    """
+    Yield DataFrames. Parquet can be streamed in batches when parquet_rows>0 (pyarrow required).
+    CSV uses pandas chunking.
+    """
     if _is_parquet(path):
-        yield pd.read_parquet(path, engine="pyarrow")
+        if parquet_rows and parquet_rows > 0 and pq is not None:
+            pf = pq.ParquetFile(path)
+            if verbose:
+                print(f"[GKA] streaming parquet in batches of ~{parquet_rows} rows", flush=True)
+            for batch in pf.iter_batches(batch_size=parquet_rows):
+                yield batch.to_pandas()
+        else:
+            yield pd.read_parquet(path, engine="pyarrow")
     else:
         parse_dates = ["time"]  # best effort; if absent, pandas will ignore
-        for chunk in pd.read_csv(path, chunksize=chunksize, low_memory=False, parse_dates=parse_dates):
+        read_size = chunksize if chunksize and chunksize > 0 else None
+        for chunk in pd.read_csv(path, chunksize=read_size, low_memory=False, parse_dates=parse_dates):
             yield chunk
 
 def _write_stream_csv(path: str | Path, df: pd.DataFrame, first: bool) -> None:
@@ -347,7 +384,10 @@ def parse_args():
                     help="Print head of input (N rows) after reading.")
     ap.add_argument("--allow-S-from-S3", action="store_true",
                     help="If S is missing, bind S := S3.")
-    # η controls
+    # Orchestrator-injected compatibility flags (used for chunk sizing) 
+    ap.add_argument("--chunk-rows", type=int, default=0, help="Preferred chunk size for streaming input")
+    ap.add_argument("--parquet-rows", type=int, default=0, help="Preferred batch size when streaming parquet input")
+    # ? controls
     ap.add_argument("--disable-eta", action="store_true",
                     help="Skip gka_parity_eta computation entirely.")
     ap.add_argument("--eta-window", type=int, default=7,
@@ -378,78 +418,71 @@ def main():
         if missing:
             raise SystemExit(f"[GKA] --require-core set but missing columns after alias binding: {missing}")
 
-    # CSV streaming path
-    if not in_is_parq and not out_is_parq:
-        if Path(args.outfile).exists() and not args.overwrite:
-            raise SystemExit(f"[GKA] Outfile exists; use --overwrite: {args.outfile}")
+    # streaming loop (works for CSV or Parquet); parquet uses pyarrow batches when parquet_rows>0
+    chunk_rows = args.chunk_rows or args.chunksize
+    parquet_rows = args.parquet_rows or args.chunk_rows
 
-        first = True
-        total_rows = 0
-        bad_chunks = 0
-        for i, chunk in enumerate(_stream_input(args.infile, args.chunksize), 1):
-            try:
-                if args.sample and i == 1:
-                    print(f"[GKA] sample head ({min(args.sample, len(chunk))} rows):")
-                    print(chunk.head(args.sample))
-                # rebind in case CSV chunks differ in header (rare but safe)
-                b = _bind_columns(list(chunk.columns), allow_S_from_S3=args.allow_S_from_S3)
-                if args.require_core:
-                    miss = [c for c in CORE_FOR_REQUIRE if not b.get(c)]
-                    if miss:
-                        raise SystemExit(f"[GKA] --require-core set but missing columns in this chunk: {miss}")
+    if out_is_parq and Path(args.outfile).exists() and not args.overwrite:
+        raise SystemExit(f"[GKA] Outfile exists; use --overwrite: {args.outfile}")
 
-                if not {"lat","lon"}.issubset(set(chunk.columns)):
-                    raise ValueError(f"Chunk {i} missing lat/lon; columns={list(chunk.columns)[:20]}")
+    first = True
+    total_rows = 0
+    bad_chunks = 0
+    writer = None
 
-                out = _compute_chunk_features(
-                    chunk, b, verbose=args.verbose,
-                    disable_eta=args.disable_eta,
-                    eta_window=args.eta_window,
-                    eta_max_rows=args.eta_max_rows,
-                )
+    for i, chunk in enumerate(_stream_input(args.infile, chunk_rows, parquet_rows, verbose=args.verbose), 1):
+        try:
+            if args.sample and i == 1:
+                print(f"[GKA] sample head ({min(args.sample, len(chunk))} rows):")
+                print(chunk.head(args.sample))
+            # rebind per chunk to stay robust to header variations
+            b = _bind_columns(list(chunk.columns), allow_S_from_S3=args.allow_S_from_S3)
+            if args.require_core:
+                miss = [c for c in CORE_FOR_REQUIRE if not b.get(c)]
+                if miss:
+                    raise SystemExit(f"[GKA] --require-core set but missing columns in this chunk: {miss}")
+
+            if not {"lat","lon"}.issubset(set(chunk.columns)):
+                raise ValueError(f"Chunk {i} missing lat/lon; columns={list(chunk.columns)[:20]}")
+
+            out = _compute_chunk_features(
+                chunk, b, verbose=args.verbose,
+                disable_eta=args.disable_eta,
+                eta_window=args.eta_window,
+                eta_max_rows=args.eta_max_rows,
+            )
+
+            if out_is_parq:
+                if pq is None or pa is None:
+                    raise SystemExit("pyarrow is required for parquet output when streaming.")
+                table = pa.Table.from_pandas(out)
+                if writer is None:
+                    writer = pq.ParquetWriter(args.outfile, table.schema)
+                writer.write_table(table)
+            else:
                 _write_stream_csv(args.outfile, out, first=first)
-                first = False
-                total_rows += len(out)
-                if args.verbose:
-                    print(f"[GKA] chunk {i} ok → rows {len(out):,}  total {total_rows:,}")
-            except Exception as ex:
-                bad_chunks += 1
-                print(
-                    "\n[GKA] ERROR in CSV chunk {}: {}: {}\n{}".format(
-                        i, type(ex).__name__, repr(ex), traceback.format_exc()
-                    ),
-                    file=sys.stderr,
-                )
-                if args.fail_fast:
-                    raise
 
-        if first:
-            raise SystemExit("[GKA] No chunks were successfully processed; outfile not created.")
-        print(f"\n[GKA] Wrote {args.outfile}  rows: {total_rows:,}  bad_chunks: {bad_chunks}")
-        return
+            first = False
+            total_rows += len(out)
+            if args.verbose:
+                print(f"[GKA] chunk {i} ok -> rows {len(out):,}  total {total_rows:,}")
+        except Exception as ex:
+            bad_chunks += 1
+            print(
+                "\n[GKA] ERROR in chunk {}: {}: {}\n{}".format(
+                    i, type(ex).__name__, repr(ex), traceback.format_exc()
+                ),
+                file=sys.stderr,
+            )
+            if args.fail_fast:
+                raise
 
-    # Parquet input path (reads once); output can be Parquet or CSV
-    df = next(iter(_stream_input(args.infile, args.chunksize)))
-    if args.sample:
-        print(f"[GKA] sample head ({min(args.sample, len(df))} rows):")
-        print(df.head(args.sample))
+    if writer is not None:
+        writer.close()
 
-    if not {"lat","lon"}.issubset(set(df.columns)):
-        raise SystemExit(f"[GKA] Input missing required coord columns lat/lon; have {list(df.columns)[:20]}")
-
-    out = _compute_chunk_features(
-        df, bind, verbose=args.verbose,
-        disable_eta=args.disable_eta,
-        eta_window=args.eta_window,
-        eta_max_rows=args.eta_max_rows,
-    )
-
-    if out_is_parq:
-        _write_parquet(args.outfile, out, overwrite=args.overwrite)
-        print(f"[GKA] Wrote {args.outfile}  rows={len(out):,} cols={out.shape[1]}")
-    else:
-        _write_stream_csv(args.outfile, out, first=True)
-        print(f"[GKA] Wrote {args.outfile}  rows={len(out):,} cols={out.shape[1]}")
+    if first:
+        raise SystemExit("[GKA] No chunks were successfully processed; outfile not created.")
+    print(f"\n[GKA] Wrote {args.outfile}  rows: {total_rows:,}  bad_chunks: {bad_chunks}")
 
 if __name__ == "__main__":
     try:

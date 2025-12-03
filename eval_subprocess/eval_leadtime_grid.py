@@ -93,7 +93,7 @@ def load_model(path):
 def prep_df(labelled_path, use, target):
     df = load_any(labelled_path)
 
-    # time → UTC tz-naive for consistent time-based rolling
+    # time -> UTC tz-naive for consistent time-based rolling
     if "time" not in df.columns:
         raise ValueError("Missing 'time' column in labelled file.")
     df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
@@ -197,7 +197,7 @@ def main():
         m = safe_metrics(y, p)
         pos = int(y.sum())
         print(
-            f"Lead +{h:>3}h  →  "
+            f"Lead +{h:>3}h  ->  "
             f"AUC={m['AUC']:.3f}  "
             f"PRAUC={m['PRAUC']:.3f}  "
             f"Brier={m['Brier']:.3f}  "

@@ -11,8 +11,9 @@ Each run folder contains:
 high-level summary text
 seed/track maps (cartopy & quick-QA)
 seed–IBTrACS overlays
-seed–track match visualisations
+seed-track match visualisations
 sanity check log
+optional slow-tick diagnostics (knee/parity/spectrum)
 any extra CSV/plots you decide to add later
 
 The subsystem is fire-and-forget: one command generates the full bundle.
@@ -51,6 +52,10 @@ Manager flags (common):
 --ibtracs-normalize-lon <mode>   # none | -180..180 | 0..360
 --strict                         # Stop immediately on any failed step.
 --skip-*                         # Skip specific map/report steps.
+--run-slowtick                   # Optional: run slowtick diagnostics on alerts.
+  --slowtick-alerts-dir          # Alerts directory (throttled/denoised/base).
+  --slowtick-leads               # Comma list of leads (e.g., 24,48,72,120,240).
+  --slowtick-out-subdir          # Subfolder under run folder for outputs (default: slowtick).
 
 
 2. Script: report_generate_summary.py

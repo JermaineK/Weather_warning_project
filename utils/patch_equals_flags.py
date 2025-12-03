@@ -6,8 +6,8 @@
 #
 # What it does:
 #  1) Rewrites helper functions like _add_norm_lon/_add_area to always emit equals-form.
-#  2) Rewrites any direct list-appends like ["--normalize-lon", val] → ["--normalize-lon=" + str(val)]
-#     and ["--area", aoi] → ["--area=" + str(aoi)].
+#  2) Rewrites any direct list-appends like ["--normalize-lon", val] -> ["--normalize-lon=" + str(val)]
+#     and ["--area", aoi] -> ["--area=" + str(aoi)].
 #
 # Safe: creates a .bak timestamped backup next to each modified file.
 
@@ -26,7 +26,7 @@ PAIR_FLAG_PATTERNS = [
 
 # Normalize helper definitions to equals-style appends
 HELPER_FIXES = [
-    # def _add_norm_lon... → always equals-style
+    # def _add_norm_lon... -> always equals-style
     (re.compile(r'def\s+_add_norm_lon[_a-zA-Z0-9]*\s*\([^\)]*\):([\s\S]*?)(?=^def|\Z)', re.MULTILINE),
      lambda body: re.sub(
          r'cmd[_a-zA-Z0-9]*\s*\+\=\s*\[\s*"--normalize-lon"\s*,\s*([^\]]+?)\s*\]',
@@ -37,7 +37,7 @@ HELPER_FIXES = [
              body
          )
      )),
-    # def _add_area... → always equals-style
+    # def _add_area... -> always equals-style
     (re.compile(r'def\s+_add_area[_a-zA-Z0-9]*\s*\([^\)]*\):([\s\S]*?)(?=^def|\Z)', re.MULTILINE),
      lambda body: re.sub(
          r'cmd[_a-zA-Z0-9]*\s*\+\=\s*\[\s*"--area"\s*,\s*([^\]]+?)\s*\]',

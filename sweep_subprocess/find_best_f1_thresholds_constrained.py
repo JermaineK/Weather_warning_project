@@ -361,7 +361,7 @@ def _fmt(res: dict, tag_label: str, score_key: str) -> None:
     stat = res.get("status", "unknown")
     extra = f"  Alerts≈{Alrt:,}" if isinstance(Alrt, (int, np.integer)) else ""
     print(
-        f"Lead +{res.get('lead_h','?')}h → [{stat}]  Best {tag_label} = {scr:.3f} @ thr={thr:.3f} "
+        f"Lead +{res.get('lead_h','?')}h -> [{stat}]  Best {tag_label} = {scr:.3f} @ thr={thr:.3f} "
         f"(P={P:.3f}, R={R:.3f})  Cov={Cov:.3f}{extra}"
     )
 
@@ -412,7 +412,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-precision", type=float, default=0.12)
     ap.add_argument("--max-coverage", type=float, default=0.25)
     ap.add_argument("--fbeta", type=float, default=0.5)
-    ap.add_argument("--out", required=True, help="CSV to save lead→thresholds")
+    ap.add_argument("--out", required=True, help="CSV to save lead->thresholds")
     ap.add_argument(
         "--save-table",
         default=None,
@@ -455,7 +455,7 @@ def main():
     print(f"Target   : {args.target}  | Success={args.success_col} (lead-aware)")
     print(f"Leads    : {args.leads}")
     print(
-        f"Constraints → min_precision={args.min_precision}  "
+        f"Constraints -> min_precision={args.min_precision}  "
         f"max_coverage={args.max_coverage}  β={args.fbeta}"
     )
     print(f"Out      : {args.out}")
@@ -496,7 +496,7 @@ def main():
         tmin = base["time"].min()
         tmax = base["time"].max()
         print(
-            f"[domain] time: {tmin} → {tmax}  | rows: {len(base):,}"
+            f"[domain] time: {tmin} -> {tmax}  | rows: {len(base):,}"
         )
         print(
             f"[domain] lon:  {base['lon'].min():.3f} .. {base['lon'].max():.3f}  "
@@ -660,14 +660,14 @@ def main():
 
     out_df = pd.DataFrame(results_rows).sort_values("lead_h")
     out_df.to_csv(args.out, index=False)
-    print(f"\nSaved thresholds → {args.out}\n")
+    print(f"\nSaved thresholds -> {args.out}\n")
     print("== Summary (constrained) ==")
     with pd.option_context("display.max_columns", None):
         print(out_df.to_string(index=False))
 
     if args.save_table and last_table is not None:
         last_table.to_csv(args.save_table, index=False)
-        print(f"\nSaved threshold curve (last lead) → {args.save_table}")
+        print(f"\nSaved threshold curve (last lead) -> {args.save_table}")
 
 
 if __name__ == "__main__":

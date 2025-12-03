@@ -201,7 +201,7 @@ def build_feature_matrix(
         else:
             Xdf[c] = np.nan
 
-    X = Xdf.to_numpy(dtype=float, copy=True)
+    X = Xdf.to_numpy(dtype=np.float32, copy=True)
     X[~np.isfinite(X)] = np.nan
 
     # Impute
@@ -216,8 +216,8 @@ def build_feature_matrix(
 
     # Clip
     if clip_stats and "lo" in clip_stats and "hi" in clip_stats:
-        lo = np.asarray(clip_stats["lo"])
-        hi = np.asarray(clip_stats["hi"])
+        lo = np.asarray(clip_stats["lo"], dtype=np.float32)
+        hi = np.asarray(clip_stats["hi"], dtype=np.float32)
         if lo.shape == X.shape[1:] and hi.shape == X.shape[1:]:
             X = np.clip(X, lo, hi)
 
@@ -229,7 +229,7 @@ def build_feature_matrix(
             # If transform fails, fall back to unscaled
             pass
 
-    return X
+    return X.astype(np.float32, copy=False)
 
 
 def score_with_estimator(est: Any, X: np.ndarray) -> np.ndarray:
@@ -252,7 +252,7 @@ def score_with_estimator(est: Any, X: np.ndarray) -> np.ndarray:
 
 
 def parse_float_list(val: str) -> List[float]:
-    # "a:b:c" → a, a+c, ..., ≤b; or "x,y,z"
+    # "a:b:c" -> a, a+c, ..., ≤b; or "x,y,z"
     s = str(val).strip()
     if ":" in s:
         a, b, c = s.split(":")
@@ -442,6 +442,18 @@ def main() -> None:
         default="results/sweep_summary.csv",
         help="Output CSV/Parquet with sweep metrics.",
     )
+    ap.add_argument(
+        "--sample-frac",
+        type=float,
+        default=0.0,
+        help="Optional fraction (0<q<=1) to randomly sample rows for sweep to reduce memory.",
+    )
+    ap.add_argument(
+        "--max-rows",
+        type=int,
+        default=0,
+        help="Optional cap on number of rows to keep for the sweep (sampled).",
+    )
 
     args = ap.parse_args()
 
@@ -476,6 +488,16 @@ def main() -> None:
 
     # Load labelled data with *only* required columns to reduce memory
     df = read_any(labelled_path, parse_dates=["time"], usecols=list(need_cols))
+
+    if args.sample_frac and 0 < args.sample_frac < 1:
+        df = df.sample(frac=args.sample_frac, random_state=args.seed).reset_index(drop=True)
+        print(f"[sweep] sample-frac={args.sample_frac} -> rows={len(df):,}")
+    if args.max_rows and args.max_rows > 0 and len(df) > args.max_rows:
+        df = df.sample(n=int(args.max_rows), random_state=args.seed).reset_index(drop=True)
+        print(f"[sweep] max-rows={args.max_rows} -> rows={len(df):,}")
+    # downcast floats to reduce memory
+    float_cols = df.select_dtypes(include=["float64", "float32"]).columns
+    df[float_cols] = df[float_cols].astype("float32")
 
     missing = [c for c in need_cols if c not in df.columns]
     if missing:

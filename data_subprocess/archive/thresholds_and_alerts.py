@@ -257,6 +257,18 @@ def main():
         help="Chunk size for streaming read (default: 500000).",
     )
     ap.add_argument(
+        "--chunksize",
+        type=int,
+        default=None,
+        help="Alias for --chunk-rows (compatibility with orchestrator hints).",
+    )
+    ap.add_argument(
+        "--parquet-rows",
+        type=int,
+        default=None,
+        help="Alias for --chunk-rows when using parquet (compatibility only).",
+    )
+    ap.add_argument(
         "--keep-features",
         action="store_true",
         help="If set, also keep original feature columns in the output (debugging).",
@@ -273,6 +285,10 @@ def main():
     )
 
     args = ap.parse_args()
+    if args.chunksize and not args.chunk_rows:
+        args.chunk_rows = args.chunksize
+    if args.parquet_rows and not args.chunk_rows:
+        args.chunk_rows = args.parquet_rows
 
     src = Path(args.scoring_src)
     if not src.exists():
@@ -301,7 +317,7 @@ def main():
     _print(f"[init] id_col={args.id_col}")
     _print(f"[init] feature columns ({len(feat_cols)}): {feat_cols}")
     _print(f"[init] default weight={args.default_weight}, score_thr={args.score_thr}")
-    _print(f"[init] output → {out_path}")
+    _print(f"[init] output -> {out_path}")
 
     need_norm = bool(args.add_scaled_score or args.add_zscore)
 
@@ -407,7 +423,7 @@ def main():
                 if math.isfinite(score_min) and math.isfinite(score_max) and score_max > score_min:
                     scaled = (s - score_min) / (score_max - score_min)
                 else:
-                    # Degenerate case: constant scores → all 0.5
+                    # Degenerate case: constant scores -> all 0.5
                     scaled = np.full_like(s, 0.5, dtype="float64")
                 scored["scaled_score"] = scaled
             if args.add_zscore:
@@ -466,7 +482,7 @@ def main():
                 f"alerts={total_alerts:,})"
             )
 
-    _print(f"[done] scoring complete → {out_path}")
+    _print(f"[done] scoring complete -> {out_path}")
     rate = (total_alerts / total_rows) if total_rows else float("nan")
     _print(
         f"        rows={total_rows:,}, alerts={total_alerts:,}, "

@@ -91,7 +91,7 @@ def main():
     ap.add_argument(
         "--extras",
         default="{}",
-        help='JSON dict of extra label→path entries to surface in the report.',
+        help='JSON dict of extra label->path entries to surface in the report.',
     )
     args = ap.parse_args()
 

@@ -200,7 +200,7 @@ def main():
     os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
     keep = ["obs_time","match_time","lat","lon","vmax","pmin","pgeom","n_cells","dt_hours","r_km_med"]
     out[keep].to_csv(args.out_csv, index=False)
-    print(f"Wrote per-point matches → {args.out_csv} (n={len(out)})")
+    print(f"Wrote per-point matches -> {args.out_csv} (n={len(out)})")
 
 if __name__ == "__main__":
     main()

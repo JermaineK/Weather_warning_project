@@ -86,8 +86,8 @@ def predict_probs(model, X_std, checkpoint_dir=None):
 def future_max_label_by_point(df, target_col, hours, include_current=False):
     """
     For each (lat,lon), compute future max of target over window:
-      include_current=False → (t, t+hours]   (strict future)
-      include_current=True  → [t, t+hours]   (includes current)
+      include_current=False -> (t, t+hours]   (strict future)
+      include_current=True  -> [t, t+hours]   (includes current)
     Returns 1D int array aligned to df rows.
     """
     df = df.sort_values(["lat","lon","time"], kind="mergesort")
@@ -185,7 +185,7 @@ def evaluate(y, p, tag):
         brier = np.nan
     pos = int(np.sum(y))
     n   = len(y)
-    println(f"{tag}  →  AUC={auc:.3f}  PRAUC={prauc:.3f}  Brier={brier:.3f}  Pos={pos:,}/{n:,}")
+    println(f"{tag}  ->  AUC={auc:.3f}  PRAUC={prauc:.3f}  Brier={brier:.3f}  Pos={pos:,}/{n:,}")
 
 # -----------------------------
 # Main
@@ -287,7 +287,7 @@ def main():
         union = np.logical_or (y1d > 0, y2d > 0).sum()
         jacc  = (inter/union) if union > 0 else 1.0
         println(
-            f"[Sanity] Overlap {h1}h vs {h2}h → Jaccard={jacc:.3f}  "
+            f"[Sanity] Overlap {h1}h vs {h2}h -> Jaccard={jacc:.3f}  "
             f"Pos{h1}={y1d.sum():,}  Pos{h2}={y2d.sum():,}"
         )
 

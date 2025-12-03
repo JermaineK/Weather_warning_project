@@ -394,7 +394,7 @@ def main():
         mets = safe_metrics(yh, p_use)
         labels_per_h[h] = yh
         print(
-            f"Lead +{h}h  →  "
+            f"Lead +{h}h  ->  "
             f"AUC={mets['AUC']:.3f}  "
             f"PRAUC={mets['PRAUC']:.3f}  "
             f"Brier={mets['Brier']:.3f}  "
@@ -409,7 +409,7 @@ def main():
         union = np.logical_or(y24 == 1, y48 == 1).sum()
         jacc = inter / max(1, union)
         print(
-            f"[Sanity] Overlap 24h vs 48h → Jaccard={jacc:.3f}  "
+            f"[Sanity] Overlap 24h vs 48h -> Jaccard={jacc:.3f}  "
             f"Pos24={y24.sum():,}  Pos48={y48.sum():,}",
             flush=True,
         )

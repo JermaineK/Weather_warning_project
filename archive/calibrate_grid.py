@@ -280,7 +280,7 @@ def main():
 
     Path(args.model_out).parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, args.model_out)
-    print(f"Saved calibrated model → {args.model_out}")
+    print(f"Saved calibrated model -> {args.model_out}")
 
 if __name__ == "__main__":
     main()

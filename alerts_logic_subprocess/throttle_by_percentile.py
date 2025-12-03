@@ -117,7 +117,7 @@ def main():
     if missing:
         raise ValueError(f"Input missing required columns: {sorted(missing)}")
 
-    # Parse time → hour bins
+    # Parse time -> hour bins
     t = _try_parse_time_raw(df[args.time_col], args.time_format)
     bad = int(t.isna().sum())
     if bad:
@@ -230,7 +230,7 @@ def main():
 
     if args.debug:
         tmin, tmax = out["time_h"].min(), out["time_h"].max()
-        print(f"[THROTTLE][debug] time range: {tmin} → {tmax} (hours={hours})", flush=True)
+        print(f"[THROTTLE][debug] time range: {tmin} -> {tmax} (hours={hours})", flush=True)
         print(f"[THROTTLE][debug] lat range: {out['lat'].min():.3f} .. {out['lat'].max():.3f}", flush=True)
         print(f"[THROTTLE][debug] lon range: {out['lon'].min():.3f} .. {out['lon'].max():.3f}", flush=True)
 

@@ -20,6 +20,7 @@ requests
 tqdm
 dask
 zstandard     # faster parquet/csv.gz support if available
+psutil        # runtime memory sizing for chunk selection
 
 # Optional extras used in pipeline scripts
 netCDF4       # for direct .nc access (build_features_grid.py / ERA5)

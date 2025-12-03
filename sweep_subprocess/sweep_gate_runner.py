@@ -57,8 +57,8 @@ from sklearn.metrics import (
 def parse_float_list(s: str) -> List[float]:
     """
     Parse either:
-      "a:b:c" → [a, a+c, ..., ≤ b]
-      "x,y,z" → [x, y, z]
+      "a:b:c" -> [a, a+c, ..., ≤ b]
+      "x,y,z" -> [x, y, z]
     """
     s = str(s).strip()
     if ":" in s:
@@ -222,7 +222,7 @@ def throttle_hourly(
     Keep only the top (1-q) fraction by score within each hour.
     If q=None, keep all.
 
-    Example: q = 0.90 → keep top 10% by score in each hour.
+    Example: q = 0.90 -> keep top 10% by score in each hour.
     """
     if q is None:
         return np.ones(len(score_vec), dtype=bool)
@@ -345,7 +345,7 @@ def main() -> None:
             .sort_values(["time", "lat", "lon"])
             .reset_index(drop=True)
         )
-        print(f"Subsampled hours → rows: {len(df):,}")
+        print(f"Subsampled hours -> rows: {len(df):,}")
     else:
         df = df.sort_values(["time", "lat", "lon"]).reset_index(drop=True)
 

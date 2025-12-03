@@ -44,9 +44,9 @@ pd.options.mode.copy_on_write = True
 
 REQ_BASE = ["time", "lat", "lon"]
 
-# Candidate shear columns (best → fallback)
-CAND_SHEAR_06 = ["shear_06km", "bulk_shear_0_6km", "shear06", "shear_06"]
-CAND_SHEAR_01 = ["shear_01km", "bulk_shear_0_1km", "shear01", "shear_01"]
+# Candidate shear columns (best -> fallback)
+CAND_SHEAR_06 = ["shear_06km", "bulk_shear_0_6km", "shear06", "shear_06", "shear_deep"]
+CAND_SHEAR_01 = ["shear_01km", "bulk_shear_0_1km", "shear01", "shear_01", "shear_low"]
 CAND_SHEAR_DEF = ["shear10_def", "shear_2d10", "shear10"]  # deformation shear from u10/v10 (this script)
 
 # u/v alias binding (column names in flattened features)
@@ -134,7 +134,7 @@ def _rolling_mean_std_lean(df: pd.DataFrame, col: str, win: int = 3) -> Tuple[pd
     for _, idx in idx_map.items():
         ii = np.asarray(idx, dtype=np.int64)
         x = pd.Series(x_all[ii])
-        # small series → rolling is cheap; no giant object created
+        # small series -> rolling is cheap; no giant object created
         m = x.rolling(win, min_periods=1).mean().astype("float32")
         s = x.rolling(win, min_periods=1).std().fillna(0.0).astype("float32")
         mean_out[ii] = m.to_numpy(dtype=np.float32, copy=False)
@@ -258,7 +258,7 @@ def _deformation_shear_from_uv(df: pd.DataFrame) -> pd.Series:
     """
     Compute 2-D deformation shear from u10/v10 using finite differences on the integer grid.
     Requires: time, lat, lon, ilat, ilon, and u/v (aliases supported).
-    Returns a Series aligned to df.index (float32). Missing prerequisites → zeros.
+    Returns a Series aligned to df.index (float32). Missing prerequisites -> zeros.
     """
     need_cols = {"time", "lat", "lon", "ilat", "ilon"}
     if not need_cols.issubset(df.columns):
@@ -554,6 +554,9 @@ def parse_args():
         action="store_true",
         help="Skip temporal derivatives to conserve memory.",
     )
+    ap.add_argument("--chunk-rows", type=int, default=0, help="Rows per CSV chunk when writing (0=all at once).")
+    ap.add_argument("--chunksize", type=int, default=0, help="Alias for --chunk-rows.")
+    ap.add_argument("--parquet-rows", type=int, default=0, help="Parquet row group size (0=default).")
     # Compatibility no-ops to avoid YAML/manager breaks (accepted, ignored)
     ap.add_argument("--neighbor-step", type=float, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--radius-cells", type=int, default=None, help=argparse.SUPPRESS)
@@ -570,14 +573,32 @@ def _read_table(path: str) -> pd.DataFrame:
     return pd.read_csv(p, low_memory=False, parse_dates=["time"])
 
 
-def _write_table(df: pd.DataFrame, path: str) -> None:
+def _write_table(df: pd.DataFrame, path: str, chunk_rows: int = 0, parquet_rows: int = 0) -> None:
     p = Path(path)
     low = p.suffix.lower()
     if low in [".parquet", ".parq", ".pq"]:
-        df.to_parquet(p, index=False)
+        if parquet_rows and parquet_rows > 0:
+            df.to_parquet(p, index=False, row_group_size=int(parquet_rows))
+        else:
+            df.to_parquet(p, index=False)
         return
     comp = "gzip" if str(p).lower().endswith(".gz") else "infer"
-    df.to_csv(p, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
+    if chunk_rows and chunk_rows > 0:
+        first = True
+        step = int(chunk_rows)
+        for i in range(0, len(df), step):
+            sub = df.iloc[i : i + step]
+            sub.to_csv(
+                p,
+                index=False,
+                mode="w" if first else "a",
+                header=first,
+                compression=comp,
+                date_format="%Y-%m-%d %H:%M:%S",
+            )
+            first = False
+    else:
+        df.to_csv(p, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
 
 
 def main():
@@ -611,7 +632,8 @@ def main():
     others = [c for c in df.columns if c not in base + front]
     df = df[base + front + others]
 
-    _write_table(df, args.outfile)
+    chunk_rows = args.chunk_rows or args.chunksize
+    _write_table(df, args.outfile, chunk_rows=chunk_rows, parquet_rows=args.parquet_rows)
     src = (df["S3_src"].iloc[0] if "S3_src" in df.columns and len(df) > 0 else "n/a")
     print(f"[patch] wrote {args.outfile} rows={len(df):,}  S3_src={src}")
 

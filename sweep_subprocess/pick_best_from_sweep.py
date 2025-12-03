@@ -73,8 +73,8 @@ def resolve_sweep_file(csv_arg: str | None, sweep_dir_arg: str | None) -> Path:
     Priority:
       1) --csv (explicit file)
       2) --sweep-dir:
-           - if file → use directly
-           - if dir  → try sweep*.csv, *.csv
+           - if file -> use directly
+           - if dir  -> try sweep*.csv, *.csv
       3) default: results/sweep_summary.csv
     """
     if csv_arg:
@@ -96,7 +96,7 @@ def resolve_sweep_file(csv_arg: str | None, sweep_dir_arg: str | None) -> Path:
                 raise SystemExit(f"[pick] No CSV files found in sweep_dir: {p}")
             # Stable ordering
             candidates = sorted(candidates)
-            print(f"[pick] sweep_dir={p} → using {candidates[0]}")
+            print(f"[pick] sweep_dir={p} -> using {candidates[0]}")
             return candidates[0]
         raise SystemExit(f"[pick] sweep_dir is neither file nor directory: {p}")
 
@@ -269,7 +269,7 @@ def main():
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     best.to_csv(out_path, index=False)
-    print(f"\n[pick] Saved best-per-lead table → {out_path}")
+    print(f"\n[pick] Saved best-per-lead table -> {out_path}")
 
     # No more suggested apply_thresholds.py commands — in the refactored pipeline
     # you typically use this CSV as thresholds_csv in grid_score.py (thr_col=thr_Fbeta).

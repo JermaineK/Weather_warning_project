@@ -100,7 +100,7 @@ from typing import Dict
 
 HERE = Path(__file__).resolve().parent
 
-# Map high-level tools → script filenames in this directory
+# Map high-level tools -> script filenames in this directory
 SCRIPT_MAP: Dict[str, str] = {
     # Core evals
     "hits":              "eval_alert_hits.py",

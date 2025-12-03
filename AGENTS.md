@@ -226,7 +226,7 @@ If you are an LLM-based agent (like a code assistant), you should:
 - For math changes:
   - Compare summary stats or golden quantiles vs previous version.
 
-If in doubt: **prefer correctness over cleverness**. It’s better to be slightly slow and right than blazing fast and wrong.
+If in doubt: **prefer correctness over cleverness**. It's better to be slightly slow and right than blazing fast and wrong.
 
 
 ---
@@ -239,3 +239,234 @@ If in doubt: **prefer correctness over cleverness**. It’s better to be slightl
   Pipeline modules: each one should have a clear single responsibility.
 
 If you are unsure whether a change violates the intent: err on the side of **not changing the mathematics** and focus on clarity, robustness, and performance only.
+
+---
+
+# Agent Briefing: Geometric Kernel Algorithm (GKA) & Weather Pipeline
+
+This repository implements a **Geometric Kernel Algorithm (GKA)** for weather-like spatiotemporal fields. The goal is to treat GKA as a **spiral spectral probe**, not just a random feature bundle.
+
+You (the coding agent) only see this repo, not prior conversations. This document tells you what the math is supposed to mean and how to extend the code **without breaking that meaning**.
+
+---
+
+## 1. Conceptual model you must preserve
+
+We treat the atmosphere as a field \( F(x, t) \) on a 2D spatial domain. There is a **spiral operator** (\mathcal{S}) that acts (conceptually) by scaling + rotating:
+
+* \((\mathcal{S} f)(z) = f(\lambda e^{i\theta_0} z)\)
+
+The **Geometric Kernel Algorithm (GKA)** is a domain-agnostic procedure that estimates how strongly local patches of the data align with **spiral eigenmodes** of this operator.
+
+In practice that means:
+
+1. Identify a **local patch** where (\mathcal{S}) is approximately well-defined.
+2. Extract statistics that estimate:
+
+   * amplitude of the leading spiral-like mode,
+   * stability / coherence of that mode,
+   * how shear is destroying or preserving it.
+3. Track how these mode coefficients evolve in time (build vs relax) and under parity flip (handedness).
+4. Measure **scale dependence** via knee-like ratios (small-scale vs smoothed behaviour).
+
+You must treat the GKA feature set as a coherent implementation of this idea.
+
+---
+
+## 2. Existing GKA-related code and what it already does
+
+You will see at least the following scripts (names may vary slightly):
+
+* `features_subprocess/compute_gka_features.py`
+  Produces columns like:
+
+  * `gka_kappa ~ zeta`
+  * `gka_tau   ~ -div`
+  * `gka_parity_eta`
+  * `gka_A_overlap`
+  * `gka_F`
+  * `gka_msl_nd`
+  * `gka_knee_ratio`
+  * `gka_chirality`
+  * `gka_Q`
+  * `gka_dir_var`
+  * `gka_vortdiv_ratio`
+
+* `features_subprocess/features_patch.py`
+  Produces:
+
+  * temporal rolls and tendencies (`*_mean3h`, `*_std3h`, `dS_dt`, etc.)
+  * shear-related quantities (`shear10_def`, `shear_proxy`, `S3`)
+
+* `features_subprocess/compute_spherical_feedback.py`
+  Produces per-time local patch features:
+
+  * `sph_center`  (pressure center-ness)
+  * `sph_radial_signed`, `sph_radial_abs` (radial wind alignment)
+  * `sph_lightning` (optional)
+  * `SFI` (spherical feedback index)
+
+Interpretation (do not break this):
+
+* `zeta`, `div`, `S`, `S3`, `shear*`, `gka_*`, and `SFI` are all **different projections of how spiral-like and stable the flow is**, at various scales.
+
+---
+
+## 3. General constraints
+
+When modifying / extending:
+
+1. **Do not break math semantics.**
+
+   * `gka_*` features should remain interpretable as spiral-mode amplitude, coherence, or parity / shear descriptors.
+   * Don’t repurpose GKA columns for unrelated calculations.
+
+2. **Keep the pipeline modular and streaming-friendly.**
+
+   * Scripts are designed to run on large datasets (10+ GB) on modest hardware.
+   * Prefer chunked IO, `float32` where safe, and avoid unnecessary `.copy()` on big DataFrames.
+   * Any new heavy transform should either:
+
+     * operate *per chunk*, or
+     * operate *per time slice* with minimal memory overhead.
+
+3. **Don’t remove or rename existing CLI flags / YAML toggles.**
+
+   * They are used by higher-level managers (`features_manager.py`, `data_manager.py`, YAML configs).
+   * You may add new flags, but keep default behaviour backward compatible.
+
+4. **Always check column presence explicitly.**
+
+   * Many scripts run on different subsets of ERA5 / label grids.
+   * Use alias binding and “if column exists, compute; otherwise use 0 / NaN with clear comments”.
+
+---
+
+## 4. High-priority tasks (GKA as spiral spectral probe)
+
+### Task A: Implement composite GKA alignment indices
+
+Location: `features_subprocess/compute_gka_features.py`
+
+Add 1–2 **composite indices** that explicitly encode “how spiral-eigenmode-like is this patch”. Example:
+
+* `gka_SAI` — **Spiral Alignment Index**
+
+  * High when the local flow is a coherent spiral mode:
+
+    * large |`gka_kappa`| (vorticity magnitude),
+    * high `gka_F` (low destructive shear / high survivorship),
+    * low `gka_dir_var` (consistent direction),
+    * high `gka_A_overlap` (vorticity-dominant over divergence),
+    * moderate `gka_knee_ratio` (non-trivial small-scale structure, but not pure noise).
+
+* `gka_SII` — **Spiral Instability Index**
+
+  * High when a spiral mode exists and is being torn apart:
+
+    * large |`gka_kappa`| and |`gka_tau`|,
+    * high `S3` or other shear-related magnitude,
+    * large |`gka_vortdiv_ratio`|,
+    * large |`dS_dt`| or similar time-derivative indicators (from patched features, if present).
+
+Implementation guidance:
+
+* Use **robust scaling** where possible (e.g. `robust01` style, quantile-based, or median/MAD).
+* Provide clear comments explaining which terms correspond to amplitude, coherence, parity, or scale.
+* Fail-safe: if needed inputs are missing, set `gka_SAI` / `gka_SII` to 0.0 and document in logs.
+
+### Task B: Patch-level aggregation (optional but desirable)
+
+Either:
+
+* Add a new script, e.g. `features_subprocess/compute_gka_patch_features.py`, or
+* Add an optional, **opt-in** block to `features_patch.py`.
+
+Goal: compute **patch-level statistics** over small spatial neighbourhoods (3x3 or 5x5 cells) and maybe a short temporal window, using existing GKA and SFI features.
+
+Examples (per cell):
+
+* Local mean / max of:
+
+  * `gka_kappa`, `gka_F`, `S3`, `SFI`, `gka_SAI`, `gka_SII`.
+* Local variance of:
+
+  * `gka_parity_eta` (parity coherence),
+  * `gka_vortdiv_ratio`.
+
+Constraints:
+
+* Use grid identity where available (`ilat`, `ilon`).
+* Neighborhood size should be small and configurable (e.g. `--patch-radius-cells`).
+* Implementation should be “rolling patch” style, not full dense matrices if memory is tight.
+* If options are added, make them **off by default** so current pipelines are unchanged.
+
+### Task C: Lead-time spiral features for forecasting
+
+Goal: provide **forecaster-friendly lead features** based on spiral alignment.
+
+Where to implement (flexible):
+
+* Either in a dedicated script, e.g. `features_subprocess/compute_gka_lead_features.py`, or
+* As an optional flag in an existing patch stage.
+
+Examples:
+
+* For each point `(time, lat, lon)` compute:
+
+  * Lagged versions of composite indices:
+    `gka_SAI_lag3h`, `gka_SAI_lag6h`, `gka_SII_lag3h`, etc. (when prior data exists).
+  * “Future-any” style indicators similar to `future_any_by_point` used for pregen:
+
+    * e.g. max GKA over next window vs storm labels (for analysis).
+
+Constraints:
+
+* Time alignment must be clear: document whether `lag3h` refers to t−3h or a rolling window.
+* Use `groupby(["lat","lon"])` with memory-safe patterns for big tables.
+
+---
+
+## 5. Testing and validation expectations
+
+When you change or extend the code:
+
+1. **Smoke tests on small subsets**
+
+   * Create a minimal synthetic or downsampled ERA5-like table (few thousand rows).
+   * Run:
+
+     * `build_features_grid.py`
+     * `features_patch.py`
+     * `compute_gka_features.py`
+     * `compute_spherical_feedback.py`
+   * Confirm:
+
+     * No crashes.
+     * New columns exist and have reasonable ranges (no wild NaNs, no all-zeros unless expected).
+
+2. **Interpretability checks (non-strict but important)**
+
+   * For `gka_SAI`: values in [0, 1]-ish (or clearly bounded) and higher in obviously rotational / low-shear scenes.
+   * For `gka_SII`: high where shear and vorticity are both strong.
+
+3. **Memory usage**
+
+   * Avoid operations that create huge intermediate arrays unnecessarily (`.copy()` of entire frames, `groupby.apply` on 70M-row frames without care, etc.).
+   * Prefer:
+
+     * per-time-slice loops (like `compute_spherical_feedback.py`),
+     * `float32` where precision is non-critical,
+     * `chunked` reading/writing for CSV/Parquet when possible.
+
+---
+
+## 6. What *not* to do
+
+* Do not discard or overwrite GKA columns unless the new version is a strict improvement and backward compatible.
+* Do not “simplify away” geometric / spiral aspects for convenience (e.g. replacing GKA with raw thresholds on wspd/msl).
+* Do not introduce hard-coded values that depend on a specific region or dataset unless guarded by flags and documented.
+
+---
+
+If you follow this document, the code changes you make will remain faithful to the underlying geometric / spiral physics while still being practical for large-scale weather forecasting experiments.

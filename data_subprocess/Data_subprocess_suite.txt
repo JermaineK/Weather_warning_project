@@ -1,67 +1,30 @@
 ---
-Mini README — Data Subprocess Suite
-This directory contains all the “data-stage” plumbing for the cyclone early-warning pipeline.
-Each script does one job well and is callable individually, but they’re typically orchestrated through:
-python data_subprocess/data_stage_manager.py <mode> [args...]
+Mini README - Data Subprocess Suite
+This directory contains the data-stage plumbing for the cyclone early-warning pipeline.
+The core flow now centers on ID-based subsetting and G/S/E viability. Legacy heuristic scorers live in archive/.
 
-Everything streams in chunks, works with CSV(.gz)/Parquet, and keeps memory bounded.
-
-1. data_stage_manager.py — The Front Door
-A thin router that selects the correct script based on the mode keyword.
-Allows the pipeline to treat the entire data stage as one conceptual block.
 Usage
 python data_subprocess/data_stage_manager.py <mode> [args...]
 
-Supported Modes
+Supported Modes (via data_stage_manager.py)
+Mode               Script                               Purpose
+stage-data         stage_data.py                        Clean/normalise; optional IDs/slim tables.
+join-labels-grid   join_labels_grid.py                  Attach storm labels + t_to_storm_min_h to grid.
+subset-by-id       build_train_subset_by_id.py          Two-pass ID subset (small view + streamed filter).
+gse-panel          build_gse_panel_from_subset.py       Add G_struct, S_shear, E_energy to the subset.
+gse-lagged         build_gse_lagged.py                  Add temporal lag (same-cell + optional nearby) G/S/E features.
+slowtick-features  build_slowtick_features.py           Add slow-cycle cos/sin (and modulated) features to GSE panel.
+viability-targets  build_viability_targets.py           Derive y_viable (and related targets) from the panel.
+train-viability    train_viability_model.py             Fit a simple viability model (logit baseline).
+storm-timeseries   build_storm_timeseries_by_id.py      Stub for slow-tick storm-centred aggregation.
+Legacy archived    archive/thresholds_and_alerts.py, archive/predict_storm_probability.py, archive/ibtracs_match.py, archive/thresholds_scan.py, archive/train_per_lead_logit.py
 
-
-
-Mode
-Script
-Purpose
-
-
-
-
-stage-data
-stage_data.py
-Clean & normalise CSVs; optional ID tables.
-
-
-score-heuristic
-thresholds_and_alerts.py
-Weighted score + alert flag.
-
-
-ibtracs-match
-ibtracs_match.py
-Space–time matching between alerts & IBTrACS.
-
-
-thresholds-scan
-thresholds_scan.py
-Mine high-score alerts, join to rich grid, summarise features.
-
-
-predict-prob
-predict_storm_probability.py
-Convert raw features → probability via softmax¹.
-
-
-
-¹ Softmax here is a placeholder for the “probability lens” defined by your Spiral/Feedback model.
-Aliases work too: stage, score, ibtracs, scan, predict.
-
-2. stage_data.py — Normalisation + Manifest + ID Tables
-The “foundation pour."
+1. stage_data.py - Foundation
 Cleans CSVs in-place, normalises timestamps, longitude, optional AOI cropping, and writes a manifest.
 Can also build:
-
-key table (row_id, time, lat, lon)
-full table (row_id + all columns)
-slim scoring table (row_id + selected features)
-
-Row IDs are stable 64-bit hashes: (time_floor_H, lat_round3, lon_round3).
+  key table (row_id, time, lat, lon)
+  full table (row_id + all columns)
+  slim scoring table (row_id + selected features)
 Typical CLI
 python stage_data.py \
   --sanitize data/*.csv.gz \
@@ -69,98 +32,92 @@ python stage_data.py \
   --area "-5,125,-35,175" \
   --manifest staged/manifest.json
 
-# With ID build
-python stage_data.py \
-  --id-build-enable \
-  --id-src data/grid_labelled_FMA_gka_realthermo.parquet \
-  --id-extra-src data/grid_labelled_FMA_gka_realthermo_sph.csv.gz \
-  --id-key-out data/grid_key_table.csv.gz \
-  --id-full-out data/grid_full_with_id.csv.gz \
-  --id-slim-out data/grid_scoring_start.csv.gz \
-  --id-slim-cols SFI SFI2 shear_low shear_deep gka_F ...
-
-
-3. thresholds_and_alerts.py — Heuristic Scorer
-Turns the slim table into:
-
-a score via score = ∑ wᵢ xᵢ
-an alert_final bit via a threshold
-optional carry-through of feature columns
-
-This is intentionally transparent: your theory logic is nearest to the metal here.
+2. join_labels_grid.py — Storm Labels + Continuous Lead
+Attaches storm/near/pregen labels and t_to_storm_min_h to the feature grid. Streams CSV or Parquet, writes CSV(.gz) or Parquet.
 Typical CLI
-python thresholds_and_alerts.py \
-  --scoring-src data/grid_scoring_start.csv.gz \
-  --out results/alerts_scored.csv.gz \
-  --default-weight 50 \
-  --score-thr 500 \
+python data_subprocess/join_labels_grid.py \
+  --features data/grid_FMA_gka_realthermo.parquet \
+  --labels data/tracks/tracks_subset.parquet \
+  --out data/grid_labelled_FMA_gka_realthermo.parquet \
+  --normalize-lon -180..180 \
+  --pregen-hours 1..240 \
+  --pregen-step 1 \
+  --storm_radius_deg 1.0 \
+  --storm_time_h 3.0 \
+  --near_radius_deg 5.0 \
+  --near_time_h 12.0 \
+  --features-chunk-rows 400000 \
+  --chunk-hours 72
+
+3. build_train_subset_by_id.py - ID Subset Builder
+Two-pass filter: use a tiny view (id + lead/label) to select interesting IDs, then stream the full rich table and keep only those rows.
+Typical CLI
+python data_subprocess/build_train_subset_by_id.py \
+  --labelled data/grid_labelled_FMA_gka_realthermo_merged_with_id.parquet \
+  --out data/grid_train_subset_by_id.csv.gz \
   --id-col row_id \
-  --keep-features
-
-
-4. ibtracs_match.py — Space–Time Storm Linking
-Attaches storm metadata and “ground truth” signals to each alert:
-
-storm_hit (0/1)
-lead_h
-min_dist_km
-storm time / name / vmax / pmin, etc.
-
-Uses merge-as-of for nearest point in time and haversine for distance.
-Typical CLI
-python ibtracs_match.py \
-  --alerts results/alerts_scored.csv.gz \
-  --alerts-score-col score \
-  --tracks data/tracks/tracks_subset.csv \
-  --storms-list data/tracks/storms_list.csv \
-  --max-time-h 120 \
+  --lead-col t_to_storm_min_h \
   --max-lead-h 240 \
-  --max-dist-km 300 \
-  --out results/alerts_with_targets.csv.gz
+  --quiet-mult 2.0 \
+  --max-rows 5000000 \
+  --chunksize 500000
 
-
-5. thresholds_scan.py — Feature Mining for High Alerts
-Selects only high-alert rows (either via threshold or quantile), re-joins them to the rich grid, and computes summary stats for any chosen candidate columns.
-This is your “find the differentiators” tool.
+4. build_gse_panel_from_subset.py - G/S/E Scalars
+Adds compact scalars:
+  G_struct ~ |gka_F| + knee_ratio + SFI/SFI2
+  S_shear  ~ sqrt(shear_low^2 + shear_deep^2 + proxies)
+  E_energy ~ thermo_shear + pdrop_nd + t2m_anom_local
+Columns are NaN-safe; existing columns are preserved.
 Typical CLI
-python thresholds_scan.py \
-  --alerts-with-targets results/alerts_with_targets.csv.gz \
-  --rich data/grid_labelled_FMA_gka_realthermo_sph.csv.gz \
-  --score-quantile 0.99 \
-  --candidate-cols SFI SFI2 gka_knee_ratio thermo_shear \
-  --out-enriched results/high_score_enriched.csv.gz \
-  --out-summary results/feature_candidate_summary.csv
+python data_subprocess/build_gse_panel_from_subset.py \
+  --subset data/grid_train_subset_by_id.csv.gz \
+  --out data/grid_train_gse_panel.parquet \
+  --chunksize 400000
 
-Works equally well with:
-
-heuristic scores (score)
-probabilities (prob_storm)
-
-Just set --alerts-score-col.
-
-6. predict_storm_probability.py — Probability Lens
-Takes the same slim table (or any feature table), applies a temperature-scaled transformation to convert your spiral-weighted geometry into a probability of storm-formation.
-This is the bridge between exploratory scoring and deployment-style output.
+5. build_gse_lagged.py - Drift/Persistence Features
+Adds same-cell lagged G/S/E (e.g., prev1h) and optional nearby-prev-hour maxima to capture drift.
 Typical CLI
-python predict_storm_probability.py \
-  --scoring-src data/grid_scoring_start.csv.gz \
-  --feature-cols msl shear_low shear_deep SFI SFI2 gka_F ... \
-  --weights-json weights.json \
-  --temp 200 \
-  --shift 0 \
-  --out results/alerts_predicted.csv.gz
+python data_subprocess/build_gse_lagged.py \
+  --panel data/grid_train_gse_panel.parquet \
+  --out data/grid_train_gse_panel_lagged.parquet \
+  --lags 1 \
+  --radius-deg 0.0 \
+  --round-dp 3
 
-Outputs:
+6. build_slowtick_features.py - Slow-cycle Features
+Adds slow-cycle cos/sin phase features (and optional G- modulated versions) so the model can learn slow tick.
+Typical CLI
+python data_subprocess/build_slowtick_features.py \
+  --panel data/grid_train_gse_panel_lagged.parquet \
+  --out data/grid_train_gse_panel_slowtick.parquet \
+  --period-hours 24 \
+  --use-modulated
 
-prob_storm
-optionally: score_raw, normed_score, features (if --keep-features).
+7. build_viability_targets.py - Viability Labels
+Adds y_viable based on a lead window and a geometry threshold (absolute or quantile-derived).
+Typical CLI
+python data_subprocess/build_viability_targets.py \
+  --panel data/grid_train_gse_panel_slowtick.parquet \
+  --out data/grid_train_gse_panel_targets.parquet \
+  --lead-col t_to_storm_min_h \
+  --horizon-max 240 \
+  --g-min-quantile 0.7 \
+  --chunksize 400000
 
+8. train_viability_model.py - Physics-Shaped Baseline
+Fits a logistic regression on G/S/E (or any provided features), with balanced weighting and a small holdout split. Saves model + metrics (+ optional coefficients CSV).
+Typical CLI
+python data_subprocess/train_viability_model.py \
+  --train data/grid_train_gse_panel_targets.parquet \
+  --model-out models/viability_model.pkl \
+  --metrics-json models/viability_model_metrics.json \
+  --coefs-csv models/viability_model_coefs.csv \
+  --features G_struct S_shear E_energy \
+  --neg-pos-ratio 3.0 \
+  --sample-frac 0.5
 
-7. Pipeline Flow (Quick Reference)
-stage_data.py
-    ↓
-thresholds_and_alerts.py        OR        predict_storm_probability.py
-    ↓                                      ↓
-ibtracs_match.py                       (optional)
-    ↓
-thresholds_scan.py
+9. build_storm_timeseries_by_id.py - Stub
+CLI shape for future slow-tick aggregation around track points. Currently exits immediately with a stub notice.
+
+Legacy (archived)
+Heuristic scoring, IBTrACS matching, thresholds scan, and softmax probability scripts now live under data_subprocess/archive/. They remain available for smoke tests or back-compat runs but are no longer wired into data_stage_manager.

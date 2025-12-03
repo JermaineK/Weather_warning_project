@@ -10,9 +10,9 @@ Fixes / Enhancements:
   • Opt-in keeping of u/v via --export-uv.
   • --force-keep to pin variables that must be retained if present.
   • Robust variable binding via alias lists (e.g., 10m_u_component_of_wind ↔ u10).
-  • Optional --engine and multi-engine fallback (netcdf4 → h5netcdf → scipy).
+  • Optional --engine and multi-engine fallback (netcdf4 -> h5netcdf -> scipy).
   • Accept normalize-lon values with or without leading spaces (argparse quirk).
-  • MSL auto-convert Pa→hPa if median suggests Pascals.
+  • MSL auto-convert Pa->hPa if median suggests Pascals.
   • --require-vars accepts CSV, space-separated, or repeated flags (friendly to YAML flattening).
   • On first skip from missing required vars, prints a sample of present variables.
 """
@@ -78,6 +78,10 @@ def parse_args():
     ap.add_argument("--delta-hours", type=int, default=1)
     ap.add_argument("--start", default=None)
     ap.add_argument("--end",   default=None)
+    # Chunking knobs (accepted for orchestrator compatibility; not used in this script)
+    ap.add_argument("--chunk-rows", type=int, default=0, help="Accepted for compatibility; unused here.")
+    ap.add_argument("--chunksize", type=int, default=0, help="Accepted for compatibility; unused here.")
+    ap.add_argument("--parquet-rows", type=int, default=0, help="Accepted for compatibility; unused here.")
 
     # Grid identity & duplicates
     ap.add_argument("--emit-grid-index", action="store_true")
@@ -357,7 +361,7 @@ def _open_dataset_with_fallback(path: str, hint_engine: str | None):
         return xr.open_dataset(path)
     except Exception as e:
         msg = "; ".join([f"{eng}:{err}" for eng, err in tried]) or "no engines tried"
-        raise RuntimeError(f"open_dataset failed for {path}. Tried → {msg}. Last error: {e}")
+        raise RuntimeError(f"open_dataset failed for {path}. Tried -> {msg}. Last error: {e}")
 
 # ---------------- main ----------------
 
@@ -403,7 +407,7 @@ def main():
                 try:
                     pv = sorted(list(present_vars))
                     extra = max(0, len(pv) - 40)
-                    print("  └─ present (sample file) →", pv[:40], (f"… +{extra} more" if extra > 0 else ""))
+                    print("  └─ present (sample file) ->", pv[:40], (f"… +{extra} more" if extra > 0 else ""))
                 except Exception:
                     pass
             skipped_require += 1
@@ -468,7 +472,7 @@ def main():
                 ds = ds.assign(agree=agree)
                 keep_vars.append("agree")
 
-        # Mean sea-level pressure (Pa→hPa if needed)
+        # Mean sea-level pressure (Pa->hPa if needed)
         if msl_name:
             msl_da = ds[msl_name].astype("float32")
             try:
@@ -506,6 +510,19 @@ def main():
             continue
 
         # Time filters and geo post-processing
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None)
+        if args.start:
+            t0 = pd.to_datetime(args.start)
+            df = df[df["time"] >= t0]
+        if args.end:
+            t1 = pd.to_datetime(args.end)
+            df = df[df["time"] < t1]
+        if args.delta_hours and args.delta_hours > 1:
+            print(
+                f"[warn] delta_hours={args.delta_hours} -> thinning times; "
+                "for slow-tick/GSE training use delta_hours=1.",
+                file=sys.stderr,
+            )
         df = keep_delta_hours(df, args.delta_hours)
         df = apply_area_df(df, area_box)
 
@@ -562,9 +579,9 @@ def main():
     H = out_df["lat"].nunique()
     W = out_df["lon"].nunique()
     T = out_df["time"].nunique()
-    print(f"[ok] wrote {len(out_df):,} rows → {out_path}  (H={H} x W={W} x T={T})")
+    print(f"[ok] wrote {len(out_df):,} rows -> {out_path}  (H={H} x W={W} x T={T})")
     if args.emit_grid_index:
-        print("  (ilat/ilon present → stable grid IDs across hours)")
+        print("  (ilat/ilon present -> stable grid IDs across hours)")
 
 if __name__ == "__main__":
     main()

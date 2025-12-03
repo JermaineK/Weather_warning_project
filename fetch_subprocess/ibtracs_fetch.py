@@ -41,7 +41,7 @@ def _download_or_cache(url: str, cache_path: Path) -> Path:
         r = requests.get(url, timeout=120)
         r.raise_for_status()
         cache_path.write_bytes(r.content)
-        print(f"[cache] saved → {cache_path}")
+        print(f"[cache] saved -> {cache_path}")
         return cache_path
     except Exception as e:
         print(f"[warn] download failed: {e}", file=sys.stderr)
@@ -163,6 +163,9 @@ def main():
     ap.add_argument("--url", default=IBTRACS_URL_DEFAULT)
     ap.add_argument("--cache-file", default="data/tracks/ibtracs.ALL.list.v04r01.csv")
     ap.add_argument("--vmax-units", choices=["kt","mps"], default="kt")
+    ap.add_argument("--chunk-rows", type=int, default=None, help="Unused (compatibility with orchestrator hints).")
+    ap.add_argument("--chunksize", type=int, default=None, help="Unused (compatibility with orchestrator hints).")
+    ap.add_argument("--parquet-rows", type=int, default=None, help="Unused (compatibility with orchestrator hints).")
     args = ap.parse_args()
 
     # YAML defaults

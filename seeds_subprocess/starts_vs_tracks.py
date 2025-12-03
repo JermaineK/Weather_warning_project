@@ -15,7 +15,7 @@ Outputs (in --out-dir)
 ----------------------
 - seed_starts_points.csv      : each grid-point start (one row per start point)
 - seed_patches.csv            : hourly patches (clustered starts) with centroid, bbox, size
-- seed_track_matches.csv      : seed-patch → track match with distances and lead times
+- seed_track_matches.csv      : seed-patch -> track match with distances and lead times
 - seed_summary.txt            : human-readable summary
 
 Notes
@@ -443,7 +443,7 @@ def main():
     tmin, tmax = seeds["time_h"].min(), seeds["time_h"].max()
     print(f"[seeds] rows={len(seeds):,}  hours={seeds['time_h'].nunique():,}  "
           f"points={seeds.drop_duplicates(['lat','lon']).shape[0]:,}  "
-          f"time={tmin}→{tmax}  lat={seeds['lat'].min():.3f}..{seeds['lat'].max():.3f}  "
+          f"time={tmin}->{tmax}  lat={seeds['lat'].min():.3f}..{seeds['lat'].max():.3f}  "
           f"lon={seeds['lon'].min():.3f}..{seeds['lon'].max():.3f}  flag={fcol}")
 
     # 2) Seed starts (per point)
@@ -480,7 +480,7 @@ def main():
     if args.save_parquet:
         patches.to_parquet(out_dir / "seed_patches.parquet", index=False)
 
-    # 4) Match patches → tracks and compute lead times
+    # 4) Match patches -> tracks and compute lead times
     matches = match_patches_to_tracks(patches, tracks,
                                       radius_deg=float(args.radius_deg),
                                       time_tol_h=float(args.time_tol_hours))
@@ -514,7 +514,7 @@ def main():
         f.write(f"Rows(seeds) : {len(seeds):,}\n")
         f.write(f"Unique pts  : {n_points:,}\n")
         f.write(f"Hours       : {n_hours:,}\n")
-        f.write(f"Time span   : {seeds['time_h'].min()} → {seeds['time_h'].max()}\n")
+        f.write(f"Time span   : {seeds['time_h'].min()} -> {seeds['time_h'].max()}\n")
         f.write(f"Lat range   : {seeds['lat'].min():.3f} .. {seeds['lat'].max():.3f}\n")
         f.write(f"Lon range   : {seeds['lon'].min():.3f} .. {seeds['lon'].max():.3f}  (normalize_lon={args.normalize_lon})\n")
         f.write(f"AOI         : {args.area or '(none)'}\n")

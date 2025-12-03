@@ -45,7 +45,7 @@ def recent_build_window(df: pd.DataFrame, prob_col: str, hours: int) -> np.ndarr
 def strict_future_max(df: pd.DataFrame, label_col: str, hours: int) -> np.ndarray:
     """
     Strict-future label: for each row at time t, 1 if any positive occurs in (t, t+hours].
-    Implementation: reverse → rolling max → shift(1) → reverse.
+    Implementation: reverse -> rolling max -> shift(1) -> reverse.
     """
     def _lead(g):
         s = g.set_index("time")[label_col].astype(int)

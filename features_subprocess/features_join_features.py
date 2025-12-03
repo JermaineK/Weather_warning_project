@@ -61,16 +61,34 @@ def read_any(path: str, usecols=None):
         kw.pop("dtype_backend", None)
         return pd.read_csv(path, **kw)
 
-def write_any(path: str, df: pd.DataFrame, overwrite=True):
+def write_any(path: str, df: pd.DataFrame, overwrite=True, chunk_rows: int = 0, parquet_rows: int = 0):
     p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
     if p.exists() and not overwrite:
         print(f"[skip] exists: {p}"); return
     low = p.name.lower()
     if low.endswith((".parquet",".parq",".pq",".pqt")):
-        df.to_parquet(p, index=False)
+        if parquet_rows and parquet_rows > 0:
+            df.to_parquet(p, index=False, row_group_size=int(parquet_rows))
+        else:
+            df.to_parquet(p, index=False)
     else:
         comp = "gzip" if (low.endswith(".gz") or p.suffix.lower()==".gz") else "infer"
-        df.to_csv(p, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
+        if chunk_rows and chunk_rows > 0:
+            first = True
+            step = int(chunk_rows)
+            for i in range(0, len(df), step):
+                sub = df.iloc[i:i+step]
+                sub.to_csv(
+                    p,
+                    index=False,
+                    mode="w" if first else "a",
+                    header=first,
+                    compression=comp,
+                    date_format="%Y-%m-%d %H:%M:%S",
+                )
+                first = False
+        else:
+            df.to_csv(p, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
 
 def to_naive_utc(s): 
     return pd.to_datetime(s, utc=True, errors="coerce").dt.tz_localize(None)
@@ -92,6 +110,9 @@ def parse_args():
     ap.add_argument("--out", required=True)
     ap.add_argument("--normalize-lon", default="-180..180")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--chunk-rows", type=int, default=0, help="Rows per CSV chunk when writing (0=all at once).")
+    ap.add_argument("--chunksize", type=int, default=0, help="Alias for --chunk-rows.")
+    ap.add_argument("--parquet-rows", type=int, default=0, help="Parquet row group size (0=default).")
     return ap.parse_args()
 
 def main():
@@ -118,7 +139,8 @@ def main():
 
     out = left.merge(right, on=keys, how="left", suffixes=("","_r"))
 
-    write_any(args.out, out, overwrite=args.overwrite)
+    chunk_rows = args.chunk_rows or args.chunksize
+    write_any(args.out, out, overwrite=args.overwrite, chunk_rows=chunk_rows, parquet_rows=args.parquet_rows)
     print(f"[join-features] wrote {args.out} rows={len(out):,}")
 
 if __name__ == "__main__":

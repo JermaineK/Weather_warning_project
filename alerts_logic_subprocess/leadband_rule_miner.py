@@ -269,7 +269,7 @@ def main():
     out_path = Path(args.out_summary)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     summary.to_csv(out_path, index=False)
-    print(f"[ok] wrote lead-band rule summary → {out_path} rows={len(summary)}", flush=True)
+    print(f"[ok] wrote lead-band rule summary -> {out_path} rows={len(summary)}", flush=True)
 
     # Optional: emit per-row rule alerts to drive later phases
     if args.out_alerts:
@@ -281,7 +281,7 @@ def main():
         out_a.parent.mkdir(parents=True, exist_ok=True)
         comp = "gzip" if out_a.name.lower().endswith(".gz") else "infer"
         alerts.to_csv(out_a, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
-        print(f"[ok] wrote per-row alerts → {out_a} rows={len(alerts)}", flush=True)
+        print(f"[ok] wrote per-row alerts -> {out_a} rows={len(alerts)}", flush=True)
 
 if __name__ == "__main__":
     try:

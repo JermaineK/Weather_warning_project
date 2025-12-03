@@ -5,7 +5,7 @@ analyze_seeds.py
 Quick, robust analysis of seed-cell outputs (e.g., seed_cells_H72.parquet).
 
 Improvements:
-- Optional prob→flag via --prob-thr when no flag column is present.
+- Optional prob->flag via --prob-thr when no flag column is present.
 - Safer numeric/time parsing; no chained-assign warnings.
 - Fixed "Top hours" preview (stable index naming + reset before sorting).
 - Optional Parquet saves; configurable output prefix; quiet mode.
@@ -297,7 +297,7 @@ def main():
         f.write(f"Columns       : {cols}\n")
         f.write(f"Unique points : {uniq_pts:,}\n")
         f.write(f"Hours         : {hours:,}   Days: {dates:,}\n")
-        f.write(f"Time span     : {tmin} → {tmax}\n")
+        f.write(f"Time span     : {tmin} -> {tmax}\n")
         f.write(f"Lat range     : {lat_min:.3f} .. {lat_max:.3f}\n")
         f.write(f"Lon range     : {lon_min:.3f} .. {lon_max:.3f}   (normalize_lon={args.normalize_lon})\n")
         f.write(f"AOI           : {args.area or '(none)'}\n")
@@ -305,7 +305,7 @@ def main():
         f.write(f"Flag column   : {flag_col}\n")
         f.write(f"Prob column   : {prob_col or '(none)'}\n")
         if prob_col and args.prob_thr is not None and args.flag_col is None:
-            f.write(f"Prob→flag rule: flag = ({prob_col} > {args.prob_thr})\n")
+            f.write(f"Prob->flag rule: flag = ({prob_col} > {args.prob_thr})\n")
         f.write("\n")
 
         if len(hourly) > 0:
@@ -345,7 +345,7 @@ def main():
             f.write(f"  lat={r['lat']:.3f}  lon={r['lon']:.3f}  hits={int(r['hits'])}\n")
         f.write("\n")
 
-        f.write("Spatial density (binned) saved → seeds_spatial_bins.csv\n\n")
+        f.write("Spatial density (binned) saved -> seeds_spatial_bins.csv\n\n")
         f.write("Outputs written:\n")
         f.write(f"  • Report            : {report_path}\n")
         f.write(f"  • Hourly CSV        : {hourly_path}\n")
@@ -355,7 +355,7 @@ def main():
         f.write(f"  • Spatial bins CSV  : {bins_path}\n")
 
     if not args.quiet:
-        print(f"[done] Wrote report → {report_path}")
+        print(f"[done] Wrote report -> {report_path}")
         print(f"[done] Also wrote CSVs to {out_dir}")
 
 if __name__ == "__main__":

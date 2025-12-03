@@ -199,7 +199,7 @@ def main():
             if c: c["storm"]=nm; rows.append(c)
         if rows:
             pd.DataFrame(rows).to_csv(args.by_storm,index=False)
-            print(f"[intensity] per-storm summary → {args.by_storm}")
+            print(f"[intensity] per-storm summary -> {args.by_storm}")
 
     write_any(args.out_csv,matches)
     print(f"[intensity] wrote {args.out_csv}")
