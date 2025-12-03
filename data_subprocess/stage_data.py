@@ -45,6 +45,13 @@ import numpy as np
 import pandas as pd
 from pandas.util import hash_pandas_object
 
+try:
+    import pyarrow as pa  # type: ignore
+    import pyarrow.parquet as pq  # type: ignore
+except Exception:
+    pa = None
+    pq = None
+
 # ===================== Embedded Config (edit this block) =====================
 # Keep values realistic but safe; empty lists mean "no-op" until you fill them.
 EMBEDDED_CONFIG: Dict[str, Any] = {
@@ -90,6 +97,9 @@ EMBEDDED_CONFIG: Dict[str, Any] = {
     "id_slim_out": None,
     "id_slim_cols": [],
     "id_chunk_rows": None,  # defaults to chunk_rows when None
+    "id_write_key": True,
+    "id_write_full": True,
+    "id_write_slim": True,
 }
 # ============================================================================
 
@@ -143,7 +153,7 @@ def _norm_lon(vals: pd.Series, mode: str) -> pd.Series:
         return x
     if mode == "0..360":
         return (x % 360 + 360) % 360
-    # default → "-180..180"
+    # default -> "-180..180"
     return ((x + 180.0) % 360.0) - 180.0
 
 
@@ -159,6 +169,20 @@ def _apply_aoi(df: pd.DataFrame, aoi: Tuple[float, float, float, float], latc: s
     latv = pd.to_numeric(df[latc], errors="coerce")
     lonv = pd.to_numeric(df[lonc], errors="coerce")
     return df.loc[(latv <= N) & (latv >= S) & (lonv >= W) & (lonv <= E)]
+
+
+def _objects_to_str(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Parquet writers require a stable schema across chunks. Object columns can
+    infer to null/string inconsistently; force them to string to stabilize.
+    """
+    obj_cols = [c for c in df.columns if df[c].dtype == "object"]
+    if not obj_cols:
+        return df
+    df = df.copy()
+    for c in obj_cols:
+        df[c] = df[c].astype(str)
+    return df
 
 
 def _first_present(cols: List[str], cands: List[str]) -> Optional[str]:
@@ -250,6 +274,9 @@ def normalize_config_shapes(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # ID builder bits
     if "id_build_enable" in out:
         out["id_build_enable"] = bool(out["id_build_enable"])
+    for flag in ("id_write_key", "id_write_full", "id_write_slim"):
+        if flag in out:
+            out[flag] = bool(out[flag])
     # IMPORTANT: expand id_slim_cols including comma-split, so
     # "--id-slim-cols SFI,SFI2,..." becomes ["SFI","SFI2",...]
     raw_cols = out.get("id_slim_cols")
@@ -289,6 +316,9 @@ def merge_cli_over(base: Dict[str, Any], override_ns: argparse.Namespace) -> Dic
         "id_slim_out": None,
         "id_slim_cols": [],
         "id_chunk_rows": None,
+        "id_write_key": True,
+        "id_write_full": True,
+        "id_write_slim": True,
     }
     merged = dict(defaults)
     merged.update(base or {})
@@ -393,18 +423,18 @@ def sanitize_csv_inplace(
             date_format="%Y-%m-%d %H:%M:%S",
         )
         wrote_header = True
-        _print(f"[stage] {path.name}: chunk {i} → {len(chunk)} rows")
+        _print(f"[stage] {path.name}: chunk {i} -> {len(chunk)} rows")
 
     # swap into place if we wrote anything; if empty, keep original but report zero effective rows
     if wrote_header:
         _safe_swap_write(tmp, path)
-        _print(f"[stage] wrote → {path}   rows={rows_out}")
+        _print(f"[stage] wrote -> {path}   rows={rows_out}")
     else:
         try:
             tmp.unlink(missing_ok=True)
         except Exception:
             pass
-        _print(f"[stage] no rows after filters: left original file intact → {path}")
+        _print(f"[stage] no rows after filters: left original file intact -> {path}")
 
     # stats
     if not np.isfinite(lat_min):  # never saw lat/lon
@@ -473,6 +503,9 @@ def build_ids_from_csv(
     chunk_rows: int = 500_000,
     time_col_hint: str = "time",
     extra_src: Optional[Path] = None,
+    write_key: bool = True,
+    write_full: bool = True,
+    write_slim: bool = True,
 ) -> Dict:
     """
     Stream a rich CSV(.gz) or Parquet file and build:
@@ -507,6 +540,7 @@ def build_ids_from_csv(
     key_first = True
     full_first = True
     slim_first = True
+    slim_rows_out = 0
 
     rows_out = 0
     cols_seen: Optional[int] = None
@@ -516,13 +550,38 @@ def build_ids_from_csv(
     lat_max = lon_max = -np.inf
 
     _print(
-        f"[id-build] src={src} extra={extra_src or '(none)'} → key={key_out} "
-        f"full={full_out or '(none)'} slim={slim_out or '(none)'} chunk_rows={chunk_rows}"
+        f"[id-build] src={src} extra={extra_src or '(none)'} -> "
+        f"key={(key_out if write_key else '(skip)')} "
+        f"full={(full_out if (full_out and write_full) else '(skip)')} "
+        f"slim={(slim_out if (slim_out and write_slim) else '(skip)')} "
+        f"chunk_rows={chunk_rows}"
     )
+
+    key_is_parquet = _is_parquet(key_out)
+    full_is_parquet = bool(full_out and _is_parquet(full_out))
+    slim_is_parquet = bool(slim_out and _is_parquet(slim_out))
 
     key_comp = "gzip" if key_out.name.lower().endswith(".gz") else "infer"
     full_comp = "gzip" if (full_out and full_out.name.lower().endswith(".gz")) else "infer"
     slim_comp = "gzip" if (slim_out and slim_out.name.lower().endswith(".gz")) else "infer"
+
+    key_pw = full_pw = slim_pw = None
+    key_schema = full_schema = slim_schema = None
+
+    # Clear existing parquet outputs to avoid mixed-format append
+    for p_out, is_parq, do_write in (
+        (key_out, key_is_parquet, write_key),
+        (full_out, full_is_parquet, write_full),
+        (slim_out, slim_is_parquet, write_slim),
+    ):
+        if do_write and is_parq and p_out is not None and Path(p_out).exists():
+            Path(p_out).unlink()
+    if (
+        (write_key and key_is_parquet)
+        or (write_full and full_is_parquet)
+        or (write_slim and slim_is_parquet)
+    ) and (pa is None or pq is None):
+        raise ImportError("pyarrow is required for parquet outputs; please install pyarrow.")
 
     extra_iter = None
     if extra_src is not None and extra_src.exists():
@@ -667,49 +726,97 @@ def build_ids_from_csv(
             lon_max = float(max(lon_max, base_lon.max()))
 
         # key table
-        key_chunk.to_csv(
-            key_out,
-            index=False,
-            mode="w" if key_first else "a",
-            header=key_first,
-            compression=key_comp,
-            date_format="%Y-%m-%d %H:%M:%S",
-        )
-        key_first = False
+        if write_key:
+            if key_is_parquet:
+                table = pa.Table.from_pandas(key_chunk, preserve_index=False)  # type: ignore[arg-type]
+                if key_schema is None:
+                    key_schema = table.schema
+                else:
+                    table = table.cast(key_schema, safe=False)
+                if key_pw is None:
+                    key_pw = pq.ParquetWriter(key_out, key_schema, compression="snappy")  # type: ignore[arg-type]
+                key_pw.write_table(table)
+            else:
+                key_chunk.to_csv(
+                    key_out,
+                    index=False,
+                    mode="w" if key_first else "a",
+                    header=key_first,
+                    compression=key_comp,
+                    date_format="%Y-%m-%d %H:%M:%S",
+                )
+                key_first = False
 
         # full table
-        if full_out is not None:
+        if write_full and full_out is not None:
             full_chunk = chunk.copy()
             full_chunk.insert(0, "row_id", row_id.values)
-            full_chunk.to_csv(
-                full_out,
-                index=False,
-                mode="w" if full_first else "a",
-                header=full_first,
-                compression=full_comp,
-                date_format="%Y-%m-%d %H:%M:%S",
-            )
-            full_first = False
+            if full_is_parquet:
+                full_chunk = _objects_to_str(full_chunk)
+                table = pa.Table.from_pandas(full_chunk, preserve_index=False)  # type: ignore[arg-type]
+                if full_schema is None:
+                    full_schema = table.schema
+                else:
+                    table = table.cast(full_schema, safe=False)
+                if full_pw is None:
+                    full_pw = pq.ParquetWriter(full_out, full_schema, compression="snappy")  # type: ignore[arg-type]
+                full_pw.write_table(table)
+            else:
+                full_chunk.to_csv(
+                    full_out,
+                    index=False,
+                    mode="w" if full_first else "a",
+                    header=full_first,
+                    compression=full_comp,
+                    date_format="%Y-%m-%d %H:%M:%S",
+                )
+                full_first = False
 
         # slim scoring table
-        if slim_out is not None and slim_cols:
+        if write_slim and slim_out is not None and slim_cols:
             present = [c for c in slim_cols if c in chunk.columns]
             if present:
                 slim_chunk = chunk[present].copy()
                 slim_chunk.insert(0, "row_id", row_id.values)
-                slim_chunk.to_csv(
-                    slim_out,
-                    index=False,
-                    mode="w" if slim_first else "a",
-                    header=slim_first,
-                    compression=slim_comp,
-                    date_format="%Y-%m-%d %H:%M:%S",
-                )
-                slim_first = False
+                if slim_is_parquet:
+                    slim_chunk = _objects_to_str(slim_chunk)
+                    table = pa.Table.from_pandas(slim_chunk, preserve_index=False)  # type: ignore[arg-type]
+                    if slim_schema is None:
+                        slim_schema = table.schema
+                    else:
+                        table = table.cast(slim_schema, safe=False)
+                    if slim_pw is None:
+                        slim_pw = pq.ParquetWriter(slim_out, slim_schema, compression="snappy")  # type: ignore[arg-type]
+                    slim_pw.write_table(table)
+                else:
+                    slim_chunk.to_csv(
+                        slim_out,
+                        index=False,
+                        mode="w" if slim_first else "a",
+                        header=slim_first,
+                        compression=slim_comp,
+                        date_format="%Y-%m-%d %H:%M:%S",
+                    )
+                    slim_first = False
+                slim_rows_out += len(slim_chunk)
             else:
                 _print(f"[id-build] chunk {i}: none of requested slim columns present; skipping slim write.")
 
         _print(f"[id-build] {src.name}: chunk {i} rows={len(chunk)} (total_out={rows_out})")
+
+    if key_pw is not None:
+        key_pw.close()
+    if full_pw is not None:
+        full_pw.close()
+    if slim_pw is not None:
+        slim_pw.close()
+    if write_slim and slim_out is not None and slim_rows_out == 0 and slim_cols:
+        _print(
+            "[id-build] slim output requested but wrote 0 rows. "
+            "Requested slim columns may be missing; check column names and id_extra_src merge."
+        )
+    if (not write_slim) and slim_out is not None:
+        _print("[id-build] slim output configured but suppressed by --no-id-write-slim.")
 
     if not np.isfinite(lat_min):
         lat_min = lat_max = lon_min = lon_max = np.nan
@@ -867,6 +974,20 @@ def main():
         help="CSV chunk size",
     )
     ap.add_argument(
+        "--chunksize",
+        dest="chunksize",
+        type=int,
+        default=None,
+        help="Alias for --chunk-rows (compatibility with orchestrator hints).",
+    )
+    ap.add_argument(
+        "--parquet-rows",
+        dest="parquet_rows",
+        type=int,
+        default=None,
+        help="Optional hint for parquet row-group streaming; falls back to chunk_rows when unset.",
+    )
+    ap.add_argument(
         "--manifest",
         default="staged/manifest.json",
         help="Manifest JSON path",
@@ -928,6 +1049,45 @@ def main():
         help="Columns to keep in slim scoring table",
     )
     ap.add_argument(
+        "--id-write-key",
+        dest="id_write_key",
+        action="store_true",
+        default=True,
+        help="Write the key table (row_id,time,lat,lon).",
+    )
+    ap.add_argument(
+        "--no-id-write-key",
+        dest="id_write_key",
+        action="store_false",
+        help="Skip writing the key table (still computes row_id for other outputs).",
+    )
+    ap.add_argument(
+        "--id-write-full",
+        dest="id_write_full",
+        action="store_true",
+        default=True,
+        help="Write the full table (row_id + all columns).",
+    )
+    ap.add_argument(
+        "--no-id-write-full",
+        dest="id_write_full",
+        action="store_false",
+        help="Skip writing the full table.",
+    )
+    ap.add_argument(
+        "--id-write-slim",
+        dest="id_write_slim",
+        action="store_true",
+        default=True,
+        help="Write the slim scoring table (row_id + selected columns).",
+    )
+    ap.add_argument(
+        "--no-id-write-slim",
+        dest="id_write_slim",
+        action="store_false",
+        help="Skip writing the slim scoring table.",
+    )
+    ap.add_argument(
         "--id-chunk-rows",
         dest="id_chunk_rows",
         type=int,
@@ -937,6 +1097,14 @@ def main():
 
     ns = ap.parse_args()
 
+    # Alias handling for orchestrator-injected flags
+    if ns.chunksize and not ns.chunk_rows:
+        ns.chunk_rows = ns.chunksize
+    if ns.parquet_rows and not ns.id_chunk_rows:
+        ns.id_chunk_rows = ns.parquet_rows
+    if not ns.id_chunk_rows:
+        ns.id_chunk_rows = ns.chunk_rows
+
     if ns.print_embedded_config:
         print(json.dumps(EMBEDDED_CONFIG, indent=2))
         return
@@ -944,7 +1112,7 @@ def main():
         Path(ns.save_embedded_config).write_text(
             json.dumps(EMBEDDED_CONFIG, indent=2), encoding="utf-8"
         )
-        print(f"Saved embedded config → {ns.save_embedded_config}")
+        print(f"Saved embedded config -> {ns.save_embedded_config}")
         return
 
     # Build config base (external, embedded, or empty), then merge CLI on top
@@ -1075,6 +1243,9 @@ def main():
                 chunk_rows=id_chunk_rows,
                 time_col_hint=merged["time_col"],
                 extra_src=extra_src_path,
+                write_key=merged.get("id_write_key", True),
+                write_full=merged.get("id_write_full", True),
+                write_slim=merged.get("id_write_slim", True),
             )
             # key table record
             if key_out.exists():
@@ -1143,7 +1314,7 @@ def main():
     out_manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest = {"files": records}
     out_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    _print(f"[stage] manifest → {out_manifest}  (files={len(records)})")
+    _print(f"[stage] manifest -> {out_manifest}  (files={len(records)})")
 
 
 if __name__ == "__main__":

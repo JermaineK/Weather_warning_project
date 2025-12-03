@@ -1,22 +1,22 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-features_manager.py — delegator + friendly flag translator.
+features_manager.py - delegator + friendly flag translator.
 
 All real work is done by sibling scripts. This manager chooses the tool and
 passes CLI args through, with optional per-mode rewriting so you can use
 nice hyphenated flags in YAML/CLI while core scripts keep their own API.
 
-Modes → scripts
-  build               → build_features_grid.py
-  patch               → features_patch.py
-  join                → join_labels_grid.py
-  gka                 → compute_gka_features.py
-  integrate-thermo    → integrate_era5_thermo.py
-  spherical-feedback  → compute_spherical_feedback.py
-  spherical           → compute_spherical_feedback.py (alias)
-  bulk-shear          → features_bulk_shear.py
-  join-features       → features_join_features.py
+Modes -> scripts
+  build               -> build_features_grid.py
+  patch               -> features_patch.py
+  gka                 -> compute_gka_features.py
+  gka-ms              -> compute_gka_multiscale.py
+  integrate-thermo    -> integrate_era5_thermo.py
+  spherical-feedback  -> compute_spherical_feedback.py
+  spherical           -> compute_spherical_feedback.py (alias)
+  bulk-shear          -> features_bulk_shear.py
+  join-features       -> features_join_features.py
+  join-labels-grid    -> join_labels_grid.py
+  join                -> join_labels_grid.py (alias)
 """
 from __future__ import annotations
 import argparse
@@ -34,53 +34,49 @@ HERE = Path(__file__).resolve().parent
 ROUTING: Dict[str, str] = {
     "build":              "build_features_grid.py",
     "patch":              "features_patch.py",
-    "join":               "join_labels_grid.py",
     "gka":                "compute_gka_features.py",
+    "gka-ms":             "compute_gka_multiscale.py",
     "integrate-thermo":   "integrate_era5_thermo.py",
     "spherical-feedback": "compute_spherical_feedback.py",
     "spherical":          "compute_spherical_feedback.py",  # alias
     "bulk-shear":         "features_bulk_shear.py",
     "join-features":      "features_join_features.py",
+    "join-labels-grid":   "join_labels_grid.py",
+    "join":               "join_labels_grid.py",  # legacy alias
 }
 
 # --------------------------------------------------------------------
 # Per-mode flag rewrite tables
 #   Key: manager mode
-#   Value: mapping from user-facing flag → script-expected flag
+#   Value: mapping from user-facing flag -> script-expected flag
 # --------------------------------------------------------------------
 FLAG_MAPS: Dict[str, Dict[str, str]] = {
-    # Keep join_labels_grid.py lean: translate kebab → underscore here.
-    "join": {
-        "--storm-radius-deg":  "--storm_radius_deg",
-        "--storm-time-h":      "--storm_time_h",
-        "--near-radius-deg":   "--near_radius_deg",
-        "--near-time-h":       "--near_time_h",
-        "--pregen-radius-deg": "--pregen_radius_deg",
-        # pass-through ones (listed for clarity; no change needed)
-        "--pregen-hours":      "--pregen-hours",
-        "--pregen-step":       "--pregen-step",
-        "--normalize-lon":     "--normalize-lon",
-        "--chunk-hours":       "--chunk-hours",
-        "--labels-time-col":   "--labels-time-col",
-        "--labels-lat-col":    "--labels-lat-col",
-        "--labels-lon-col":    "--labels-lon-col",
-        "--features":          "--features",
-        "--labels":            "--labels",
-        "--out":               "--out",
-    },
     # Most other tools already speak kebab; no rewrites needed.
     "build": {},
     "patch": {},
     "gka": {},
+    "gka-ms": {},
     "integrate-thermo": {},
     "spherical-feedback": {},
     "bulk-shear": {},
     "join-features": {},
+    "join-labels-grid": {
+        "--storm-radius-deg": "--storm_radius_deg",
+        "--storm-time-h":     "--storm_time_h",
+        "--near-radius-deg":  "--near_radius_deg",
+        "--near-time-h":      "--near_time_h",
+    },
+    "join": {
+        "--storm-radius-deg": "--storm_radius_deg",
+        "--storm-time-h":     "--storm_time_h",
+        "--near-radius-deg":  "--near_radius_deg",
+        "--near-time-h":      "--near_time_h",
+    },
 }
 
 # For certain modes/flags, trim spaces after commas so merges-on lists are tidy.
 COMPACT_CSV: Dict[str, List[str]] = {
-    "join-features": ["--on"],  # e.g., --on "time, lat, lon" → "time,lat,lon"
+    "join-features": ["--on"],  # e.g., --on "time, lat, lon" -> "time,lat,lon"
 }
 
 # --------------------------------------------------------------------
@@ -177,7 +173,7 @@ def main() -> int:
     args2 = _compact_csv_if_needed(ns.mode, args1)
 
     cmd = [sys.executable, str(script), *args2]
-    print("# features_manager →", script.name)
+    print("# features_manager ->", script.name)
     if ns.dry_run:
         print("$ " + " ".join(shlex.quote(c) for c in cmd))
         return 0

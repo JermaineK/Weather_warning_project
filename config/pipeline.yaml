@@ -8,17 +8,6 @@ report:
   out_md: results/reports/summary_auto.md
 report_pdf: true
 
-# Optional: standalone helpers not covered by the *_subprocess managers.
-misc:
-  enabled: false
-  steps:
-    # Example: run one-off scoring/prediction helpers from YAML
-    # - script: one_off_processes/predict_raw_scores.py
-    #   model: models/grid_logit_perlead.pkl
-    #   features: data/grid_labelled_FMA_gka_realthermo.csv.gz
-    #   out: results/predictions.csv.gz
-    #   skip_if_exists: true
-
 # -------- Global defaults (use anchors so everything is controlled here) --------
 defaults:
   start: &start "2025-02-01"
@@ -74,6 +63,7 @@ fetch:
 features:
   enabled: true
   steps:
+    # 1. Base grid from ERA5 single-level
     - mode: build
       enabled: false
       nc_glob: data_era5/extracted/**/era5_single_*_*.nc
@@ -86,6 +76,7 @@ features:
       dedup: time_lat_lon
       emit_grid_index: true
 
+    # 2. Pressure-level bulk shear (separate table)
     - mode: bulk-shear
       enabled: false
       pl_glob: data_era5/extracted/**/era5_pl_*_uv.nc
@@ -96,6 +87,7 @@ features:
       normalize_lon: *norm
       area: *area
 
+    # 3. Merge shear onto base grid
     - mode: join-features
       enabled: false
       left:  data/features_eoi.parquet
@@ -104,53 +96,62 @@ features:
       out: data/features_merged.parquet
       overwrite: true
 
+    # 4. Patch / rolling stats / shear proxies / S3 / tendencies
     - mode: patch
       enabled: false
       in:  data/features_merged.parquet
-      out: data/features_merged_patched.csv.gz
+      out: data/features_merged_patched.parquet
       neighbor_step: 0.0
       radius_cells: 1
-      prefer_shear: shear_06km
+      prefer_shear: shear_deep   # uses deep bulk shear as preferred S source
       s3_window: 3
       overwrite: true
 
-    # Optional legacy join-to-labels; not required for the GKA+thermo chain
+    # 5. Attach storm labels + t_to_storm_min_h
     - mode: join
       enabled: false
-      features: data/features_merged_patched.csv.gz
-      labels:   data/tracks/tracks_subset.csv
-      out:      data/grid_labelled_base.csv.gz
-      features_chunk_rows: 100000
-
-    - mode: gka
-      enabled: false
-      infile:  data/features_merged_patched.csv.gz
-      outfile: data/grid_labelled_FMA_gka.csv.gz
+      features: data/features_merged_patched.parquet
+      labels:   data/tracks/tracks_subset.csv   # accepts csv or parquet
+      out:      data/grid_labelled_base.parquet
+      normalize-lon: *norm
+      pregen-hours: "1..240"
+      pregen-step: 1
+      storm_radius_deg: 1.0
+      storm_time_h: 3.0
+      near_radius_deg: 5.0
+      near_time_h: 12.0
+      features-chunk-rows: 400000
+      chunk-hours: 72
       overwrite: true
 
+    # 6. GKA + geometric-kernel features on labelled grid
+    - mode: gka
+      enabled: false
+      infile:  data/grid_labelled_base.parquet
+      outfile: data/grid_labelled_FMA_gka.parquet
+      overwrite: true
+
+    # 7. Integrate ERA5 thermo (u10/v10/msl/t2m) back in (exact (time,lat,lon) join)
     - mode: integrate-thermo
-      enabled: true
-      features: data/grid_labelled_FMA_gka.csv.gz
+      enabled: false
+      features: data/grid_labelled_FMA_gka.parquet
       thermo_glob: data_era5/extracted/**/era5_single_*_*.nc
-      out: data/grid_labelled_FMA_gka_realthermo.csv.gz
+      out: data/grid_labelled_FMA_gka_realthermo.parquet
       nearest: true
       nearest_maxdeg: 0.4
       normalize_lon: *norm
-      nc_glob: false       # this is a glob, not a single file
       overwrite: true
 
+    # 8. Spherical-feedback features (SFI / SFI2)
     - mode: spherical-feedback
-      enabled: true
-      infile:  data/grid_labelled_FMA_gka_realthermo.csv.gz
-      out:     data/grid_labelled_FMA_gka_realthermo_sph.csv.gz
-
+      enabled: false
+      infile:  data/grid_labelled_FMA_gka_realthermo.parquet
+      out:     data/grid_labelled_FMA_gka_realthermo_sph.parquet
       neighbor_step: 0.0
       radius_cells: 2
       normalize_lon: *norm
       area: *area
-
       lead_hours: 24
-
       # SFI2 weights
       w_center: 0.40
       w_radial: 0.25
@@ -158,449 +159,147 @@ features:
       w_pdrop:  0.10
       w_thermo: 0.05
 
+    # 9. Multi-scale GKA (spiral probe on S/S3 etc.)
+    - mode: gka-ms
+      enabled: false
+      infile:  data/grid_labelled_FMA_gka_realthermo_sph.parquet
+      outfile: data/grid_labelled_FMA_gka_realthermo_sph_ms.parquet
+      parquet-rows: 250000
+      overwrite: true
+      verbose: true
 
 # =====================================================================
-# 2) Data stage (staging; heuristic scoring; IBTrACS; thresholds; packaging)
+# 2) Data stage (staging; GSE panel; viability)
 # =====================================================================
 data_stage:
   enabled: true
   steps:
-    # 1) Stage: sanitize any CSVs + scan the rich label table(s),
-    #    then build IDs + a slim scoring table for downstream scripts.
+    # 2.1 Build row_id / key table and an ID-merged master + slim table
     - mode: stage-data
-      id_build_enable: true
-      id_src: data/grid_labelled_FMA_gka_realthermo.csv.gz
-      id_extra_src: data/grid_labelled_FMA_gka_realthermo_sph.csv.gz
-      id_key_out: data/grid_key_table.csv.gz
-      id_full_out: data/grid_labelled_FMA_gka_realthermo_merged_with_id.csv.gz
-      id_slim_out: data/grid_scoring_start.csv.gz
+      id_build_enable: false
+      id_src: data/grid_labelled_FMA_gka_realthermo_sph_ms.parquet
+      id_extra_src: data/grid_labelled_base.parquet
+      id_key_out: data/grid_key_table.parquet
+      id_full_out: data/grid_labelled_FMA_gka_realthermo_sph_ms_merged_with_id.parquet
+      id_slim_out: data/grid_slim_start.parquet
+      # Slim table: only what we really need for “who/where/when + lead”
       id_slim_cols:
+        - row_id
         - time
         - lat
         - lon
-        - msl
-        - msl_d1h
-        - msl_d3h
-        - zeta
-        - div
-        - S
-        - zeta_mean3h
-        - zeta_std3h
-        - div_mean3h
-        - div_std3h
-        - S_mean3h
-        - S_std3h
-        - shear10_def
-        - shear_proxy
-        - S3
-        - S3_src
-        - dS_dt
-        - drelax_dt
-        - dagree_dt
-        - msl_grad
-        - u10
-        - v10
-        - wspd
-        - agree
-        - t2m
-        - shear_low
-        - shear_deep
-        - gka_kappa
-        - gka_tau
-        - gka_parity_eta
-        - gka_A_overlap
-        - gka_F
-        - gka_msl_nd
-        - gka_knee_ratio
-        - gka_chirality
-        - gka_Q
-        - gka_vortdiv_ratio
-        - gka_dir_var
-        - t2m_anom_local
-        - pdrop_nd
-        - thermo_shear
+        - t_to_storm_min_h
+        - storm
+        - storm_point
+        - storm_window
+        - near_storm
 
-    - mode: train-logit
-      enabled: true
-      labelled: data/grid_labelled_FMA_gka_realthermo_merged_with_id.csv.gz
-      out: models/grid_logit_perlead.pkl
-      label-col: storm
-      leads: "24,48,72,120,240"
-      min-positives: 30
-      eval: true
-
-    # 2) Heuristic scoring from slim table → scored alerts
-    - mode: score-heuristic
-      enabled: true
-      scoring_src: "data/grid_scoring_start.csv.gz"
-      out: "results/alerts_scored.csv.gz"
-      id_col: "row_id"
-      feature_cols:
+    # 2.2 Optional lookup/slim rebuild without re-running ID stage
+    - mode: lookup-panel
+      enabled: false
+      source: data/grid_labelled_FMA_gka_realthermo_sph_ms_merged_with_id.parquet
+      ids-file: data/grid_train_subset_by_id.parquet   # any table with row_id column
+      ids-col: row_id
+      keep-cols:
+        - row_id
         - time
         - lat
         - lon
-        - msl
-        - msl_d1h
-        - msl_d3h
-        - zeta
-        - div
-        - S
-        - zeta_mean3h
-        - zeta_std3h
-        - div_mean3h
-        - div_std3h
-        - S_mean3h
-        - S_std3h
-        - shear10_def
-        - shear_proxy
-        - S3
-        - S3_src
-        - dS_dt
-        - drelax_dt
-        - dagree_dt
-        - msl_grad
-        - u10
-        - v10
-        - wspd
-        - agree
-        - t2m
-        - shear_low
-        - shear_deep
-        - gka_kappa
-        - gka_tau
-        - gka_parity_eta
-        - gka_A_overlap
+        - t_to_storm_min_h
+        - storm_window
+        - pregen
         - gka_F
-        - gka_msl_nd
-        - gka_knee_ratio
-        - gka_chirality
-        - gka_Q
-        - gka_vortdiv_ratio
-        - gka_dir_var
-        - pdrop_nd
-        - thermo_shear
+        - SFI
+        - SFI2
+      out: data/grid_lookup_panel.parquet
+      chunk-rows: 200000
+      overwrite: true
 
-      # Optional: external weights JSON; omit to use defaults in thresholds_and_alerts.py
-      weights_json:
-      default_weight: 50.0
-      score_thr: 600.0
-      score_col: "score"
-      alert_col: "alert_flag"
-      chunk_rows: 500000
-      keep_features: true
-
-    # 3) Match scored alerts to IBTrACS tracks → add storm_hit
-    - mode: ibtracs-match
+    # 2.3 Build training subset keyed by row_id, using t_to_storm_min_h
+    - mode: subset-by-id
       enabled: true
-      alerts: "results/alerts_scored.csv.gz"
-      tracks: "data/tracks/tracks_subset.csv"
-      storms_list: "data/tracks/storms_list.csv"   # optional; drop if you don't have it
-      out: "results/alerts_with_targets.csv.gz"
-      chunk_rows: 200000
-      alerts_time_col: "time"
-      alerts_lat_col: "lat"
-      alerts_lon_col: "lon"
-      alerts_score_col: "score"
-      max_time_h: 120
-      max_lead_h: 240
-      max_dist_km: 300
+      labelled: data/grid_labelled_FMA_gka_realthermo_sph_ms_merged_with_id.parquet
+      out: data/grid_train_subset_by_id.parquet
+      id-col: row_id
+      lead-col: t_to_storm_min_h
+      max-lead-h: 240
+      quiet-mult: 2.0
+      max-rows: 5000000
+      chunksize: 500000
+      seed: 42
 
-    # 4) Threshold scan on heuristic scores using slim grid for enrichment
-    - mode: thresholds-scan
+    # 2.4 GSE-style panel
+    - mode: gse-panel
       enabled: true
-      alerts_with_targets: "results/alerts_with_targets.csv.gz"
-      rich: "data/grid_labelled_FMA_gka_realthermo_merged_with_id.csv.gz"
-      out_enriched: "results/alerts_with_targets_enriched.csv.gz"
-      out_summary: "results/thresholds_summary.csv"
+      subset: data/grid_train_subset_by_id.parquet
+      out: data/grid_train_gse_panel.parquet
+      chunksize: 200000
 
-      alerts_time_col: "time"
-      alerts_lat_col: "lat"
-      alerts_lon_col: "lon"
-      alerts_score_col: "score"
-      alerts_target_col: "storm_hit"
-
-      rich_time_col: "time"
-      rich_lat_col: "lat"
-      rich_lon_col: "lon"
-
-      # If thresholds_scan.py supports scanning quantiles, you can set score_quantile here;
-      # otherwise leave both None and let the script's defaults do their thing.
-      score_threshold:
-      score_quantile:
-
-      candidate_cols:
-
-      chunk_rows: 500000
-
-    # 5) Predict probability (softmax-style squashing of weighted sum)
-    - mode: predict-prob
+    # 2.5 Lagged GSE panel
+    - mode: gse-lagged
       enabled: true
-      scoring_src: "data/grid_scoring_start.csv.gz"
-      out: "results/alerts_predicted.csv.gz"
-      id_col: "row_id"
-      feature_cols:
-        - time
-        - lat
-        - lon
-        - msl
-        - msl_d1h
-        - msl_d3h
-        - zeta
-        - div
-        - S
-        - zeta_mean3h
-        - zeta_std3h
-        - div_mean3h
-        - div_std3h
-        - S_mean3h
-        - S_std3h
-        - shear10_def
-        - shear_proxy
-        - S3
-        - S3_src
-        - dS_dt
-        - drelax_dt
-        - dagree_dt
-        - msl_grad
-        - u10
-        - v10
-        - wspd
-        - agree
-        - t2m
-        - shear_low
-        - shear_deep
-        - gka_kappa
-        - gka_tau
-        - gka_parity_eta
-        - gka_A_overlap
+      panel: data/grid_train_gse_panel.parquet
+      out: data/grid_train_gse_panel_lagged.parquet
+      lags: "1"
+      radius-deg: 0.0
+      round-dp: 3
+
+    # 2.6 Slow-tick features
+    - mode: slowtick-features
+      enabled: true
+      panel: data/grid_train_gse_panel_lagged.parquet
+      out: data/grid_train_gse_panel_slowtick.parquet
+      period-hours: 24.0
+      use-modulated: true
+
+    # 2.7 Viability targets / labels
+    - mode: viability-targets
+      enabled: true
+      panel: data/grid_train_gse_panel_slowtick.parquet
+      out: data/grid_train_gse_panel_targets.parquet
+      lead-col: t_to_storm_min_h
+      horizon-max: 240
+      g-min-quantile: 0.7
+      g-min:
+      chunksize: 400000
+      seed: 42
+
+    # 2.8 Train viability model
+    - mode: train-viability
+      enabled: true
+      train: data/grid_train_gse_panel_targets.parquet
+      target: y_viable
+      features:
+        - G_struct
+        - S_shear
+        - E_energy
+        - slow_cos
+        - slow_sin
+        - G_slow_cos
+        - G_slow_sin
         - gka_F
-        - gka_msl_nd
         - gka_knee_ratio
-        - gka_chirality
-        - gka_Q
-        - gka_vortdiv_ratio
-        - gka_dir_var
-        - t2m_anom_local
-        - pdrop_nd
-        - thermo_shear
+        - SFI
+        - SFI2
+      neg-pos-ratio: 3.0
+      sample-frac: 0.5
+      test-size: 0.2
+      seed: 42
+      C: 1.0
+      model-out: models/viability_model.pkl
+      metrics-json: models/viability_model_metrics.json
+      coefs-csv: models/viability_model_coefs.csv
 
-      weights_json:
-      default_weight: 40.0
-      shift: 0.0
-      temp: 500.0
-      keep_features: true
-      chunk_rows: 400000
-
-
-# =====================================================================
-# 3) Sweep manager — model threshold sweeps (optional, exploratory)
-# =====================================================================
-sweep:
-  enabled: true
-  steps:
-    # 3.1) Joint run+pick sweep:
-    #      - run: sweep_runner → builds a grid of (thr, persist, neighbors, quantile)
-    #      - pick: pick_best_from_sweep → filters & picks best per-lead rows
-    #
-    # Produces:
-    #   results/sweeps/coral_sea_demo_sweep.csv
-    #   results/sweeps/coral_sea_demo_best_from_sweep.csv   (nice human-readable table)
-    - mode: chain
-      recipe: "run+pick"
-
-      run:
-        labelled: data/grid_labelled_FMA_gka_realthermo_merged_with_id.csv.gz
-        model: models/grid_logit_perlead.pkl
-        target: storm           # or "pregen" / "near_storm" if that's what the bundle used
-        leads: "24,48,72,120,240"
-
-        # Threshold grid & filters
-        thr_grid: "0.02:0.18:0.002"
-        persist: "1,2"
-        neighbors: "0,3"
-        quantiles: "0.90"
-
-        # Hour downsampling for speed:
-        #   "1.0" = use all hours
-        #   "0.3" = random ~30% of hours
-        #   "every:3" = keep every 3rd hour
-        subsample_hours: "1.0"
-
-        out: "results/sweeps/coral_sea_demo_sweep.csv"
-
-      pick:
-        csv: "results/sweeps/coral_sea_demo_sweep.csv"
-        coverage_max: 0.25
-        recall_min:   0.20
-        prec_min:     0.10
-        topn: 5
-        save: "results/sweeps/coral_sea_demo_best_from_sweep.csv"
-
-    # 3.2) Constrained per-lead threshold finder.
-    #      This is the one that can feed directly into the `score:` section
-    #      via results/best_fbeta_thresholds.csv (thr_Fbeta per lead).
-    #      Leave disabled by default; enable once the model + labels are stable.
-    - mode: best-constrained
+    # 2.9 Storm-centric time series panel (optional)
+    - mode: storm-timeseries
       enabled: true
-      labelled: data/grid_labelled_FMA_gka_realthermo_merged_with_id.csv.gz
-      model: models/grid_logit_perlead.pkl
-      target: storm
-      success-col: storm_window   # if missing, script falls back to future window of `target`
-      leads: 24 48 72 120 240
-
-      min-precision: 0.12
-      max-coverage: 0.25
-      fbeta: 0.5
-
-      out: "results/best_fbeta_thresholds.csv"
-      save-table: "results/sweeps/coral_sea_demo_constrained_curve_last_lead.csv"
-
-      # Domain hygiene (matches rest of pipeline)
-      time-format:
-      normalize-lon: *norm
-      area: *area
-      prob-grid: 1000
-
-# =====================================================================
-# 4) Scoring (legacy ML scorer — may be bypassed if using heuristic-only)
-# =====================================================================
-score:
-  enabled: false
-  jobs:
-    - in: data/grid_labelled_FMA_gka_realthermo.parquet
-      features: predict_raw
-      bundle: models/grid_logit_perlead.pkl
-      leads: "1..240"
-      out_dir: results/alerts
-      run_name: coral_sea_demo
-      normalize_lon: *norm
-      area: *area
-      thresholds_csv: results/best_fbeta_thresholds.csv
-      thr_col: thr_Fbeta
-
-# =====================================================================
-# 5) Alerts logic
-# =====================================================================
-alerts_logic:
-  enabled: true
-  steps:
-    - mode: denoise
-      in: results/alerts
-      out: results/alerts_denoised
-      persist_hours: 1
-      min_neighbors: 3
-      connectivity: 4
-      min_area: 0
-      sparse_output: false
-      normalize_lon: *norm
-
-    - mode: throttle
-      in: results/alerts_denoised
-      out: results/alerts_throttled
-      per_lead_keep_quantile:
-        "24": 0.90
-        "48": 0.90
-        "72": 0.90
-        "120": 0.90
-        "240": 0.90
-
-# =====================================================================
-# 6) Evaluation & plots
-# =====================================================================
-eval:
-  enabled: true
-  steps:
-    - mode: hourly-rollup
-      alerts_dir: results/alerts_throttled
-      out_csv: results/metrics/hourly_rollup.csv
-
-    - mode: leadtime-progress
-      alerts_dir: results/alerts_throttled
-      truth: data/tracks/tracks_subset.csv
-      out_png: figures/leadtime_progress.png
-      normalize_lon: *norm
-
-    - mode: plot-skill-vs-tracks
-      alerts_dir: results/alerts_throttled
-      tracks_csv: data/tracks/tracks_subset.csv
-      out_png: figures/skill_vs_tracks.png
-      normalize_lon: *norm
-
-
-# =====================================================================
-# 8) Seeds & Tracks bundle
-# =====================================================================
-seeds:
-  enabled: true
-  from_alerts:
-    alerts: results/alerts/alerts_*_thr*.csv.gz
-    out_dir: results/seedmaps
-    run_name: coral_sea_demo
-    flag_col: alert_final
-    time_floor: H
-    normalize_lon: *norm
-    area: *area
-    chunk_rows: 300000
-    write_parquet: false
-    overwrite: true
-
-  outcomes:
-    overwrite: true
-    ibtracs: data/tracks/tracks_subset.csv
-    normalize_lon: *norm
-    aoi: *area
-    link_radius_km: 75
-    max_gap_hours: 1
-    storm_radius_km: 150
-    lookahead_hours: 120
-    min_track_hours: 2
-    out_dir: results/seedmaps
-    run_name: coral_sea_demo
-    write_parquet: true
-
-  starts:
-    overwrite: true
-    tracks_csv: data/tracks/tracks_subset.csv
-    out_dir: results/seedmaps
-    time_col: time_h
-    flag_col: any_alert
-    min_run_hours: 24
-    connectivity: 8
-    radius_deg: 2.5
-    time_tol_hours: 18
-    normalize_lon: *norm
-    area: *area
-    track_time_offset_hours: 0.0
-    save_parquet: true
-
-  analyze:
-    overwrite: true
-    seeds: results/seedmaps/coral_sea_demo_union_byhour.csv
-    out_dir: results/seedmaps
-    out_prefix: coral_sea_demo
-    time_col: time_h
-    prob_col: prob_max
-    flag_col: any_alert
-    prob_thr: 0.0
-    normalize_lon: *norm
-    area: *area
-    topk: 50
-    bins: 60
-    save_parquet: true
-    quiet: false
-
-  map:
-    enabled: true
-    overwrite: true
-    script: map_seeds_cartopy.py
-    seeds_csv: results/seedmaps/coral_sea_demo_union_byhour.csv
-    out_png: results/maps/seeds_union_map.png
-    value_col: prob_max
-    time_col: time_h
-    per_hour: false
-    title: "Seed Union (by hour)"
-    normalize_lon: *norm
-    area: *area
+      labelled-with-id: data/grid_labelled_FMA_gka_realthermo_sph_ms_merged_with_id.parquet
+      tracks: data/tracks/tracks_subset.csv
+      out: data/storm_timeseries_panel.parquet
+      t-before: 240
+      t-after: 48
+      radius-deg: 2.0
+      ref-kind: genesis
 
 
 # =====================================================================
@@ -614,7 +313,7 @@ seeds:
 # | time              | datetime (UTC)            | Valid time of gridpoint (hourly ERA5 time)                    |
 # | lat               | degrees north             | Gridpoint latitude                                            |
 # | lon               | degrees east              | Gridpoint longitude (later normalised to *norm)              |
-# | msl               | Pa                        | Mean sea-level pressure                                       |
+# | msl               | hPa                       | Mean sea-level pressure                                       |
 # | msl_d1h           | Pa                        | 1-hour pressure tendency (msl(t) - msl(t-1h))                 |
 # | msl_d3h           | Pa                        | 3-hour pressure tendency (msl(t) - msl(t-3h))                 |
 # | zeta              | s^-1                      | 10 m relative vorticity (cyclonic vs anticyclonic spin)       |

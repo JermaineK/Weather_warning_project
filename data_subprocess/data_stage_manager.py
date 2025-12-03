@@ -4,28 +4,34 @@
 """
 data_stage_manager.py
 
-Thin front door for data staging + heuristic scoring + IBTrACS matching +
-threshold feature mining + probability prediction + per-lead logit training.
+Thin front door for data staging + ID subset building + GSE panel/targets +
+viability training. Legacy heuristic/prob scoring is archived.
 
 Current tools (script filenames in brackets):
 
-  - stage-data        [stage_data.py]
-  - score-heuristic   [thresholds_and_alerts.py]
-  - ibtracs-match     [ibtracs_match.py]
-  - thresholds-scan   [thresholds_scan.py]
-  - predict-prob      [predict_storm_probability.py]
-  - train-logit       [train_per_lead_logit.py]
+  - stage-data          [stage_data.py]
+  - subset-by-id        [build_train_subset_by_id.py]
+  - gse-panel           [build_gse_panel_from_subset.py]
+  - gse-lagged          [build_gse_lagged.py]
+  - slowtick-features   [build_slowtick_features.py]
+  - viability-targets   [build_viability_targets.py]
+  - train-viability     [train_viability_model.py]
+  - storm-timeseries    [build_storm_timeseries_by_id.py]
+  - join-labels-grid    [join_labels_grid.py]
 
 This manager does no heavy lifting itself; it just selects the script
 and forwards the remaining CLI arguments as-is. It is designed to be
 called from run_pipeline.py, e.g.:
 
-  python data_subprocess/data_stage_manager.py stage-data      --config ...
-  python data_subprocess/data_stage_manager.py score-heuristic --scoring-src ...
-  python data_subprocess/data_stage_manager.py ibtracs-match   --alerts ... --tracks ...
-  python data_subprocess/data_stage_manager.py thresholds-scan --alerts-with-targets ...
-  python data_subprocess/data_stage_manager.py predict-prob    --scoring-src ...
-  python data_subprocess/data_stage_manager.py train-logit     --labelled ... --out ...
+  python data_subprocess/data_stage_manager.py stage-data        --config ...
+  python data_subprocess/data_stage_manager.py subset-by-id      --labelled ... --out ...
+  python data_subprocess/data_stage_manager.py gse-panel         --subset ... --out ...
+  python data_subprocess/data_stage_manager.py gse-lagged        --panel ... --out ...
+  python data_subprocess/data_stage_manager.py slowtick-features --panel ... --out ...
+  python data_subprocess/data_stage_manager.py viability-targets --panel ... --out ...
+  python data_subprocess/data_stage_manager.py train-viability   --train ... --model-out ...
+  python data_subprocess/data_stage_manager.py storm-timeseries  --labelled-with-id ... --tracks ...
+  python data_subprocess/data_stage_manager.py join-labels-grid  --features ... --labels ... --out ...
 
 Dash/underscore variants are accepted via normalisation.
 """
@@ -36,17 +42,21 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 HERE = Path(__file__).resolve().parent
 
 SCRIPT_MAP: Dict[str, str] = {
-    "stage-data":      "stage_data.py",
-    "score-heuristic": "thresholds_and_alerts.py",
-    "ibtracs-match":   "ibtracs_match.py",
-    "thresholds-scan": "thresholds_scan.py",
-    "predict-prob":    "predict_storm_probability.py",
-    "train-logit":     "train_per_lead_logit.py",
+    "stage-data":        "stage_data.py",
+    "subset-by-id":      "build_train_subset_by_id.py",
+    "gse-panel":         "build_gse_panel_from_subset.py",
+    "gse-lagged":        "build_gse_lagged.py",
+    "slowtick-features": "build_slowtick_features.py",
+    "viability-targets": "build_viability_targets.py",
+    "train-viability":   "train_viability_model.py",
+    "storm-timeseries":  "build_storm_timeseries_by_id.py",
+    "join-labels-grid":  "join_labels_grid.py",
+    "lookup-panel":      "build_lookup_panel.py",
 }
 
 ALIASES: Dict[str, str] = {
@@ -54,27 +64,82 @@ ALIASES: Dict[str, str] = {
     "stage":      "stage-data",
     "stage_data": "stage-data",
 
-    "score":           "score-heuristic",
-    "heuristic":       "score-heuristic",
-    "heuristic-score": "score-heuristic",
+    # subset builder
+    "subset":             "subset-by-id",
+    "train-subset":       "subset-by-id",
+    "subset_by_id":       "subset-by-id",
+    "build-train-subset": "subset-by-id",
 
-    "ibtracs":         "ibtracs-match",
-    "match":           "ibtracs-match",
+    # GSE panel
+    "panel":         "gse-panel",
+    "gse":           "gse-panel",
+    "gse_panel":     "gse-panel",
 
-    "scan":            "thresholds-scan",
-    "thr-scan":        "thresholds-scan",
+    # lagged GSE
+    "gse-lag":       "gse-lagged",
+    "gse_lagged":    "gse-lagged",
+    "lagged-gse":    "gse-lagged",
 
-    "predict":         "predict-prob",
-    "predict_prob":    "predict-prob",
-    "prob":            "predict-prob",
+    # slowtick features
+    "slowtick-feat":     "slowtick-features",
+    "slowtick_feat":     "slowtick-features",
 
-    # new trainer aliases
-    "train":                 "train-logit",
-    "train_logit":           "train-logit",
-    "train-perlead-logit":   "train-logit",
-    "train_per_lead_logit":  "train-logit",
-    "perlead-logit":         "train-logit",
+    # viability targets
+    "targets":             "viability-targets",
+    "viability":           "viability-targets",
+    "viability_targets":   "viability-targets",
+
+    # viability trainer
+    "train-viability-model": "train-viability",
+    "viability-train":       "train-viability",
+
+    # storm timeseries
+    "storm-ts":          "storm-timeseries",
+    "storm_timeseries":  "storm-timeseries",
+
+    # label joiner
+    "join-labels":       "join-labels-grid",
+    "labels":            "join-labels-grid",
+    "join_labels_grid":  "join-labels-grid",
+    # lookup panel
+    "lookup":            "lookup-panel",
+    "lookup_panel":      "lookup-panel",
+
+    # diagnostics
 }
+
+
+OPTION_ALIASES: Dict[str, Dict[str, str]] = {
+    # join-labels-grid expects underscore flags; run_pipeline emits hyphenated ones.
+    "join-labels-grid": {
+        "--storm-radius-deg": "--storm_radius_deg",
+        "--storm-time-h":     "--storm_time_h",
+        "--near-radius-deg":  "--near_radius_deg",
+        "--near-time-h":      "--near_time_h",
+    },
+}
+
+
+def rewrite_args(tool: str, argv: List[str]) -> List[str]:
+    """
+    Map hyphenated flags back to the underscore variants expected by the script.
+    Supports both '--flag value' and '--flag=value' forms.
+    """
+    fmap = OPTION_ALIASES.get(tool)
+    if not fmap:
+        return argv
+
+    out: List[str] = []
+    for tok in argv:
+        if tok.startswith("--"):
+            if "=" in tok:
+                flag, val = tok.split("=", 1)
+                out.append(f"{fmap.get(flag, flag)}={val}")
+                continue
+            out.append(fmap.get(tok, tok))
+            continue
+        out.append(tok)
+    return out
 
 
 def normalize_tool(name: str) -> str:
@@ -136,8 +201,8 @@ def find_script(cmd: str) -> Path:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=(
-            "Data-stage manager: staging, heuristic scoring, IBTrACS matching, "
-            "threshold feature mining, probability prediction, and per-lead logit training."
+            "Data-stage manager: staging, ID subsets, GSE panel/targets, viability training. "
+            "Legacy heuristic/prob scoring scripts are archived."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -145,8 +210,8 @@ def main() -> int:
         "tool",
         help=(
             "Which data-stage tool to run "
-            "(stage-data, score-heuristic, ibtracs-match, thresholds-scan, "
-            "predict-prob, train-logit). "
+            "(stage-data, subset-by-id, gse-panel, viability-targets, "
+            "gse-lagged, slowtick-features, train-viability, storm-timeseries, join-labels-grid). "
             "Dash/underscore variants and simple aliases are accepted."
         ),
     )
@@ -158,8 +223,17 @@ def main() -> int:
 
     args, extra = ap.parse_known_args()
 
-    script = find_script(args.tool)
-    cmd = [sys.executable, str(script), *extra]
+    tool = normalize_tool(args.tool)
+    rewritten = rewrite_args(tool, extra)
+
+    # join-labels-grid now lives under features_subprocess; forward there to keep
+    # data-stage configs working without duplicating logic.
+    if tool == "join-labels-grid":
+        feat_mgr = (HERE.parent / "features_subprocess" / "features_manager.py").resolve()
+        cmd = [sys.executable, str(feat_mgr), "join-labels-grid", *rewritten]
+    else:
+        script = find_script(tool)
+        cmd = [sys.executable, str(script), *rewritten]
 
     print(f"\n$ {' '.join(map(str, cmd))}")
     if args.dry_run:
