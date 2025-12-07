@@ -4,12 +4,13 @@
 
 import argparse
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Sequence, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pyarrow.lib import ArrowInvalid
 
 # Ensure repository root (containing utils/) is importable when run as a script.
 import sys
@@ -53,6 +54,12 @@ def parse_args():
                     help="Alias for --chunk-rows (pipeline compatibility).")
     ap.add_argument("--parquet-rows", type=int, default=0,
                     help="Preferred batch size when streaming parquet input/output.")
+    ap.add_argument("--tmp", dest="tmp_path", default=None,
+                    help="Optional explicit temp path. Defaults to <out>.tmp.{parquet,csv}.")
+    ap.add_argument("--resume", action="store_true",
+                    help="Skip recompute; resume from existing temp file and only finalize SFI/SFI2.")
+    ap.add_argument("--keep-tmp", action="store_true",
+                    help="Keep temp file after successful finalize (useful with --resume).")
     # Kept for compatibility; lead correlations are not computed in this streamer.
     ap.add_argument("--lead-hours", type=int, default=24,
                     help="Accepted for backward compatibility; currently unused in streaming mode.")
@@ -96,12 +103,12 @@ def _peek_columns(path: Path) -> List[str]:
     return list(head.columns)
 
 
-def _iter_input_chunks(path: Path, usecols: Sequence[str], chunk_rows: int, parquet_rows: int | None = None) -> Iterable[pd.DataFrame]:
+def _iter_input_chunks(path: Path, usecols: Optional[Sequence[str]], chunk_rows: int, parquet_rows: int | None = None) -> Iterable[pd.DataFrame]:
     fmt = _detect_table_format(path)
     if fmt == "parquet":
         pf = pq.ParquetFile(path)
         batch_size = parquet_rows if parquet_rows and parquet_rows > 0 else chunk_rows
-        for batch in pf.iter_batches(batch_size=batch_size, columns=list(usecols)):
+        for batch in pf.iter_batches(batch_size=batch_size, columns=list(usecols) if usecols else None):
             yield batch.to_pandas()
     else:
         kw = {
@@ -109,7 +116,7 @@ def _iter_input_chunks(path: Path, usecols: Sequence[str], chunk_rows: int, parq
             "low_memory": False,
             "encoding_errors": "replace",
             "on_bad_lines": "skip",
-            "usecols": list(usecols),
+            "usecols": list(usecols) if usecols else None,
             "chunksize": chunk_rows,
             "parse_dates": ["time"],
         }
@@ -253,18 +260,31 @@ def robust01_from_quantiles(x: np.ndarray, q1: float, q99: float) -> np.ndarray:
     return np.clip((np.asarray(x, float) - q1) / (den + 1e-12), 0.0, 1.0)
 
 
-def _compute_quantiles_from_temp(path: Path, cols: Sequence[str], batch_size: int) -> dict[str, Tuple[float, float]]:
-    """Exact 1/99 quantiles by fully scanning temp file columns (slower, no sampling)."""
+def _compute_quantiles_from_temp(path: Path, cols: Sequence[str], batch_size: int) -> tuple[dict[str, Tuple[float, float]], int]:
+    """
+    Exact 1/99 quantiles by fully scanning temp file columns (slower, no sampling).
+    Returns (quantiles, row_count) where row_count is counted once using the first column.
+    """
     fmt = _detect_table_format(path)
     q = {}
+    row_count = 0
     for col in cols:
         vals = []
         if fmt == "parquet":
-            pf = pq.ParquetFile(path)
+            try:
+                pf = pq.ParquetFile(path)
+            except (OSError, ArrowInvalid) as e:
+                raise SystemExit(
+                    f"[spherical] temp parquet appears corrupt or non-parquet: {path}\n"
+                    f"  error: {e}\n"
+                    f"  -> Delete this temp and rerun without --resume."
+                ) from e
             for batch in pf.iter_batches(columns=[col], batch_size=batch_size):
                 arr = batch.column(0).to_numpy()
                 if arr.size:
                     vals.append(arr[np.isfinite(arr)])
+                if col == cols[0]:
+                    row_count += len(arr)
         else:
             for chunk in pd.read_csv(
                 path,
@@ -278,6 +298,8 @@ def _compute_quantiles_from_temp(path: Path, cols: Sequence[str], batch_size: in
                 arr = pd.to_numeric(chunk[col], errors="coerce").to_numpy()
                 if arr.size:
                     vals.append(arr[np.isfinite(arr)])
+                if col == cols[0]:
+                    row_count += len(arr)
 
         if not vals:
             q[col] = (0.0, 1.0)
@@ -285,7 +307,7 @@ def _compute_quantiles_from_temp(path: Path, cols: Sequence[str], batch_size: in
         allv = np.concatenate(vals)
         q[col] = tuple(np.nanpercentile(allv, [1, 99]).tolist())  # type: ignore[assignment]
         del allv, vals
-    return q
+    return q, row_count
 
 
 # ----------------------- core blocks -----------------------
@@ -480,7 +502,7 @@ def _process_ready_hours(
             ucol, vcol, mcol, vdr_col, t2m_col, shear_col, pdrop_col
         )
 
-        res = pd.DataFrame({
+        base_cols = {
             "time": sub["time"].to_numpy(),
             "lat": sub["lat"].to_numpy(),
             "lon": sub["lon"].to_numpy(),
@@ -491,7 +513,13 @@ def _process_ready_hours(
             "t2m_anom_local": out["t2m_anom_local"],
             "pdrop_nd": out["pdrop"],
             "thermo_shear": out["thermo_shear"],
-        }, index=sub.index).sort_index()
+        }
+        res = pd.DataFrame(base_cols, index=sub.index).sort_index()
+        # carry through all existing columns from the buffered slice
+        base_full = buf.loc[mask].copy()
+        for lbl in ("row_id", "storm_point", "storm_window", "storm", "near_storm", "t_to_storm_min_h", "pregen"):
+            if lbl in sub.columns:
+                base_full[lbl] = sub[lbl].to_numpy()
 
         sfi_raw = (0.45 * res["sph_center"].to_numpy(dtype=np.float32) +
                    0.35 * res["sph_radial_abs"].to_numpy(dtype=np.float32))
@@ -503,8 +531,19 @@ def _process_ready_hours(
         res["SFI_raw"] = sfi_raw.astype(np.float32)
         res["SFI2_raw"] = mix_raw.astype(np.float32)
 
-        writer.write(res)
-        rows_written += len(res)
+        # merge new columns into the full base slice so we preserve all original columns
+        base_full["sph_center"] = res["sph_center"].to_numpy()
+        base_full["sph_radial_signed"] = res["sph_radial_signed"].to_numpy()
+        base_full["sph_radial_abs"] = res["sph_radial_abs"].to_numpy()
+        base_full["sph_vdr_std"] = res["sph_vdr_std"].to_numpy()
+        base_full["t2m_anom_local"] = res["t2m_anom_local"].to_numpy()
+        base_full["pdrop_nd"] = res["pdrop_nd"].to_numpy()
+        base_full["thermo_shear"] = res["thermo_shear"].to_numpy()
+        base_full["SFI_raw"] = res["SFI_raw"].to_numpy()
+        base_full["SFI2_raw"] = res["SFI2_raw"].to_numpy()
+
+        writer.write(base_full.sort_index())
+        rows_written += len(base_full)
         hours_done += 1
         if (hours_done % 10) == 0:
             print(f"  . hours processed={hours_done} rows_written={rows_written:,}", flush=True)
@@ -522,19 +561,18 @@ def main():
     out_path = Path(args.out)
 
     fmt_out = _detect_table_format(out_path)
-    if fmt_out == "parquet":
+    if args.tmp_path:
+        tmp_path = Path(args.tmp_path)
+    else:
         base = out_path.name
         if base.endswith(".parquet"):
             base = base[:-len(".parquet")]
-        tmp_path = out_path.with_name(f"{base}.tmp.parquet")
-    elif fmt_out == "csv.gz":
-        base = out_path.name
-        if base.endswith(".csv.gz"):
+        elif base.endswith(".csv.gz"):
             base = base[:-len(".csv.gz")]
+        else:
+            base = out_path.stem
+        # Always write temp as CSV.GZ so resumes survive partial writes
         tmp_path = out_path.with_name(f"{base}.tmp.csv.gz")
-    else:  # csv
-        base = out_path.stem
-        tmp_path = out_path.with_name(f"{base}.tmp.csv")
 
     in_fmt = _detect_table_format(in_path)
     csv_rows, parq_rows = io_common.recommend_chunk_rows()  # type: ignore[attr-defined]
@@ -563,89 +601,117 @@ def main():
     shear_col = bind_col(cols_all, ALIASES["shear"])
     pdrop_col = bind_col(cols_all, ALIASES["msl_d1h"])
 
-    keep_cols = ["time","lat","lon", ucol, vcol, mcol]
-    for opt in (vdr_col, t2m_col, shear_col, pdrop_col, "pregen"):
-        if isinstance(opt, str) and opt in cols_all and opt not in keep_cols:
-            keep_cols.append(opt)
+    # Read all columns to preserve inputs (IDs/labels/features) through this stage.
+    # Downstream writes will keep everything except intermediate SFI_raw columns.
+    needed_cols = None  # None -> all columns
 
-    writer_tmp = _ChunkedWriter(tmp_path, overwrite=True)
+    writer_tmp = None
+    writer_out = None
     rows_written = 0
     hours_done = 0
     buf = pd.DataFrame()
 
-    for chunk in _iter_input_chunks(in_path, keep_cols, chunk_rows, parquet_rows=parquet_rows):
-        if chunk is None or len(chunk) == 0:
-            continue
-        chunk["time"] = pd.to_datetime(chunk["time"], utc=True, errors="coerce").dt.tz_localize(None)
-        chunk["lat"]  = pd.to_numeric(chunk["lat"], errors="coerce").astype(np.float32)
-        chunk["lon"]  = wrap_lon_vec(pd.to_numeric(chunk["lon"], errors="coerce"), lon_mode).astype(np.float32)
-        chunk[ucol]   = pd.to_numeric(chunk[ucol], errors="coerce").astype(np.float32)
-        chunk[vcol]   = pd.to_numeric(chunk[vcol], errors="coerce").astype(np.float32)
-        chunk[mcol]   = pd.to_numeric(chunk[mcol], errors="coerce").astype(np.float32)
-        if vdr_col:   chunk[vdr_col]   = pd.to_numeric(chunk[vdr_col], errors="coerce").astype(np.float32)
-        if t2m_col:   chunk[t2m_col]   = pd.to_numeric(chunk[t2m_col], errors="coerce").astype(np.float32)
-        if shear_col: chunk[shear_col] = pd.to_numeric(chunk[shear_col], errors="coerce").astype(np.float32)
-        if pdrop_col: chunk[pdrop_col] = pd.to_numeric(chunk[pdrop_col], errors="coerce").astype(np.float32)
+    process_input = not args.resume
+    if args.resume and not tmp_path.exists():
+        raise SystemExit(f"[spherical] --resume requested but temp file missing: {tmp_path}")
 
-        chunk = chunk.dropna(subset=["time","lat","lon"])
-        if aoi:
-            chunk = crop_aoi(chunk, aoi)
-        if chunk.empty:
-            continue
+    success = False
 
-        chunk["time_hr"] = pd.to_datetime(chunk["time"]).dt.floor("h")
-        buf = pd.concat([buf, chunk], ignore_index=True)
-        buf.sort_values(["time","lat","lon"], kind="mergesort", inplace=True, ignore_index=True)
+    try:
+        if process_input:
+            writer_tmp = _ChunkedWriter(tmp_path, overwrite=True)
+            for chunk in _iter_input_chunks(in_path, needed_cols, chunk_rows, parquet_rows=parquet_rows):
+                if chunk is None or len(chunk) == 0:
+                    continue
+                chunk["time"] = pd.to_datetime(chunk["time"], utc=True, errors="coerce").dt.tz_localize(None)
+                chunk["lat"]  = pd.to_numeric(chunk["lat"], errors="coerce").astype(np.float32)
+                chunk["lon"]  = wrap_lon_vec(pd.to_numeric(chunk["lon"], errors="coerce"), lon_mode).astype(np.float32)
+                chunk[ucol]   = pd.to_numeric(chunk[ucol], errors="coerce").astype(np.float32)
+                chunk[vcol]   = pd.to_numeric(chunk[vcol], errors="coerce").astype(np.float32)
+                chunk[mcol]   = pd.to_numeric(chunk[mcol], errors="coerce").astype(np.float32)
+                if vdr_col:   chunk[vdr_col]   = pd.to_numeric(chunk[vdr_col], errors="coerce").astype(np.float32)
+                if t2m_col:   chunk[t2m_col]   = pd.to_numeric(chunk[t2m_col], errors="coerce").astype(np.float32)
+                if shear_col: chunk[shear_col] = pd.to_numeric(chunk[shear_col], errors="coerce").astype(np.float32)
+                if pdrop_col: chunk[pdrop_col] = pd.to_numeric(chunk[pdrop_col], errors="coerce").astype(np.float32)
 
-        hours = buf["time_hr"].unique()
-        if len(hours) > 1:
-            ready_hours = hours[:-1]  # leave last hour in buffer in case spillover appears next chunk
-            buf, rows_written, hours_done = _process_ready_hours(
-                buf, ready_hours, writer_tmp,
-                args.radius_cells, args.neighbor_step,
-                ucol, vcol, mcol, vdr_col, t2m_col, shear_col, pdrop_col,
-                args.w_center, args.w_radial, args.w_vdrstd, args.w_pdrop, args.w_thermo,
-                rows_written, hours_done
-            )
+                chunk = chunk.dropna(subset=["time","lat","lon"])
+                if aoi:
+                    chunk = crop_aoi(chunk, aoi)
+                if chunk.empty:
+                    continue
 
-    if not buf.empty:
-        remaining_hours = buf["time_hr"].unique()
-        buf, rows_written, hours_done = _process_ready_hours(
-            buf, remaining_hours, writer_tmp,
-            args.radius_cells, args.neighbor_step,
-            ucol, vcol, mcol, vdr_col, t2m_col, shear_col, pdrop_col,
-            args.w_center, args.w_radial, args.w_vdrstd, args.w_pdrop, args.w_thermo,
-            rows_written, hours_done
-        )
+                chunk["time_hr"] = pd.to_datetime(chunk["time"]).dt.floor("h")
+                buf = pd.concat([buf, chunk], ignore_index=True)
+                buf.sort_values(["time","lat","lon"], kind="mergesort", inplace=True, ignore_index=True)
 
-    writer_tmp.close()
-    if rows_written == 0:
-        raise SystemExit("[spherical] No rows processed; aborting.")
+                hours = buf["time_hr"].unique()
+                if len(hours) > 1:
+                    ready_hours = hours[:-1]  # leave last hour in buffer in case spillover appears next chunk
+                    buf, rows_written, hours_done = _process_ready_hours(
+                        buf, ready_hours, writer_tmp,
+                        args.radius_cells, args.neighbor_step,
+                        ucol, vcol, mcol, vdr_col, t2m_col, shear_col, pdrop_col,
+                        args.w_center, args.w_radial, args.w_vdrstd, args.w_pdrop, args.w_thermo,
+                        rows_written, hours_done
+                    )
 
-    q = _compute_quantiles_from_temp(tmp_path, ["SFI_raw","SFI2_raw"], max(chunk_rows, 100_000))
-    sfi_q1, sfi_q99 = q["SFI_raw"]
-    mix_q1, mix_q99 = q["SFI2_raw"]
-    print(f"Quantiles (exact scan): SFI q1={sfi_q1:.4f} q99={sfi_q99:.4f} | SFI2 q1={mix_q1:.4f} q99={mix_q99:.4f}", flush=True)
+            if not buf.empty:
+                remaining_hours = buf["time_hr"].unique()
+                buf, rows_written, hours_done = _process_ready_hours(
+                    buf, remaining_hours, writer_tmp,
+                    args.radius_cells, args.neighbor_step,
+                    ucol, vcol, mcol, vdr_col, t2m_col, shear_col, pdrop_col,
+                    args.w_center, args.w_radial, args.w_vdrstd, args.w_pdrop, args.w_thermo,
+                    rows_written, hours_done
+                )
 
-    writer_out = _ChunkedWriter(out_path, overwrite=True)
-    keep_final = [
-        "time","lat","lon",
-        "sph_center","sph_radial_signed","sph_radial_abs",
-        "sph_vdr_std","t2m_anom_local","pdrop_nd","thermo_shear",
-        "SFI","SFI2"
-    ]
+            writer_tmp.close()
+            if rows_written == 0:
+                raise SystemExit("[spherical] No rows processed; aborting.")
+        else:
+            print(f"[spherical] Resuming from existing temp: {tmp_path}", flush=True)
 
-    for chunk in _iter_input_chunks(tmp_path, keep_final + ["SFI_raw","SFI2_raw"], chunk_rows, parquet_rows=parquet_rows):
-        if chunk is None or len(chunk) == 0:
-            continue
-        chunk["SFI"] = robust01_from_quantiles(chunk["SFI_raw"], sfi_q1, sfi_q99).astype(np.float32)
-        chunk["SFI2"] = robust01_from_quantiles(chunk["SFI2_raw"], mix_q1, mix_q99).astype(np.float32)
-        writer_out.write(chunk[keep_final])
+        q, row_count = _compute_quantiles_from_temp(tmp_path, ["SFI_raw","SFI2_raw"], max(chunk_rows, 100_000))
+        sfi_q1, sfi_q99 = q["SFI_raw"]
+        mix_q1, mix_q99 = q["SFI2_raw"]
+        print(f"Quantiles (exact scan): SFI q1={sfi_q1:.4f} q99={sfi_q99:.4f} | SFI2 q1={mix_q1:.4f} q99={mix_q99:.4f}", flush=True)
 
-    writer_out.close()
-    tmp_path.unlink(missing_ok=True)
-    print(f"\nWrote {out_path}  | rows={rows_written:,}", flush=True)
+        writer_out = _ChunkedWriter(out_path, overwrite=True)
+        tmp_cols_all = _peek_columns(tmp_path)
+        base_keep = [c for c in tmp_cols_all if c not in ("SFI_raw","SFI2_raw")]
+        keep_final = base_keep + ["SFI","SFI2"]
+        # When reading the temp, only request columns that actually exist there (base + raw).
+        temp_cols = base_keep + ["SFI_raw","SFI2_raw"]
 
+        for chunk in _iter_input_chunks(tmp_path, temp_cols, chunk_rows, parquet_rows=parquet_rows):
+            if chunk is None or len(chunk) == 0:
+                continue
+            chunk["SFI"] = robust01_from_quantiles(chunk["SFI_raw"], sfi_q1, sfi_q99).astype(np.float32)
+            chunk["SFI2"] = robust01_from_quantiles(chunk["SFI2_raw"], mix_q1, mix_q99).astype(np.float32)
+            cols_present = [c for c in keep_final if c in chunk.columns]
+            writer_out.write(chunk[cols_present])
+            if rows_written == 0:  # resume path: count rows as we stream out
+                rows_written += len(chunk)
+
+        total_rows = rows_written if rows_written else row_count
+        print(f"\nWrote {out_path}  | rows={total_rows:,}", flush=True)
+        success = True
+    finally:
+        try:
+            if writer_tmp is not None:
+                writer_tmp.close()
+        except Exception:
+            pass
+        if writer_out is not None:
+            try:
+                writer_out.close()
+            except Exception:
+                pass
+        try:
+            if tmp_path.exists() and (not args.keep_tmp) and (not args.resume) and success:
+                tmp_path.unlink()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()

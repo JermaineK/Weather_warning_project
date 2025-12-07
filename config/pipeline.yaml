@@ -5,7 +5,13 @@ reports_dir: results/reports
 table_format: parquet  # set to parquet or csv.gz; conversion copies are auto-built when switching
 report:
   enabled: true
-  out_md: results/reports/summary_auto.md
+  steps:
+    - mode: summary
+      enabled: true
+      run-name: coral_sea_demo
+      out-md: results/reports/summary_auto.md
+      viability-targets: data/grid_train_gse_panel_targets.parquet
+      viability-metrics: models/viability_model_metrics.json
 report_pdf: true
 
 # -------- Global defaults (use anchors so everything is controlled here) --------
@@ -61,7 +67,7 @@ fetch:
 # 1) Features (NC → Parquet/CSV)
 # =====================================================================
 features:
-  enabled: true
+  enabled: false
   steps:
     # 1. Base grid from ERA5 single-level
     - mode: build
@@ -107,14 +113,62 @@ features:
       s3_window: 3
       overwrite: true
 
-    # 5. Attach storm labels + t_to_storm_min_h
-    - mode: join
+    # 5. GKA + geometric-kernel features on labelled grid
+    - mode: gka
       enabled: false
-      features: data/features_merged_patched.parquet
-      labels:   data/tracks/tracks_subset.csv   # accepts csv or parquet
-      out:      data/grid_labelled_base.parquet
+      infile:  data/features_merged_patched.parquet
+      outfile: data/grid_FMA_gka.parquet
+      overwrite: true
+
+    # 7. Integrate ERA5 thermo (u10/v10/msl/t2m) back in (exact (time,lat,lon) join)
+    - mode: integrate-thermo
+      enabled: false
+      features: data/grid_FMA_gka.parquet
+      thermo_glob: data_era5/extracted/**/era5_single_*_*.nc
+      out: data/grid_FMA_gka_realthermo.parquet
+      nearest: true
+      nearest_maxdeg: 0.4
+      normalize_lon: *norm
+      overwrite: true
+
+    # 8. Spherical-feedback features (SFI / SFI2)
+    - mode: spherical-feedback
+      enabled: false
+      infile:  data/grid_FMA_gka_realthermo.parquet
+      out:     data/grid_FMA_gka_realthermo_sph.parquet
+      neighbor_step: 0.0
+      radius_cells: 2
+      normalize_lon: *norm
+      area: *area
+      lead_hours: 24
+      keep-tmp: true          # keep tmp so resume is possible after long runs
+      resume: false          # set true to finalize from an existing tmp
+      # SFI2 weights
+      w_center: 0.40
+      w_radial: 0.20
+      w_vdrstd: 0.20
+      w_pdrop:  0.10
+      w_thermo: 0.10
+      overwrite: false
+
+    # 9. Multi-scale GKA (spiral probe on S/S3 etc.)
+    - mode: gka-ms
+      enabled: false
+      infile:  data/grid_FMA_gka_realthermo_sph.parquet
+      outfile: data/grid_FMA_gka_realthermo_sph_ms.parquet
+      parquet-rows: 250000
+      overwrite: true
+      verbose: true
+
+    # 10. Attach labels to fully-enriched feature table
+    - mode: join-labels-grid
+      enabled: false
+      features: data/grid_FMA_gka_realthermo_sph_ms.parquet
+      labels:   data/tracks/tracks_subset.parquet
+      out:      data/grid_labelled_FMA_gka_realthermo_sph_ms.parquet
       normalize-lon: *norm
-      pregen-hours: "1..240"
+      pregen-hours:            # leave empty to use single-horizon pregen
+      pregen_future_h: 240.0   # single horizon for pregen + t_to_storm_min_h cap
       pregen-step: 1
       storm_radius_deg: 1.0
       storm_time_h: 3.0
@@ -124,66 +178,26 @@ features:
       chunk-hours: 72
       overwrite: true
 
-    # 6. GKA + geometric-kernel features on labelled grid
-    - mode: gka
+    # 11. Add row_id at the end of feature enrichment
+    - mode: add-ids
       enabled: false
-      infile:  data/grid_labelled_base.parquet
-      outfile: data/grid_labelled_FMA_gka.parquet
+      infile:  data/grid_labelled_FMA_gka_realthermo_sph_ms.parquet
+      outfile: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+      chunk-rows: 200000
       overwrite: true
-
-    # 7. Integrate ERA5 thermo (u10/v10/msl/t2m) back in (exact (time,lat,lon) join)
-    - mode: integrate-thermo
-      enabled: false
-      features: data/grid_labelled_FMA_gka.parquet
-      thermo_glob: data_era5/extracted/**/era5_single_*_*.nc
-      out: data/grid_labelled_FMA_gka_realthermo.parquet
-      nearest: true
-      nearest_maxdeg: 0.4
-      normalize_lon: *norm
-      overwrite: true
-
-    # 8. Spherical-feedback features (SFI / SFI2)
-    - mode: spherical-feedback
-      enabled: false
-      infile:  data/grid_labelled_FMA_gka_realthermo.parquet
-      out:     data/grid_labelled_FMA_gka_realthermo_sph.parquet
-      neighbor_step: 0.0
-      radius_cells: 2
-      normalize_lon: *norm
-      area: *area
-      lead_hours: 24
-      # SFI2 weights
-      w_center: 0.40
-      w_radial: 0.25
-      w_vdrstd: 0.20
-      w_pdrop:  0.10
-      w_thermo: 0.05
-
-    # 9. Multi-scale GKA (spiral probe on S/S3 etc.)
-    - mode: gka-ms
-      enabled: false
-      infile:  data/grid_labelled_FMA_gka_realthermo_sph.parquet
-      outfile: data/grid_labelled_FMA_gka_realthermo_sph_ms.parquet
-      parquet-rows: 250000
-      overwrite: true
-      verbose: true
 
 # =====================================================================
 # 2) Data stage (staging; GSE panel; viability)
 # =====================================================================
 data_stage:
-  enabled: true
+  enabled: false
   steps:
-    # 2.1 Build row_id / key table and an ID-merged master + slim table
-    - mode: stage-data
-      id_build_enable: false
-      id_src: data/grid_labelled_FMA_gka_realthermo_sph_ms.parquet
-      id_extra_src: data/grid_labelled_base.parquet
-      id_key_out: data/grid_key_table.parquet
-      id_full_out: data/grid_labelled_FMA_gka_realthermo_sph_ms_merged_with_id.parquet
-      id_slim_out: data/grid_slim_start.parquet
-      # Slim table: only what we really need for “who/where/when + lead”
-      id_slim_cols:
+    # 2.1 Build slim lookup panel (all rows) from the ID'd feature file
+    - mode: lookup-panel
+      enabled: false
+      source: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+      all-rows: true
+      keep-cols:
         - row_id
         - time
         - lat
@@ -193,32 +207,14 @@ data_stage:
         - storm_point
         - storm_window
         - near_storm
-
-    # 2.2 Optional lookup/slim rebuild without re-running ID stage
-    - mode: lookup-panel
-      enabled: false
-      source: data/grid_labelled_FMA_gka_realthermo_sph_ms_merged_with_id.parquet
-      ids-file: data/grid_train_subset_by_id.parquet   # any table with row_id column
-      ids-col: row_id
-      keep-cols:
-        - row_id
-        - time
-        - lat
-        - lon
-        - t_to_storm_min_h
-        - storm_window
-        - pregen
-        - gka_F
-        - SFI
-        - SFI2
-      out: data/grid_lookup_panel.parquet
+      out: data/grid_slim_start.parquet
       chunk-rows: 200000
       overwrite: true
 
-    # 2.3 Build training subset keyed by row_id, using t_to_storm_min_h
+    # 2.2 Build training subset keyed by row_id, using t_to_storm_min_h
     - mode: subset-by-id
-      enabled: true
-      labelled: data/grid_labelled_FMA_gka_realthermo_sph_ms_merged_with_id.parquet
+      enabled: false
+      labelled: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
       out: data/grid_train_subset_by_id.parquet
       id-col: row_id
       lead-col: t_to_storm_min_h
@@ -230,14 +226,14 @@ data_stage:
 
     # 2.4 GSE-style panel
     - mode: gse-panel
-      enabled: true
+      enabled: false
       subset: data/grid_train_subset_by_id.parquet
       out: data/grid_train_gse_panel.parquet
       chunksize: 200000
 
     # 2.5 Lagged GSE panel
     - mode: gse-lagged
-      enabled: true
+      enabled: false
       panel: data/grid_train_gse_panel.parquet
       out: data/grid_train_gse_panel_lagged.parquet
       lags: "1"
@@ -246,7 +242,7 @@ data_stage:
 
     # 2.6 Slow-tick features
     - mode: slowtick-features
-      enabled: true
+      enabled: false
       panel: data/grid_train_gse_panel_lagged.parquet
       out: data/grid_train_gse_panel_slowtick.parquet
       period-hours: 24.0
@@ -254,7 +250,7 @@ data_stage:
 
     # 2.7 Viability targets / labels
     - mode: viability-targets
-      enabled: true
+      enabled: false
       panel: data/grid_train_gse_panel_slowtick.parquet
       out: data/grid_train_gse_panel_targets.parquet
       lead-col: t_to_storm_min_h
@@ -266,7 +262,7 @@ data_stage:
 
     # 2.8 Train viability model
     - mode: train-viability
-      enabled: true
+      enabled: false
       train: data/grid_train_gse_panel_targets.parquet
       target: y_viable
       features:
@@ -292,8 +288,8 @@ data_stage:
 
     # 2.9 Storm-centric time series panel (optional)
     - mode: storm-timeseries
-      enabled: true
-      labelled-with-id: data/grid_labelled_FMA_gka_realthermo_sph_ms_merged_with_id.parquet
+      enabled: false
+      labelled-with-id: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
       tracks: data/tracks/tracks_subset.csv
       out: data/storm_timeseries_panel.parquet
       t-before: 240
@@ -303,7 +299,7 @@ data_stage:
 
 
 # =====================================================================
-# 9) Column dictionary (grid_labelled_FMA_gka_realthermo[ _sph ])
+# Column dictionary
 # =====================================================================
 #
 # Base grid columns (47 total)

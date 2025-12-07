@@ -14,7 +14,8 @@ Intended usage:
         --out-dir  results/reports/20251122_run001
         --seed-summary <path>
         --seed-analysis <path>
-        --include-conversion <path>
+        --viability-targets <path>
+        --viability-metrics <path>
         --extras '{"key": "path", ...}'
 
 This script assumes:
@@ -84,15 +85,29 @@ def main():
         help="Folder containing alerts_* CSVs (for presence snapshot).",
     )
     ap.add_argument(
-        "--include-conversion",
-        default="results/seedmaps/coral_sea_demo_conversion_rates.csv",
-        help="Optional CSV of conversion/proto-outcome rates.",
+        "--viability-targets",
+        default="data/grid_train_gse_panel_targets.parquet",
+        help="Panel with y_viable/t_to_storm_min_h for conversion snapshot (optional).",
+    )
+    ap.add_argument(
+        "--viability-metrics",
+        default="models/viability_model_metrics.json",
+        help="Viability model metrics JSON (optional).",
+    )
+    ap.add_argument(
+        "--viability-horizons",
+        default="24,48,72,120",
+        help="Comma-separated horizons (hours) for conversion snapshot.",
     )
     ap.add_argument(
         "--extras",
         default="{}",
         help='JSON dict of extra label->path entries to surface in the report.',
     )
+    # Compatibility: accept chunk hints without using them.
+    ap.add_argument("--chunk-rows", type=int, default=None, help="Ignored; accepted for pipeline compatibility.")
+    ap.add_argument("--chunksize", type=int, default=None, help="Alias for --chunk-rows (ignored).")
+    ap.add_argument("--parquet-rows", type=int, default=None, help="Ignored; accepted for pipeline compatibility.")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -120,21 +135,49 @@ def main():
                 # We don't fail the report if one file is unreadable
                 continue
 
-    # ---- Conversion (proto-outcomes) table (optional) ----
+    # ---- Viability conversion snapshot (optional) ----
     conv_txt = ""
-    conv_path = Path(args.include_conversion)
+    horizons = []
+    try:
+        horizons = [int(h.strip()) for h in str(args.viability_horizons).split(",") if h.strip()]
+    except Exception:
+        horizons = [24, 48, 72, 120]
+
+    conv_path = Path(args.viability_targets)
     if exists_nonempty(conv_path):
         try:
-            conv = pd.read_csv(conv_path)
-            # Keep it compact if huge: show head + note
-            if len(conv) > 50:
-                conv_head = conv.head(50)
-                conv_txt = conv_head.to_string(index=False)
-                conv_txt += f"\n\n[truncated: {len(conv) - 50} more rows not shown]"
-            else:
-                conv_txt = conv.to_string(index=False)
+            cols = ["t_to_storm_min_h", "y_viable"]
+            df = pd.read_parquet(conv_path, columns=cols)
+            rows = []
+            for h in horizons:
+                mask = pd.to_numeric(df["t_to_storm_min_h"], errors="coerce").le(h)
+                mask &= df["t_to_storm_min_h"].notna()
+                subset = df.loc[mask]
+                total = len(subset)
+                pos = subset["y_viable"].sum() if "y_viable" in subset else 0
+                rate = (subset["y_viable"].mean() if total > 0 else np.nan) if "y_viable" in subset else np.nan
+                rows.append({"horizon_h": h, "rows": int(total), "y_viable_mean": float(rate) if pd.notna(rate) else np.nan, "positives": float(pos)})
+            conv = pd.DataFrame(rows)
+            conv_txt = conv.to_string(index=False)
         except Exception:
             conv_txt = ""
+
+    # ---- Viability metrics snapshot (optional) ----
+    metrics_txt = ""
+    metrics_path = Path(args.viability_metrics)
+    if exists_nonempty(metrics_path):
+        try:
+            m = json.loads(metrics_path.read_text())
+            # Pick a few commonly logged metrics if present
+            keys = ["roc_auc", "pr_auc", "brier", "opt_threshold", "neg_pos_ratio", "sample_frac"]
+            lines = []
+            for k in keys:
+                if k in m:
+                    lines.append(f"{k}: {m[k]}")
+            if lines:
+                metrics_txt = "\n".join(lines)
+        except Exception:
+            metrics_txt = ""
 
     # ---- Extras ----
     try:
@@ -169,11 +212,17 @@ def main():
             f"{alert_rows_sampled} (for basic presence/health check only)\n\n"
         )
 
-        # Conversion
+        # Viability conversion snapshot
         if conv_txt:
-            f.write("Conversion rates (if proto-outcomes stage ran)\n")
+            f.write("Viability conversion snapshot (t_to_storm_min_h)\n")
             f.write("-" * 72 + "\n")
             f.write(conv_txt.strip() + "\n\n")
+
+        # Viability metrics
+        if metrics_txt:
+            f.write("Viability model metrics\n")
+            f.write("-" * 72 + "\n")
+            f.write(metrics_txt.strip() + "\n\n")
 
         # Extras
         if extras:

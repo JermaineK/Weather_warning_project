@@ -89,10 +89,41 @@ def main() -> None:
     ap.add_argument("--lon-col", default="lon", help="Longitude column.")
     ap.add_argument("--time-col", default="time", help="Timestamp column.")
     ap.add_argument("--round-dp", type=int, default=3, help="Decimal places to round lat/lon for same-cell grouping.")
+    ap.add_argument(
+        "--chunksize",
+        "--chunk-rows",
+        "--chunk_rows",
+        "--parquet-rows",
+        "--parquet_rows",
+        type=int,
+        default=None,
+        help="Optional chunk size for streaming CSV or Parquet batches (0/None = load whole file).",
+    )
     args = ap.parse_args()
 
     lags = _parse_lags(args.lags)
-    df = _read_any(args.panel)
+    chunk_rows = args.chunksize if args.chunksize and args.chunksize > 0 else None
+
+    if _is_parquet(args.panel):
+        df_iter = None
+        if chunk_rows:
+            import pyarrow.parquet as pq  # type: ignore
+            pf = pq.ParquetFile(args.panel)
+            df_iter = (batch.to_pandas() for batch in pf.iter_batches(batch_size=chunk_rows))
+        if df_iter is None:
+            df = _read_any(args.panel)
+            dfs = [df]
+        else:
+            dfs = []
+            for b in df_iter:
+                dfs.append(b)
+        df = pd.concat(dfs, ignore_index=True)
+    else:
+        if chunk_rows:
+            dfs = list(pd.read_csv(args.panel, low_memory=False, chunksize=chunk_rows))
+            df = pd.concat(dfs, ignore_index=True)
+        else:
+            df = _read_any(args.panel)
 
     if args.time_col not in df or args.lat_col not in df or args.lon_col not in df:
         missing = [c for c in (args.time_col, args.lat_col, args.lon_col) if c not in df]

@@ -17,6 +17,8 @@ Modes -> scripts
   join-features       -> features_join_features.py
   join-labels-grid    -> join_labels_grid.py
   join                -> join_labels_grid.py (alias)
+  add-ids             -> add_row_id.py
+  id                  -> add_row_id.py (alias)
 """
 from __future__ import annotations
 import argparse
@@ -43,6 +45,8 @@ ROUTING: Dict[str, str] = {
     "join-features":      "features_join_features.py",
     "join-labels-grid":   "join_labels_grid.py",
     "join":               "join_labels_grid.py",  # legacy alias
+    "add-ids":            "add_row_id.py",
+    "id":                 "add_row_id.py",
 }
 
 # --------------------------------------------------------------------
@@ -65,13 +69,17 @@ FLAG_MAPS: Dict[str, Dict[str, str]] = {
         "--storm-time-h":     "--storm_time_h",
         "--near-radius-deg":  "--near_radius_deg",
         "--near-time-h":      "--near_time_h",
+        "--pregen-future-h":  "--pregen_future_h",
     },
     "join": {
         "--storm-radius-deg": "--storm_radius_deg",
         "--storm-time-h":     "--storm_time_h",
         "--near-radius-deg":  "--near_radius_deg",
         "--near-time-h":      "--near_time_h",
+        "--pregen-future-h":  "--pregen_future_h",
     },
+    "add-ids": {},
+    "id": {},
 }
 
 # For certain modes/flags, trim spaces after commas so merges-on lists are tidy.

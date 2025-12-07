@@ -38,8 +38,12 @@ def _iter_file(path: str, chunksize: Optional[int]) -> Iterable[pd.DataFrame]:
             yield pd.read_parquet(path)
             return
         pf = pq.ParquetFile(path)
-        for rg in range(pf.num_row_groups):
-            yield pf.read_row_group(rg).to_pandas()
+        if chunksize and chunksize > 0:
+            for batch in pf.iter_batches(batch_size=int(chunksize)):
+                yield batch.to_pandas()
+        else:
+            for rg in range(pf.num_row_groups):
+                yield pf.read_row_group(rg).to_pandas()
         return
 
     if chunksize and chunksize > 0:
@@ -146,7 +150,16 @@ def main() -> None:
     ap.add_argument("--horizon-max", type=float, default=240.0, help="Max lead (hours) for viability window.")
     ap.add_argument("--g-min", type=float, default=None, help="Absolute G threshold. If set, bypass quantile.")
     ap.add_argument("--g-min-quantile", type=float, default=0.7, help="Quantile for G threshold when g-min not set.")
-    ap.add_argument("--chunksize", type=int, default=400_000, help="CSV chunksize (parquet uses row-groups).")
+    ap.add_argument(
+        "--chunksize",
+        "--chunk-rows",
+        "--chunk_rows",
+        "--parquet-rows",
+        "--parquet_rows",
+        type=int,
+        default=400_000,
+        help="Chunk size for streaming CSV or Parquet batches.",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-threshold-json", default=None, help="Optional path to save g_min metadata.")
     args = ap.parse_args()

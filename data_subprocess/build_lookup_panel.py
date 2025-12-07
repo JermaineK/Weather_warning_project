@@ -135,10 +135,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ids", default=None, help="Optional comma-separated list of IDs to include.")
     ap.add_argument("--ids-col", default="row_id", help="ID column name in source and ids-file.")
     ap.add_argument(
+        "--all-rows",
+        action="store_true",
+        help="Keep all rows from source (ignores ids-file/ids filters).",
+    )
+    ap.add_argument(
         "--keep-cols",
         nargs="*",
         default=[],
-        help="Columns to keep (row_id always kept). Empty = keep all columns.",
+        help="Columns to keep (row_id always kept when present). Empty = keep all columns.",
     )
     ap.add_argument(
         "--chunksize",
@@ -168,37 +173,55 @@ def main() -> None:
         return
 
     ids: Set[object] = set()
-    if args.ids_file:
-        ids |= _load_ids(args.ids_file, args.ids_col)
-    if args.ids:
-        for part in str(args.ids).split(","):
+    if not args.all_rows:
+        if args.ids_file:
+            ids |= _load_ids(args.ids_file, args.ids_col)
+        if args.ids:
+            for part in str(args.ids).split(","):
+                part = part.strip()
+                if part:
+                    ids.add(_to_python_id(part))
+
+        ids = {i for i in ids if i is not None}
+        if not ids:
+            raise SystemExit("No IDs provided. Use --ids-file/--ids or set --all-rows.")
+
+    # normalize keep-cols: split on commas, strip, dedupe while preserving order
+    keep_cols: list[str] = []
+    seen = set()
+    for item in (args.keep_cols or []):
+        for part in str(item).split(","):
             part = part.strip()
-            if part:
-                ids.add(_to_python_id(part))
+            if part and part not in seen:
+                keep_cols.append(part)
+                seen.add(part)
 
-    ids = {i for i in ids if i is not None}
-    if not ids:
-        raise SystemExit("No IDs provided. Use --ids-file and/or --ids.")
-
-    keep_cols = [c for c in (args.keep_cols or []) if c]
     writer = _Writer(out_path)
     total_rows = 0
 
     print(
-        f"[lookup] source={args.source} ids={len(ids):,} keep_cols="
-        f"{keep_cols if keep_cols else '(all)'} chunksize={args.chunksize}"
+        f"[lookup] source={args.source} "
+        f"{'all rows' if args.all_rows else f'ids={len(ids):,}'} "
+        f"keep_cols={keep_cols if keep_cols else '(all)'} "
+        f"chunksize={args.chunksize}"
     )
 
     for i, chunk in enumerate(_iter_table(args.source, args.chunksize), start=1):
         if chunk is None or chunk.empty:
             continue
         if args.ids_col not in chunk.columns:
-            raise SystemExit(f"Chunk {i} missing ids-col '{args.ids_col}'. Columns: {list(chunk.columns)[:10]}")
-        id_norm = chunk[args.ids_col].apply(_to_python_id)
-        mask = id_norm.isin(ids)
-        sub = chunk.loc[mask]
+            raise SystemExit(f"Chunk {i} missing ids-col '{args.ids_col}'. Columns: {list(chunk.columns)[:15]}")
+        if args.all_rows:
+            sub = chunk
+        else:
+            id_norm = chunk[args.ids_col].apply(_to_python_id)
+            mask = id_norm.isin(ids)
+            sub = chunk.loc[mask]
         if keep_cols:
-            cols = ["row_id"] if "row_id" in sub.columns else []
+            cols = []
+            # always include row_id first if present
+            if "row_id" in sub.columns:
+                cols.append("row_id")
             cols += [c for c in keep_cols if c in sub.columns and c not in cols]
             missing = [c for c in keep_cols if c not in sub.columns]
             if missing:

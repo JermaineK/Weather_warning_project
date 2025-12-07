@@ -95,7 +95,7 @@ def main() -> None:
         "--features",
         nargs="+",
         default=["G_struct", "S_shear", "E_energy"],
-        help="Feature columns to use.",
+        help="Feature columns to use (space-separated or comma-separated).",
     )
     ap.add_argument("--neg-pos-ratio", type=float, default=3.0, help="Max negatives per positive (0 disables).")
     ap.add_argument("--sample-frac", type=float, default=1.0, help="Optional overall subsample fraction (0-1].")
@@ -105,9 +105,33 @@ def main() -> None:
     ap.add_argument("--model-out", required=True, help="Output path for fitted model (.pkl).")
     ap.add_argument("--metrics-json", default=None, help="Where to write metrics JSON.")
     ap.add_argument("--coefs-csv", default=None, help="Where to write coefficient table CSV.")
+    ap.add_argument(
+        "--chunksize",
+        "--chunk-rows",
+        "--chunk_rows",
+        "--parquet-rows",
+        "--parquet_rows",
+        type=int,
+        default=None,
+        help="Optional chunk size for streaming train input (0/None = load whole file).",
+    )
     args = ap.parse_args()
 
-    df = _load_table(args.train)
+    # normalize features: allow comma-separated single arg or space list
+    if len(args.features) == 1 and "," in args.features[0]:
+        args.features = [f.strip() for f in args.features[0].split(",") if f.strip()]
+
+    if args.chunksize and args.chunksize > 0:
+        chunk_rows = int(args.chunksize)
+        if args.train.lower().endswith((".parquet", ".parq", ".pq")):
+            import pyarrow.parquet as pq  # type: ignore
+            pf = pq.ParquetFile(args.train)
+            dfs = [batch.to_pandas() for batch in pf.iter_batches(batch_size=chunk_rows)]
+        else:
+            dfs = list(pd.read_csv(args.train, low_memory=False, chunksize=chunk_rows))
+        df = pd.concat(dfs, ignore_index=True)
+    else:
+        df = _load_table(args.train)
     df_fit = _subsample(df, args.target, args.neg_pos_ratio, args.sample_frac, args.seed)
     print(f"[train] using {len(df_fit):,} rows after subsample (features={args.features})")
 

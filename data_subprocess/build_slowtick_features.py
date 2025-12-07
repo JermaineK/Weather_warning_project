@@ -53,34 +53,72 @@ def main() -> None:
         action="store_true",
         help="Also add G_struct-modulated slow features (G_slow_cos/sin).",
     )
+    ap.add_argument(
+        "--chunksize",
+        "--chunk-rows",
+        "--chunk_rows",
+        "--parquet-rows",
+        "--parquet_rows",
+        type=int,
+        default=None,
+        help="Optional chunk size for streaming CSV/Parquet input (0/None = load whole file).",
+    )
     args = ap.parse_args()
 
-    df = _read_any(args.panel)
-    if args.time_col not in df.columns:
-        raise SystemExit(f"Missing time column '{args.time_col}' in {args.panel}")
+    chunk_rows = args.chunksize if args.chunksize and args.chunksize > 0 else None
 
-    t = pd.to_datetime(df[args.time_col], utc=True, errors="coerce").dt.tz_convert(None)
-    if t.isna().all():
-        raise SystemExit(f"Could not parse any times from column '{args.time_col}'")
-    t0 = t.min()
-    dt_h = (t - t0) / np.timedelta64(1, "h")
+    def process_chunk(df: pd.DataFrame, t0: pd.Timestamp | None) -> tuple[pd.DataFrame, pd.Timestamp | None]:
+        if args.time_col not in df.columns:
+            raise SystemExit(f"Missing time column '{args.time_col}' in {args.panel}")
+        t = pd.to_datetime(df[args.time_col], utc=True, errors="coerce").dt.tz_convert(None)
+        if t.isna().all():
+            raise SystemExit(f"Could not parse any times from column '{args.time_col}'")
+        if t0 is None:
+            t0 = t.min()
+        dt_h = (t - t0) / np.timedelta64(1, "h")
 
-    omega = 2 * np.pi / float(args.period_hours)
-    slow_cos = np.cos(omega * dt_h.to_numpy())
-    slow_sin = np.sin(omega * dt_h.to_numpy())
+        omega = 2 * np.pi / float(args.period_hours)
+        slow_cos = np.cos(omega * dt_h.to_numpy())
+        slow_sin = np.sin(omega * dt_h.to_numpy())
 
-    df["slow_cos"] = slow_cos.astype("float32")
-    df["slow_sin"] = slow_sin.astype("float32")
+        df["slow_cos"] = slow_cos.astype("float32")
+        df["slow_sin"] = slow_sin.astype("float32")
 
-    if args.use_modulated:
-        if "G_struct" in df.columns:
-            df["G_slow_cos"] = (df["G_struct"].to_numpy(dtype=float) * slow_cos).astype("float32")
-            df["G_slow_sin"] = (df["G_struct"].to_numpy(dtype=float) * slow_sin).astype("float32")
+        if args.use_modulated:
+            if "G_struct" in df.columns:
+                g = df["G_struct"].to_numpy(dtype=float)
+                df["G_slow_cos"] = (g * slow_cos).astype("float32")
+                df["G_slow_sin"] = (g * slow_sin).astype("float32")
+            else:
+                print("[warn] G_struct not found; skipping modulated slow-tick features.")
+        return df, t0
+
+    # streaming read/write
+    is_parquet = _is_parquet(args.panel)
+    writer = None
+    total = 0
+    t0_global = None
+
+    if chunk_rows:
+        if is_parquet:
+            import pyarrow.parquet as pq  # type: ignore
+            pf = pq.ParquetFile(args.panel)
+            iterator = (batch.to_pandas() for batch in pf.iter_batches(batch_size=chunk_rows))
         else:
-            print("[warn] G_struct not found; skipping modulated slow-tick features.")
+            iterator = pd.read_csv(args.panel, low_memory=False, chunksize=chunk_rows)
+    else:
+        iterator = [_read_any(args.panel)]
 
-    _write_any(args.out, df)
-    print(f"[done] wrote slow-tick features -> {args.out}  (rows={len(df):,})")
+    for ch in iterator:
+        df_chunk = ch
+        df_chunk, t0_global = process_chunk(df_chunk, t0_global)
+        if writer is None:
+            # init output based on first chunk type
+            writer = _write_any
+        _write_any(args.out, df_chunk if writer is _write_any else df_chunk)
+        total += len(df_chunk)
+
+    print(f"[done] wrote slow-tick features -> {args.out}  (rows={total:,})")
 
 
 if __name__ == "__main__":

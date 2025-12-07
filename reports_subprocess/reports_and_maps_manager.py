@@ -112,6 +112,53 @@ def _parse_leads(spec: str) -> List[int]:
 
 
 def main() -> int:
+    # Support mode-first calls (e.g., "summary") as used by run_pipeline.
+    argv = sys.argv[1:]
+    mode_first = None
+    if argv and not argv[0].startswith("--"):
+        mode_first = argv[0]
+        argv = argv[1:]
+
+    # Convenience dispatch for summary-only calls so pipeline can do:
+    #   reports_and_maps_manager.py summary --out-md ...
+    if mode_first == "summary":
+        ignore_flags = {"--chunk-rows", "--chunksize", "--parquet-rows"}
+        args_iter = iter(argv)
+        passthrough: List[str] = []
+        run_name = "auto"
+        out_dir = Path("results/reports")
+        out_md = None
+        for tok in args_iter:
+            if tok in ignore_flags:
+                # skip value if present
+                nxt = next(args_iter, None)
+                continue
+            if tok == "--run-name":
+                run_name = next(args_iter, run_name)
+                continue
+            if tok == "--out-dir":
+                out_dir = Path(next(args_iter, str(out_dir)))
+                continue
+            if tok == "--out-md":
+                out_md = Path(next(args_iter, "results/reports/summary_auto.md"))
+                continue
+            passthrough.append(tok)
+        if "--run-name" not in passthrough:
+            passthrough = ["--run-name", run_name] + passthrough
+        if "--out-dir" not in passthrough:
+            passthrough = ["--out-dir", str(out_dir)] + passthrough
+        script = HERE / "report_generate_summary.py"
+        ok, code = run_step("summary", script, passthrough)
+        if ok and out_md:
+            safe = Path(out_dir) / f"{run_name.strip().replace(' ', '_')}_report.txt"
+            try:
+                out_md.parent.mkdir(parents=True, exist_ok=True)
+                out_md.write_text(safe.read_text())
+                print(f"[manager] copied summary to {out_md}")
+            except Exception as e:
+                print(f"[manager] warning: could not copy summary to {out_md}: {e}")
+        return code
+
     ap = argparse.ArgumentParser(
         description="Bundle per-run maps + summary + sanity checks into a dated run folder.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -120,7 +167,7 @@ def main() -> int:
     # Core run identity
     ap.add_argument(
         "--run-name",
-        required=True,
+        default="auto",
         help="Human-readable name/tag for this run (used in summary filename).",
     )
     ap.add_argument(
@@ -302,8 +349,12 @@ def main() -> int:
         action="store_true",
         help="If set, stop on first failing step and exit with its code.",
     )
+    # Pipeline compatibility: accept chunking hints even though manager doesn't use them.
+    ap.add_argument("--chunk-rows", type=int, default=None, help="Ignored; accepted for pipeline compatibility.")
+    ap.add_argument("--chunksize", type=int, default=None, help="Alias for --chunk-rows (ignored).")
+    ap.add_argument("--parquet-rows", type=int, default=None, help="Ignored; accepted for pipeline compatibility.")
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     run_root = Path(args.run_root)
     run_dir = make_run_dir(run_root, args.run_date)
