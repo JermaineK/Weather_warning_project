@@ -121,6 +121,11 @@ def main():
         help="Per-lead viability thresholds CSV (optional).",
     )
     ap.add_argument(
+        "--seed-union",
+        default=None,
+        help="Seed union file (csv/parquet) to derive slow-tick diagnostics (optional).",
+    )
+    ap.add_argument(
         "--viability-horizons",
         default="24,48,72,120",
         help="Comma-separated horizons (hours) for conversion snapshot.",
@@ -279,30 +284,80 @@ def main():
     if exists_nonempty(metrics_path):
         try:
             m = json.loads(metrics_path.read_text())
-            base = m.get("overall", m) if isinstance(m, dict) else {}
-            keys = [
-                "roc_auc",
-                "pr_auc",
-                "brier",
-                "f1",
-                "fbeta",
-                "opt_threshold",
-                "thr_Fbeta",
-                "neg_pos_ratio",
-                "sample_frac",
-            ]
             lines = []
-            for k in keys:
-                if k in base:
-                    lines.append(f"{k}: {base[k]}")
-            if not lines and isinstance(m, dict):
-                for k, v in m.items():
-                    if isinstance(v, (int, float, str)) and len(lines) < 8:
-                        lines.append(f"{k}: {v}")
+            if isinstance(m, dict):
+                for split in ("train", "val", "overall"):
+                    if split in m and isinstance(m[split], dict):
+                        part = m[split]
+                        auc = part.get("roc_auc")
+                        ap = part.get("avg_precision") or part.get("pr_auc")
+                        brier = part.get("brier")
+                        thr = part.get("opt_threshold") or part.get("thr_Fbeta")
+                        pieces = [f"{split.title():<6}"]
+                        if auc is not None:
+                            pieces.append(f"AUC={float(auc):.3f}")
+                        if ap is not None:
+                            pieces.append(f"PRAUC={float(ap):.3f}")
+                        if brier is not None:
+                            pieces.append(f"Brier={float(brier):.4f}")
+                        if thr is not None:
+                            pieces.append(f"thr={thr}")
+                        if len(pieces) > 1:
+                            lines.append("  " + "  ".join(pieces))
+                if not lines:
+                    base = m.get("overall", m)
+                    for k, v in base.items():
+                        if isinstance(v, (int, float, str)) and len(lines) < 8:
+                            lines.append(f"{k}: {v}")
             if lines:
                 metrics_txt = "\n".join(lines)
         except Exception:
             metrics_txt = ""
+
+    # ---- Slow-tick diagnostics (optional) ----
+    slowtick_txt = ""
+    union_path = None
+    if args.seed_union:
+        union_path = Path(args.seed_union)
+    elif args.run_name:
+        union_path = Path(f"results/seedmaps/{args.run_name}_union_byhour.parquet")
+    if union_path and exists_nonempty(union_path):
+        try:
+            seeds = read_table_any(union_path)
+            if seeds is None:
+                seeds = read_table_any(union_path, nrows=1_000_000)
+            if seeds is not None and not seeds.empty:
+                prob_col = None
+                for c in ("prob_max", "prob_viable", "prob"):
+                    if c in seeds.columns:
+                        prob_col = c
+                        break
+                if prob_col is None:
+                    prob_col = "prob_max"
+                    seeds[prob_col] = np.nan
+                hi = seeds
+                if prob_col in seeds:
+                    hi = seeds[pd.to_numeric(seeds[prob_col], errors="coerce") >= 0.5]
+                has_slow = {"slow_cos", "slow_sin"}.issubset(seeds.columns)
+                if has_slow and not hi.empty:
+                    phase = np.arctan2(
+                        pd.to_numeric(hi["slow_sin"], errors="coerce"),
+                        pd.to_numeric(hi["slow_cos"], errors="coerce"),
+                    )
+                    phase_hours = (phase % (2 * np.pi)) * 24.0 / (2 * np.pi)
+                    bins = np.arange(0, 25, 3)
+                    hist, _ = np.histogram(phase_hours, bins=bins)
+                    slow_lines = [
+                        f"High-probability seeds (prob >=0.5): {len(hi):,}",
+                        f"Mean slow-phase (h): {float(np.nanmean(phase_hours)):.2f}",
+                        f"Std slow-phase (h): {float(np.nanstd(phase_hours)):.2f}",
+                        "Phase distribution (3h bins):",
+                    ]
+                    for k in range(len(bins) - 1):
+                        slow_lines.append(f\"  {bins[k]:2.0f}–{bins[k+1]:2.0f} h : {int(hist[k]):7d}\")
+                    slowtick_txt = \"\\n\".join(slow_lines)
+        except Exception:
+            slowtick_txt = ""
 
     # ---- Proto outcomes / conversion CSV (optional) ----
     proto_txt = ""
@@ -378,6 +433,11 @@ def main():
             f.write("Proto outcomes / conversion rates\n")
             f.write("-" * 72 + "\n")
             f.write(proto_txt.strip() + "\n\n")
+
+        if slowtick_txt:
+            f.write("Slow-tick diagnostics\n")
+            f.write("-" * 72 + "\n")
+            f.write(slowtick_txt.strip() + "\n\n")
 
         # Extras
         if extras:

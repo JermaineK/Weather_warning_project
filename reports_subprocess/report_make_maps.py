@@ -39,7 +39,13 @@ def try_imports():
         return None
 
 
-def plot_points(df: pd.DataFrame, out_png: Path, title: str, value_col: str | None = None):
+def plot_points(
+    df: pd.DataFrame,
+    out_png: Path,
+    title: str,
+    value_col: str | None = None,
+    time_band: bool = False,
+):
     """
     Simple lat/lon scatter plot.
 
@@ -73,7 +79,15 @@ def plot_points(df: pd.DataFrame, out_png: Path, title: str, value_col: str | No
 
     cvals = None
     clabel = None
-    if value_col and value_col in d.columns:
+    colors = None
+    if time_band and "time" in d.columns:
+        try:
+            t = pd.to_datetime(d["time"], utc=True, errors="coerce").dt.tz_convert(None)
+            colors = t.dt.month.fillna(-1).astype(int)
+            clabel = "month"
+        except Exception:
+            colors = None
+    if colors is None and value_col and value_col in d.columns:
         cvals = pd.to_numeric(d[value_col], errors="coerce")
         if cvals.notna().any():
             clabel = value_col
@@ -83,8 +97,12 @@ def plot_points(df: pd.DataFrame, out_png: Path, title: str, value_col: str | No
     fig = plt.figure(figsize=(10, 6))
     ax = fig.add_subplot(111)
 
-    if cvals is not None:
-        sc = ax.scatter(d["lon"], d["lat"], s=6, c=cvals, alpha=0.8)
+    if colors is not None:
+        sc = ax.scatter(d["lon"], d["lat"], s=6, c=colors, alpha=0.8, cmap="tab20")
+        cb = fig.colorbar(sc, ax=ax)
+        cb.set_label(clabel or "band")
+    elif cvals is not None:
+        sc = ax.scatter(d["lon"], d["lat"], s=6, c=cvals, alpha=0.8, cmap="viridis")
         cb = fig.colorbar(sc, ax=ax)
         cb.set_label(clabel or value_col)
     else:
@@ -170,6 +188,11 @@ def main():
         default="prob_max",
         help="Optional numeric column in union file to colour by (default: prob_max).",
     )
+    ap.add_argument(
+        "--color-by-time-band",
+        action="store_true",
+        help="Colour union points by month (time bands) instead of numeric value.",
+    )
     args = ap.parse_args()
 
     out_dir = _infer_out_dir(args.run_name, args.out_dir)
@@ -187,6 +210,7 @@ def main():
                 out_dir / "union_points.png",
                 f"Seed Union (by hour){run_label}",
                 value_col=args.union_value_col,
+                time_band=args.color_by_time_band,
             )
         else:
             print(f"[maps] union file missing lat/lon: {upath}")

@@ -156,6 +156,16 @@ def main():
     ap.add_argument("--run-name", default="run")
     ap.add_argument("--time-format", default=None, help="Optional strptime format for non-standard time strings")
     ap.add_argument("--write-parquet", action="store_true", help="Also write Parquet copies next to CSVs")
+    ap.add_argument(
+        "--slowtick-panel",
+        default=None,
+        help="Optional slowtick panel (parquet) with slow_cos/slow_sin/G_slow_* to merge onto union_byhour.",
+    )
+    ap.add_argument(
+        "--slowtick-cols",
+        default="slow_cos,slow_sin,G_slow_cos,G_slow_sin",
+        help="Comma-separated columns to pull from slowtick panel when provided.",
+    )
     # preprocess normalize-lon to handle tokens like "-180..180"
     argv = []
     skip = False
@@ -240,6 +250,20 @@ def main():
     out_starts = out_dir / f"{args.run_name}_starts_byhour.csv"
 
     agg = agg.rename(columns={"time_h": "time"})
+
+    # Optional slowtick join for diagnostics / maps
+    if args.slowtick_panel:
+        slow_cols = [c.strip() for c in args.slowtick_cols.split(",") if c.strip()]
+        try:
+            slow = pd.read_parquet(
+                args.slowtick_panel, columns=["time", "lat", "lon", *slow_cols]
+            )
+            before = len(agg)
+            agg = agg.merge(slow, on=["time", "lat", "lon"], how="left")
+            print(f"[slowtick] joined {len(agg)} rows (from {before}) using {args.slowtick_panel}")
+        except Exception as e:
+            print(f"[warn] failed to join slowtick panel {args.slowtick_panel}: {e}")
+
     agg.to_csv(out_union, index=False, date_format="%Y-%m-%d %H:%M:%S")
     starts.to_csv(out_starts, index=False, date_format="%Y-%m-%d %H:%M:%S")
 
