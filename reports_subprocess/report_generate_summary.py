@@ -354,8 +354,8 @@ def main():
                         "Phase distribution (3h bins):",
                     ]
                     for k in range(len(bins) - 1):
-                        slow_lines.append(f\"  {bins[k]:2.0f}–{bins[k+1]:2.0f} h : {int(hist[k]):7d}\")
-                    slowtick_txt = \"\\n\".join(slow_lines)
+                        slow_lines.append(f"  {bins[k]:2.0f}-{bins[k+1]:2.0f} h : {int(hist[k]):7d}")
+                    slowtick_txt = "\n".join(slow_lines)
         except Exception:
             slowtick_txt = ""
 

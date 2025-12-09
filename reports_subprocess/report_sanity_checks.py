@@ -99,7 +99,7 @@ def main() -> None:
                 found_any = True
                 if fp.suffix.lower() in {".parquet", ".pq", ".pqt"}:
                     try:
-                        sample = pd.read_parquet(fp, columns=["time"], nrows=500)
+                        sample = pd.read_parquet(fp, columns=["time"])
                         rows = len(sample)
                         print(f"[sanity] alerts file: {fp.name}  sample_rows={rows}")
                         if rows == 0:

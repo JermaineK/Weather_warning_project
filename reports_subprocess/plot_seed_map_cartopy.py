@@ -36,9 +36,10 @@ def main():
     ap = argparse.ArgumentParser(description="Cartopy seed map renderer")
     ap.add_argument("--seeds", required=True, help="CSV/Parquet with at least: lat, lon[, value][, time]")
     ap.add_argument("--out-png", required=True, help="Output PNG path (or prefix if --per-hour).")
-    ap.add_argument("--value-col", default=None, help="Optional numeric column to color/size by")
+    ap.add_argument("--value-col", default="prob_max", help="Optional numeric column to color/size by")
     ap.add_argument("--time-col", default=None, help="Optional time column; if provided with --per-hour, make one map/hour")
     ap.add_argument("--per-hour", action="store_true", help="Produce one PNG per hour if time is available")
+    ap.add_argument("--min-prob", type=float, default=0.3, help="Optional minimum prob/value to plot (filters points)")
     ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="none")
     ap.add_argument("--area", default=None, help='Optional AOI "latN,lonW,latS,lonE"')
     ap.add_argument("--title", default=None, help="Figure title")
@@ -58,7 +59,11 @@ def main():
     df = df.copy()
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = _norm_lon(df["lon"], args.normalize_lon)
+    if args.min_prob is not None and args.value_col and args.value_col in df.columns:
+        df = df.loc[pd.to_numeric(df[args.value_col], errors="coerce") >= float(args.min_prob)]
     df = df.dropna(subset=["lat","lon"]).reset_index(drop=True)
+    if len(df) > 20000:
+        df = df.sample(20000, random_state=42)
 
     if args.area:
         latN, lonW, latS, lonE = _parse_area(args.area)
