@@ -39,9 +39,15 @@ def main():
     ap.add_argument("--value-col", default="prob_max", help="Optional numeric column to color/size by")
     ap.add_argument("--time-col", default=None, help="Optional time column; if provided with --per-hour, make one map/hour")
     ap.add_argument("--per-hour", action="store_true", help="Produce one PNG per hour if time is available")
-    ap.add_argument("--min-prob", type=float, default=0.3, help="Optional minimum prob/value to plot (filters points)")
+    ap.add_argument("--flag-col", default=None, help="Optional flag column; if provided, filter to rows == 1")
+    ap.add_argument("--min-prob", type=float, default=0.5, help="Minimum value/prob to plot (filters points)")
+    ap.add_argument("--top-quantile", type=float, default=None, help="Keep only rows with value_col above this quantile (0-1)")
     ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="none")
     ap.add_argument("--area", default=None, help='Optional AOI "latN,lonW,latS,lonE"')
+    ap.add_argument("--tracks", default=None, help="Optional tracks file to time/space-filter seeds (CSV/Parquet).")
+    ap.add_argument("--storm-radius-deg", type=float, default=5.0, help="Lat/lon padding around track bbox for filtering.")
+    ap.add_argument("--storm-window-before-h", type=float, default=240.0, help="Hours before track times to include seeds.")
+    ap.add_argument("--storm-window-after-h", type=float, default=72.0, help="Hours after track times to include seeds.")
     ap.add_argument("--title", default=None, help="Figure title")
     ap.add_argument("--dpi", type=int, default=180)
     args = ap.parse_args()
@@ -59,8 +65,53 @@ def main():
     df = df.copy()
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = _norm_lon(df["lon"], args.normalize_lon)
+    if args.flag_col and args.flag_col in df.columns:
+        df = df.loc[pd.to_numeric(df[args.flag_col], errors="coerce").fillna(0) > 0]
     if args.min_prob is not None and args.value_col and args.value_col in df.columns:
         df = df.loc[pd.to_numeric(df[args.value_col], errors="coerce") >= float(args.min_prob)]
+    if args.top_quantile is not None and args.value_col and args.value_col in df.columns:
+        vals = pd.to_numeric(df[args.value_col], errors="coerce")
+        cutoff = vals.quantile(float(args.top_quantile))
+        df = df.loc[vals >= cutoff]
+    # Optional filter: restrict to storms window/bbox
+    if args.tracks:
+        try:
+            tp = str(args.tracks).lower()
+            if tp.endswith((".parquet",".parq",".pq")):
+                tr = pd.read_parquet(args.tracks)
+            else:
+                tr = pd.read_csv(args.tracks)
+            if {"lat","lon","time"}.issubset(tr.columns):
+                tr = tr.copy()
+                tr["lat"] = pd.to_numeric(tr["lat"], errors="coerce")
+                tr["lon"] = _norm_lon(tr["lon"], args.normalize_lon)
+                ttime = pd.to_datetime(tr["time"], utc=True, errors="coerce").dt.tz_convert(None)
+                tr = tr.assign(time=ttime).dropna(subset=["lat","lon","time"])
+                if args.area:
+                    latN, lonW, latS, lonE = _parse_area(args.area)
+                    tr = tr.loc[(tr["lat"] <= latN) & (tr["lat"] >= latS) &
+                                (tr["lon"] >= lonW) & (tr["lon"] <= lonE)]
+                if not tr.empty:
+                    tmin = tr["time"].min() - pd.Timedelta(hours=args.storm_window_before_h)
+                    tmax = tr["time"].max() + pd.Timedelta(hours=args.storm_window_after_h)
+                    lat_min = tr["lat"].min() - args.storm_radius_deg
+                    lat_max = tr["lat"].max() + args.storm_radius_deg
+                    lon_min = tr["lon"].min() - args.storm_radius_deg
+                    lon_max = tr["lon"].max() + args.storm_radius_deg
+                    if args.time_col and args.time_col in df.columns:
+                        tcol = args.time_col
+                    else:
+                        # auto-detect time column
+                        tcol = "time" if "time" in df.columns else None
+                    if tcol:
+                        tseeds = pd.to_datetime(df[tcol], utc=True, errors="coerce").dt.tz_convert(None)
+                        df = df.loc[
+                            tseeds.between(tmin, tmax)
+                            & df["lat"].between(lat_min, lat_max)
+                            & df["lon"].between(lon_min, lon_max)
+                        ]
+        except Exception as e:
+            print(f"[map] warning: failed to apply track filter: {e}")
     df = df.dropna(subset=["lat","lon"]).reset_index(drop=True)
     if len(df) > 20000:
         df = df.sample(20000, random_state=42)

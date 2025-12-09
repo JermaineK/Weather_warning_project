@@ -390,9 +390,13 @@ def main() -> int:
     if not args.skip_quick_maps:
         script = HERE / "report_make_maps.py"
         step_args = [
+            "--run-name", args.run_name,
             "--union-csv", union_csv,
             "--patches-csv", patches_csv,
             "--out-dir", str(maps_dir / "quick"),
+            "--union-value-col", "prob_max",
+            "--min-prob", "0.5",
+            "--color-by-time-band",
         ]
         ok, code = run_step("quick-maps", script, step_args)
         if not ok and args.strict:
@@ -405,8 +409,17 @@ def main() -> int:
         step_args = [
             "--seeds", union_csv,
             "--out-png", str(out_png),
+            "--value-col", "prob_max",
+            "--min-prob", "0.5",
             "--title", f"Seeds (union by hour) — {args.run_name}",
         ]
+        if ibtracs_path:
+            step_args += [
+                "--tracks", ibtracs_path,
+                "--storm-window-before-h", "240",
+                "--storm-window-after-h", "72",
+                "--storm-radius-deg", "5.0",
+            ]
         ok, code = run_step("seed-map-cartopy", script, step_args)
         if not ok and args.strict:
             return code
@@ -435,13 +448,15 @@ def main() -> int:
         if not ok and args.strict:
             return code
 
-    # --- STEP 4: seed–track match map (cartopy) ---
+    # --- STEP 4: seed-track match map (cartopy) ---
     if (not args.skip_ibtracs_maps) and Path(matches_csv).exists():
         script = HERE / "plot_seed_track_map_cartopy.py"
         out_png = maps_dir / "seed_track_map.png"
         step_args = [
             "--matches", matches_csv,
             "--out", str(out_png),
+            "--value-col", "prob_max",
+            "--min-prob", "0.5",
         ]
         ok, code = run_step("seed-track-map", script, step_args)
         if not ok and args.strict:

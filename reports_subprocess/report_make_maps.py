@@ -45,6 +45,9 @@ def plot_points(
     title: str,
     value_col: str | None = None,
     time_band: bool = False,
+    min_prob: float | None = None,
+    flag_col: str | None = None,
+    top_quantile: float | None = None,
 ):
     """
     Simple lat/lon scatter plot.
@@ -72,6 +75,16 @@ def plot_points(
     if d.empty:
         print(f"[maps] no finite lat/lon for {out_png.name}; skipping.")
         return
+
+    # Filters
+    if flag_col and flag_col in d.columns:
+        d = d.loc[pd.to_numeric(d[flag_col], errors="coerce").fillna(0) > 0]
+    if min_prob is not None and value_col and value_col in d.columns:
+        d = d.loc[pd.to_numeric(d[value_col], errors="coerce") >= float(min_prob)]
+    if top_quantile is not None and value_col and value_col in d.columns:
+        vals = pd.to_numeric(d[value_col], errors="coerce")
+        cutoff = vals.quantile(float(top_quantile))
+        d = d.loc[vals >= cutoff]
 
     # Sample to avoid huge PNGs
     if len(d) > 10_000:
@@ -193,6 +206,9 @@ def main():
         action="store_true",
         help="Colour union points by month (time bands) instead of numeric value.",
     )
+    ap.add_argument("--min-prob", type=float, default=0.5, help="Minimum value/prob to plot (filters points).")
+    ap.add_argument("--flag-col", default=None, help="Optional flag column to require ==1.")
+    ap.add_argument("--top-quantile", type=float, default=None, help="Keep only rows above this quantile of union-value-col.")
     args = ap.parse_args()
 
     out_dir = _infer_out_dir(args.run_name, args.out_dir)
@@ -211,6 +227,9 @@ def main():
                 f"Seed Union (by hour){run_label}",
                 value_col=args.union_value_col,
                 time_band=args.color_by_time_band,
+                min_prob=args.min_prob,
+                flag_col=args.flag_col,
+                top_quantile=args.top_quantile,
             )
         else:
             print(f"[maps] union file missing lat/lon: {upath}")
