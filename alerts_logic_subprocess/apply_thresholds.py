@@ -4,7 +4,7 @@
 """
 apply_thresholds.py
 Apply a trained (and optionally calibrated) grid model to a labelled CSV/Parquet,
-producing BASE alerts with a probability column and a binary flag using a threshold.
+producing viability-style BASE alerts with a probability column and a binary flag using a threshold.
 
 Key features:
 - Per-lead aware: uses bundle['per_lead_models'][lead] when present; otherwise falls back to bundle['model'].
@@ -31,8 +31,23 @@ import joblib
 def read_any(path: str, usecols=None) -> pd.DataFrame:
     low = path.lower()
     if low.endswith((".parquet", ".parq", ".pq")):
-        return pd.read_parquet(path, columns=usecols if usecols else None)
-    return pd.read_csv(path, compression="infer", usecols=usecols if usecols else None, low_memory=False)
+        try:
+            return pd.read_parquet(path, columns=usecols if usecols else None)
+        except Exception:
+            # If some requested columns are missing, intersect with available schema
+            try:
+                import pyarrow.parquet as pq
+                schema = pq.read_schema(path)
+                available = set(schema.names)
+                cols = [c for c in usecols or [] if c in available] or None
+                return pd.read_parquet(path, columns=cols)
+            except Exception:
+                return pd.read_parquet(path)
+    try:
+        return pd.read_csv(path, compression="infer", usecols=usecols if usecols else None, low_memory=False)
+    except ValueError:
+        # Fallback: read all and subset later if CSV columns mismatch
+        return pd.read_csv(path, compression="infer", low_memory=False)
 
 def write_any(path: str, df: pd.DataFrame) -> None:
     p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +82,29 @@ def parse_area(aoi: str | None):
     latN, lonW, latS, lonE = [float(x.strip()) for x in aoi.split(",")]
     return latN, lonW, latS, lonE
 
+def _strip_choice(val: str) -> str:
+    """Normalize choice strings to allow leading/trailing spaces (YAML quirks)."""
+    return str(val).strip()
+
+def _preprocess_norm(argv: list[str]) -> list[str]:
+    """
+    Allow --normalize-lon values that look like options (e.g., -180..180) by
+    rewriting them to --normalize-lon=<value> before argparse runs.
+    """
+    out = []
+    skip = False
+    for i, tok in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if tok == "--normalize-lon" and i + 1 < len(argv):
+            val = argv[i + 1]
+            out.append(f"--normalize-lon={val}")
+            skip = True
+        else:
+            out.append(tok)
+    return out
+
 def _estimator_has_internal_scaler(est) -> bool:
     # Detect a Pipeline with a StandardScaler-ish stage
     try:
@@ -92,6 +130,31 @@ def _load_thr_map(spec: str | None) -> dict[int, float]:
     for k, v in obj.items():
         out[int(k)] = float(v)
     return out
+
+
+def _parse_feature_arg(tokens) -> list[str]:
+    if not tokens:
+        return []
+    out: list[str] = []
+    for tok in tokens:
+        for part in str(tok).replace(",", " ").split():
+            if part.strip():
+                out.append(part.strip())
+    return out
+
+
+def _load_metrics_features(path: str | None) -> list[str]:
+    if not path:
+        return []
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        meta = json.loads(p.read_text())
+        feats = meta.get("features", [])
+        return [str(f) for f in feats]
+    except Exception:
+        return []
 
 # ------------- feature pipeline -------------
 
@@ -162,68 +225,117 @@ def predict_prob(est, X: np.ndarray) -> np.ndarray:
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Apply thresholds to produce BASE alerts from a labelled grid.")
-    ap.add_argument("--labelled", required=True, help="CSV(.gz) or Parquet with features + meta (time,lat,lon).")
-    ap.add_argument("--model", required=True, help="Trained bundle .pkl (possibly calibrated or per-lead).")
-    ap.add_argument("--lead-hours", type=int, required=True, help="Lead in hours for which we’re applying the model.")
-    ap.add_argument("--thr", type=float, required=False, help="Global probability threshold (overridden by --thr-map).")
-    ap.add_argument("--thr-map", default=None, help='JSON string or path with per-lead thresholds, e.g. {"24":0.08,"72":0.04}')
-    ap.add_argument("--out", required=True, help="Output CSV(.gz)/Parquet with prob + flag.")
-    ap.add_argument("--prob-col", default="prob", help="Probability column name (default: prob).")
-    ap.add_argument("--flag-col", default="alert_final", help="Binary flag column name (default: alert_final).")
-    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="none",
-                    help="Normalize lon in the OUTPUT only (default: none). AOI must match this frame.")
+    ap.add_argument("--labelled",
+                    default="data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet",
+                    help="CSV(.gz) or Parquet with features + meta (time,lat,lon,row_id).")
+    ap.add_argument("--model",
+                    default="models/viability_model.pkl",
+                    help="Trained bundle .pkl (possibly calibrated or per-lead).")
+    ap.add_argument("--metrics-json",
+                    default="models/viability_model_metrics.json",
+                    help="Optional metrics JSON with feature list (used when model is not a dict bundle).")
+    ap.add_argument("--features", nargs="+", default=None,
+                    help="Optional explicit feature list (space or comma separated).")
+    ap.add_argument("--lead-hours", type=int, default=None,
+                    help="Optional lead in hours (used for per-lead models/threshold maps).")
+    ap.add_argument("--thr", type=float, required=False, default=0.15,
+                    help="Global probability threshold (overridden by --thr-map).")
+    ap.add_argument("--thr-map", default=None,
+                    help='JSON string or path with per-lead thresholds, e.g. {"24":0.08,"72":0.04}')
+    ap.add_argument("--out", required=False, default=None, help="Output CSV(.gz)/Parquet with prob + flag.")
+    ap.add_argument("--prob-col", default="prob_viable", help="Probability column name (default: prob_viable).")
+    ap.add_argument("--flag-col", default="alert_base", help="Binary flag column name (default: alert_base).")
+    ap.add_argument(
+        "--normalize-lon",
+        choices=["none", "-180..180", "0..360"],
+        default="-180..180",
+        type=_strip_choice,
+        help="Normalize lon in the OUTPUT only (default: -180..180). AOI must match this frame.",
+    )
     ap.add_argument("--time-format", default=None, help="Optional strftime to parse time if non-standard.")
     ap.add_argument("--area", default=None, help='Optional crop "latN,lonW,latS,lonE" on OUTPUT coords.')
     ap.add_argument("--chunk-rows", type=int, default=1_500_000, help="Chunk size for large CSV inputs.")
     ap.add_argument("--strict-features", action="store_true", help="Error if any required feature is missing.")
     ap.add_argument("--force-csv-out-when-chunking", action="store_true",
                     help="When input is CSV and out is Parquet, force a CSV(.gz) sibling. Otherwise error.")
-    return ap.parse_args()
+    ap.add_argument("--run-name", default=None, help="Optional run name for default outputs (alerts_<run>_base.parquet).")
+    ap.add_argument("--passthrough-cols", default="row_id,ilat,ilon",
+                    help="Comma list of extra columns to keep if present (e.g., row_id,ilat,ilon).")
+    argv = _preprocess_norm(sys.argv[1:])
+    return ap.parse_args(argv)
 
 # ------------- main -------------
 
 def main():
     args = parse_args()
 
+    passthrough = [c.strip() for c in str(args.passthrough_cols).split(",") if c.strip()]
+    feats_override = _parse_feature_arg(args.features)
+    feats_from_metrics = _load_metrics_features(args.metrics_json)
+
     # Load bundle
     bundle = joblib.load(args.model)
-    feats  = list(bundle["features"])
-    scaler = bundle.get("scaler")
-    imp    = bundle.get("imputer_stats", None)
-    clip   = bundle.get("clip_stats", None)
+    per_lead = {}
+    imp = None
+    clip = None
+    scaler = None
 
-    # Choose the estimator: per-lead or global
-    per_lead = bundle.get("per_lead_models", {}) or {}
-    if isinstance(per_lead, dict) and (args.lead_hours in per_lead):
-        est = per_lead[args.lead_hours]
-        print(f"[APPLY] Using per-lead estimator for +{args.lead_hours}h.")
+    if isinstance(bundle, dict):
+        feats = list(bundle.get("features", feats_override or feats_from_metrics))
+        scaler = bundle.get("scaler")
+        imp = bundle.get("imputer_stats", None)
+        clip = bundle.get("clip_stats", None)
+        per_lead = bundle.get("per_lead_models", {}) or {}
+        est = bundle.get("model")
+        if isinstance(per_lead, dict) and args.lead_hours is not None and (args.lead_hours in per_lead):
+            est = per_lead[args.lead_hours]
+            print(f"[APPLY] Using per-lead estimator for +{args.lead_hours}h.")
+        else:
+            print(f"[APPLY] Using global estimator.")
     else:
-        est = bundle["model"]
-        print(f"[APPLY] Using global estimator (no per-lead model for +{args.lead_hours}h).")
+        est = bundle
+        feats = feats_override or feats_from_metrics
+        if not feats:
+            raise SystemExit("Model bundle lacks features; provide --features or a --metrics-json with 'features'.")
+        print("[APPLY] Using plain estimator (features from metrics/override).")
+
+    if est is None:
+        raise SystemExit("Model estimator missing from bundle.")
+    if not feats:
+        raise SystemExit("Feature list empty; provide --features or --metrics-json with 'features'.")
 
     # If estimator is a Pipeline that already scales, skip external scaling
     allow_external_scale = not _estimator_has_internal_scaler(est)
 
     # Threshold selection (map overrides)
     thr_map = _load_thr_map(args.thr_map)
-    if args.lead_hours in thr_map:
+    if args.lead_hours is not None and args.lead_hours in thr_map:
         thr = float(thr_map[args.lead_hours])
         print(f"[APPLY] Threshold from map for +{args.lead_hours}h: {thr}")
     else:
-        if args.thr is None:
-            print("[ERROR] --thr is required when no --thr-map value is provided for this lead.", file=sys.stderr)
+        if args.thr is None and not thr_map:
+            print("[ERROR] Provide --thr or a --thr-map with this lead.", file=sys.stderr)
             sys.exit(2)
-        thr = float(args.thr)
+        thr = float(args.thr if args.thr is not None else list(thr_map.values())[0])
 
     # Columns to load
-    need_cols = ["time", "lat", "lon", *feats]
+    need_cols = ["time", "lat", "lon", *feats, *passthrough]
 
     path = args.labelled
     low = path.lower()
     aoi = parse_area(args.area)
 
+    # Resolve default out path
+    out_path_cli = args.out
+    if out_path_cli is None:
+        if args.run_name:
+            out_path_cli = f"results/alerts/alerts_{args.run_name}_base.parquet"
+        else:
+            out_path_cli = "results/alerts/alerts_base.parquet"
+
     def finalize_and_write(df_meta: pd.DataFrame, probs: np.ndarray):
-        out = df_meta[["time","lat","lon"]].copy()
+        keep_cols = [c for c in ["time","lat","lon", *passthrough] if c in df_meta.columns]
+        out = df_meta[keep_cols].copy()
         out[args.prob_col] = probs
         out[args.flag_col] = (out[args.prob_col] >= thr).astype(int)
 
@@ -244,18 +356,23 @@ def main():
 
     if low.endswith((".parquet",".parq",".pq")):
         df = read_any(path, usecols=need_cols)
+        missing_feats = [c for c in feats if c not in df.columns]
+        for c in missing_feats:
+            df[c] = np.nan
+        if missing_feats:
+            print(f"[warn] {len(missing_feats)} feature(s) missing from input parquet; filling with imputer stats/0.0: {missing_feats[:8]}{' ...' if len(missing_feats)>8 else ''}")
         X = build_matrix(df, feats, imp, clip, scaler,
                          allow_scale=allow_external_scale,
                          strict_features=args.strict_features)
         prob = predict_prob(est, X)
         out = finalize_and_write(df, prob)
-        write_any(args.out, out)
+        write_any(out_path_cli, out)
         total_rows = len(out)
-        print(f"[APPLY] Wrote {len(out):,} rows -> {args.out}")
+        print(f"[APPLY] Wrote {len(out):,} rows -> {out_path_cli}")
         return
 
     # CSV: chunked
-    out_path = Path(args.out); out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path = Path(out_path_cli); out_path.parent.mkdir(parents=True, exist_ok=True)
     wants_parquet = out_path.suffix.lower() in (".parquet", ".parq", ".pq")
     if wants_parquet and not args.force_csv_out_when_chunking:
         print("[ERROR] Parquet output with chunked CSV input is unsafe. "
@@ -273,6 +390,7 @@ def main():
 
     for i, df in enumerate(pd.read_csv(path, compression="infer", chunksize=int(args.chunk_rows), low_memory=False)):
         keep = [c for c in ["time","lat","lon"] if c in df.columns] + [c for c in feats if c in df.columns]
+        keep += [c for c in passthrough if c in df.columns]
         for req in ["time","lat","lon"]:
             if req not in df.columns:
                 df[req] = np.nan

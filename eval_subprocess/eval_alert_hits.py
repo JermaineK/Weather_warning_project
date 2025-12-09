@@ -73,7 +73,8 @@ def by_hour_sum(t: pd.Series, v: np.ndarray) -> pd.Series:
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Evaluate grid alerts against truth (lead-aware).")
-    ap.add_argument("--labelled", required=True,
+    ap.add_argument("--labelled",
+                    default="data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet",
                     help="Labelled grid with time, lat, lon, truth column.")
     ap.add_argument("--alerts", required=True,
                     help="Alerts CSV/Parquet with time, lat, lon, flag column.")
@@ -83,14 +84,20 @@ def parse_args():
                     help="Alert flag column in alerts (default: alert_final).")
     ap.add_argument("--truth-col", default="storm_window",
                     help="Truth/target column in labelled grid (default: storm_window).")
+    ap.add_argument("--truth-mode", choices=["storm_window", "t_to_storm_leq"], default="storm_window",
+                    help="Truth definition: storm_window flag or t_to_storm_min_h <= lead-hours.")
+    ap.add_argument("--lead-col", default="t_to_storm_min_h",
+                    help="Lead column when using truth-mode=t_to_storm_leq.")
     ap.add_argument("--time-col", default="time",
                     help="Time column name shared by labelled/alerts (default: time).")
-    ap.add_argument("--normalize-lon", choices=["none", "-180..180", "0..360"], default="none",
+    ap.add_argument("--normalize-lon", choices=["none", "-180..180", "0..360"], default="-180..180",
                     help="Longitude frame (must match rest of pipeline).")
     ap.add_argument("--grid-decimals", type=int, default=None,
                     help="If set, round lat/lon to this many decimals before merging.")
     ap.add_argument("--out-csv", default=None,
                     help="Optional metrics CSV path (default: beside alerts, *_eval_lead{L}.csv).")
+    ap.add_argument("--run-name", default=None,
+                    help="Optional run name to stamp default output (results/metrics/<run>_alert_hits_lead{L}.csv).")
     return ap.parse_args()
 
 
@@ -109,7 +116,7 @@ def main():
 
     # ---- labelled (truth) ----
     lab = read_any(a.labelled)
-    need_lab = {a.time_col, "lat", "lon", a.truth_col}
+    need_lab = {a.time_col, "lat", "lon", a.truth_col, a.lead_col}
     if not need_lab.issubset(lab.columns):
         raise ValueError(
             f"Labelled missing {sorted(need_lab)}; got {sorted(lab.columns)[:20]} ..."
@@ -120,6 +127,9 @@ def main():
     lab["lat"] = pd.to_numeric(lab["lat"], errors="coerce")
     lab["lon"] = norm_lon(lab["lon"], a.normalize_lon)
     lab[a.truth_col] = binarize(lab[a.truth_col])
+    if a.truth_mode == "t_to_storm_leq":
+        lead_vals = pd.to_numeric(lab[a.lead_col], errors="coerce")
+        lab[a.truth_col] = ((lead_vals > 0) & (lead_vals <= lead_h)).astype(np.int8)
     lab = lab.dropna(subset=[a.time_col, "lat", "lon"]).reset_index(drop=True)
     lab = maybe_round_grid(lab, a.grid_decimals)
 
@@ -153,12 +163,17 @@ def main():
         suffixes=("_al", "_lab"),
     )
 
+    default_out = (
+        f"results/metrics/{a.run_name}_alert_hits_lead{lead_h}.csv"
+        if a.run_name else None
+    )
+
     if df.empty:
         print(
             f"[eval] No overlaps after lead shift (lead={lead_h}h). "
             f"Check lon frame, grid rounding, and that alerts preserve (time,lat,lon)."
         )
-        outp = a.out_csv or (str(Path(a.alerts).with_suffix("")) + f"_eval_lead{lead_h}.csv")
+        outp = a.out_csv or default_out or (str(Path(a.alerts).with_suffix("")) + f"_eval_lead{lead_h}.csv")
         Path(outp).parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(
             [{
@@ -224,7 +239,7 @@ def main():
     )
 
     # ---- write metrics CSV ----
-    outp = a.out_csv or (str(Path(a.alerts).with_suffix("")) + f"_eval_lead{lead_h}.csv")
+    outp = a.out_csv or default_out or (str(Path(a.alerts).with_suffix("")) + f"_eval_lead{lead_h}.csv")
     Path(outp).parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
         [{

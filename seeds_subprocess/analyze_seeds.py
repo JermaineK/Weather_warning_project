@@ -23,11 +23,16 @@ CANDIDATE_TIME_COLS = ["time", "issue_time", "valid_time", "datetime"]
 CANDIDATE_FLAG_COLS = ["seed", "alert", "alert_final", "alert_throttled"]
 CANDIDATE_PROB_COLS = ["prob", "p", "pgeom", "p_seed"]
 
-def read_any(path: str | Path, columns: Optional[List[str]] = None) -> pd.DataFrame:
+def read_any(path: str | Path, columns: Optional[List[str]] = None, chunk_rows: int = 0) -> pd.DataFrame:
     p = str(path).strip()
     low = p.lower()
     if low.endswith((".parquet", ".pq")):
         return pd.read_parquet(p, columns=columns)
+    if chunk_rows and chunk_rows > 0:
+        parts = []
+        for chunk in pd.read_csv(p, compression="infer", low_memory=False, usecols=columns, chunksize=int(chunk_rows)):
+            parts.append(chunk)
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
     try:
         return pd.read_csv(p, compression="infer", low_memory=False, usecols=columns)
     except pd.errors.EmptyDataError:
@@ -142,12 +147,13 @@ def main():
     ap.add_argument("--flag-col", default=None)
     ap.add_argument("--prob-thr", type=float, default=0.0, help="If no flag col, set flag = (prob > thr).")
     ap.add_argument("--time-format", default=None)
-    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="none")
+    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="-180..180")
     ap.add_argument("--area", default=None, help='Optional crop "latN,lonW,latS,lonE" after lon normalization.')
     ap.add_argument("--topk", type=int, default=50)
     ap.add_argument("--bins", type=int, default=60)
     ap.add_argument("--save-parquet", action="store_true", help="Also save derived tables as Parquet.")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--chunk-rows", type=int, default=0, help="Optional chunk size for CSV inputs (0=off).")
     args = ap.parse_args()
 
     files = sorted(glob.glob(args.seeds))
@@ -161,7 +167,7 @@ def main():
     # Load & concat
     dfs = []
     for f in files:
-        df = read_any(f)
+        df = read_any(f, chunk_rows=args.chunk_rows)
         if df.empty:
             if not args.quiet:
                 print(f"[warn] {f} empty; skipping.")

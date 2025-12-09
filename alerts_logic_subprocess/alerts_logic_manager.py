@@ -6,6 +6,7 @@ alerts_logic_manager.py
 Thin front door for the alert-shaping tools in this directory.
 
 Current tools (script filenames in brackets):
+  - viability-pipeline               [viability_pipeline.py]
   - apply / apply-rules              [apply_rules.py]
   - rule-applier                     [rule_applier.py]
   - rule-miner                       [rule_miner.py]
@@ -78,6 +79,7 @@ HERE = Path(__file__).resolve().parent
 # Canonical subcommand -> script filename.
 # Dash/underscore aliases are handled in find_script, so this map can stay small.
 SCRIPT_MAP: Dict[str, str] = {
+    "viability-pipeline": "viability_pipeline.py",
     # core rule appliers / discovery
     "apply":              "apply_rules.py",
     "apply-rules":        "apply_rules.py",
@@ -180,12 +182,61 @@ def main() -> int:
         action="store_true",
         help="Print the resolved command and exit without running it.",
     )
+    ap.add_argument(
+        "--run-name",
+        default=None,
+        help="Optional run name to auto-fill common defaults for viability alerts (apply-thr/throttle/denoise).",
+    )
 
     # Everything unknown is forwarded to the target script.
     args, extra = ap.parse_known_args()
 
+    def _has_flag(seq: list[str], flag: str) -> bool:
+        return any(x == flag or x.startswith(flag + "=") for x in seq)
+
+    def _apply_run_defaults(tool: str, run_name: str | None, argv: list[str]) -> list[str]:
+        if not run_name:
+            return argv
+        out = list(argv)
+
+        def ensure(flag: str, *vals: str):
+            if _has_flag(out, flag):
+                return
+            out.extend([flag, *map(str, vals)])
+
+        tool_norm = tool.replace("_", "-")
+        if tool_norm in {"apply-thresholds", "apply-thr"}:
+            ensure("--labelled", "data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet")
+            ensure("--model", "models/viability_model.pkl")
+            ensure("--metrics-json", "models/viability_model_metrics.json")
+            ensure("--prob-col", "prob_viable")
+            ensure("--flag-col", "alert_base")
+            ensure("--normalize-lon", "-180..180")
+            if not _has_flag(out, "--out"):
+                ensure("--out", f"results/alerts/alerts_{run_name}_base.parquet")
+        elif tool_norm == "throttle":
+            ensure("--normalize-lon", "-180..180")
+            ensure("--prob-col", "prob_viable")
+            ensure("--flag-col", "alert_base")
+            if not _has_flag(out, "--alerts"):
+                ensure("--alerts", f"results/alerts/alerts_{run_name}_base.parquet")
+            if not _has_flag(out, "--out"):
+                ensure("--out", f"results/alerts/alerts_{run_name}_thr.parquet")
+        elif tool_norm == "denoise":
+            ensure("--flag-col", "alert_base")
+            ensure("--flag-out", "alert_final")
+            ensure("--score-col", "prob_viable")
+            if not _has_flag(out, "--alerts"):
+                ensure("--alerts", f"results/alerts/alerts_{run_name}_thr.parquet")
+            if not _has_flag(out, "--out"):
+                ensure("--out", f"results/alerts/alerts_{run_name}_final.parquet")
+        elif tool_norm == "viability-pipeline":
+            ensure("--run-name", run_name)
+        return out
+
     script = find_script(args.tool)
     fwd = build_forward_args(args)
+    extra = _apply_run_defaults(args.tool, args.run_name, list(extra))
     cmd = [sys.executable, str(script), *fwd, *extra]
 
     print(f"\n$ {' '.join(map(str, cmd))}")

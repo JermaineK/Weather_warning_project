@@ -154,6 +154,11 @@ def main():
         action="store_true",
         help="Print the resolved command without executing it.",
     )
+    top.add_argument(
+        "--run-name",
+        default=None,
+        help="Optional run name to forward to subcommands that support it.",
+    )
 
     # first positional: subcommand
     top.add_argument(
@@ -183,6 +188,10 @@ def main():
         passthrough = passthrough[1:]
 
     py = sys.executable or shutil.which("python") or "python"
+    # Auto-forward run-name if provided and not already present
+    if ns.run_name and "--run-name" not in passthrough and "--run_name" not in passthrough:
+        passthrough = ["--run-name", ns.run_name, *passthrough]
+
     cmd = build_cmd(py, script_path, passthrough)
 
     print(f"[launch] {ns.subcommand} -> {script_path}")

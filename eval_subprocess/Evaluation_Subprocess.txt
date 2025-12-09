@@ -7,6 +7,7 @@ Each script is a standalone CLI, but the preferred entry point is the unified ev
 Contents
 The directory includes:
 eval_alert_hits.py
+eval_viability_leads.py
 eval_leadtime_grid.py
 eval_leadtime_grid_progress.py
 eval_leadtime_motion.py
@@ -41,6 +42,24 @@ Console precision/recall/F1/coverage
 A tiny metrics CSV for that lead
 
 Use this when testing thresholding and early pipeline steps.
+
+1b. eval_viability_leads.py
+Viability model skill vs t_to_storm_min_h leads.
+Purpose:
+Evaluates a fitted viability model against lead-aware labels derived from t_to_storm_min_h.
+Defaults align to the new pipeline: panel (grid_train_gse_panel_targets.parquet), model (models/viability_model.pkl),
+metrics JSON (models/viability_model_metrics.json), and run-stamped output.
+Key arguments:
+--panel <file>                 # defaults to data/grid_train_gse_panel_targets.parquet
+--model <joblib>               # defaults to models/viability_model.pkl
+--model-metrics <json>         # pulls feature list / target (models/viability_model_metrics.json)
+--lead-hours 24 48 72 120
+--lead-col t_to_storm_min_h
+--lead-lower 0.0
+--run-name coral_sea_demo      # stamps out to results/metrics/<run>_viability_leads.csv
+
+Outputs:
+CSV with coincident viability metrics (lead=0) and per-lead AUC/PRAUC/Brier/pos counts.
 
 2. eval_leadtime_grid.py
 Model-based skill across strict future windows.
@@ -195,6 +214,7 @@ Usage:
 python eval_manager.py <tool> [tool-args...]
 
 Tools:
+viability-leads
 hits
 leadtime
 leadtime-progress
@@ -207,3 +227,4 @@ per-storm
 Supports:
 --dry-run
 --quiet
+--run-name   # fills common defaults for viability/hits/hourly metrics outputs

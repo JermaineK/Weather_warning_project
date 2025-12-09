@@ -19,15 +19,16 @@ It wires together:
 Typical usage
 -------------
 python reports_and_maps_manager.py \
-  --run-name coral_sea_demo_lead72 \
+  --run-name coral_sea_demo \
   --union-csv   results/seedmaps/coral_sea_demo_union_byhour.csv \
-  --patches-csv results/seedmaps/seed_patches.csv \
-  --matches-csv results/seedmaps/seed_track_matches.csv \
-  --seed-summary  results/seedmaps/seed_summary.txt \
-  --seed-analysis results/seedmaps/seed_analysis.txt \
+  --patches-csv results/seedmaps/coral_sea_demo_seed_patches.csv \
+  --matches-csv results/seedmaps/coral_sea_demo_seed_track_matches.csv \
+  --seed-summary  results/seedmaps/coral_sea_demo_seed_summary.txt \
+  --seed-analysis results/seedmaps/coral_sea_demo_seed_analysis.txt \
   --alerts-dir    results/alerts \
   --conversion-csv results/seedmaps/coral_sea_demo_conversion_rates.csv \
-  --ibtracs data/tracks/ibtracs.ALL.list.v04r01.csv
+  --viability-thresholds results/sweeps/viability_best_thresholds.csv \
+  --ibtracs data/tracks/tracks_subset.csv
 """
 
 from __future__ import annotations
@@ -183,24 +184,24 @@ def main() -> int:
 
     # Key inputs shared across reports
     ap.add_argument(
-        "--union-csv",
-        default="results/seedmaps/seed_union_byhour.csv",
-        help="Seed union-by-hour CSV for maps.",
+    "--union-csv",
+        default=None,
+        help="Seed union-by-hour CSV for maps (default: results/seedmaps/<run>_union_byhour.csv).",
     )
     ap.add_argument(
         "--patches-csv",
-        default="results/seedmaps/seed_patches.csv",
-        help="Seed patches CSV (centroids) for quick QA maps.",
+        default=None,
+        help="Seed patches CSV (centroids) for quick QA maps (default: results/seedmaps/<run>_seed_patches.csv).",
     )
     ap.add_argument(
         "--matches-csv",
-        default="results/seedmaps/seed_track_matches.csv",
-        help="Seed–track matches CSV for overlays.",
+        default=None,
+        help="Seed-track matches CSV for overlays (default: results/seedmaps/<run>_seed_track_matches.csv).",
     )
     ap.add_argument(
         "--seed-summary",
-        default="results/seedmaps/seed_summary.txt",
-        help="Seed-level summary text produced earlier in the pipeline.",
+        default=None,
+        help="Seed-level summary text produced earlier in the pipeline (default: results/seedmaps/<run>_seed_summary.txt).",
     )
     ap.add_argument(
         "--seed-analysis",
@@ -214,8 +215,13 @@ def main() -> int:
     )
     ap.add_argument(
         "--conversion-csv",
-        default="results/seedmaps/coral_sea_demo_conversion_rates.csv",
-        help="Optional conversion/proto-outcomes CSV to embed in summary.",
+        default=None,
+        help="Optional conversion/proto-outcomes CSV to embed in summary (default: results/seedmaps/<run>_conversion_rates.csv if present).",
+    )
+    ap.add_argument(
+        "--viability-thresholds",
+        default=None,
+        help="Optional viability thresholds CSV (default: results/sweeps/viability_best_thresholds.csv).",
     )
 
     # IBTrACS / storm overlays
@@ -363,12 +369,29 @@ def main() -> int:
 
     print(f"[manager] Run folder: {run_dir}")
 
+    def or_default(path_arg: str | None, pattern: str | None, fallback: str | None = None) -> str:
+        if path_arg:
+            return path_arg
+        if pattern and args.run_name:
+            return pattern.format(run=args.run_name)
+        return fallback or ""
+
+    union_csv = or_default(args.union_csv, "results/seedmaps/{run}_union_byhour.csv")
+    patches_csv = or_default(args.patches_csv, "results/seedmaps/{run}_seed_patches.csv")
+    matches_csv = or_default(args.matches_csv, "results/seedmaps/{run}_seed_track_matches.csv")
+    seed_summary = or_default(args.seed_summary, "results/seedmaps/{run}_seed_summary.txt")
+    seed_analysis = or_default(args.seed_analysis, "results/seedmaps/{run}_seed_analysis.txt", "")
+    conversion_csv = or_default(args.conversion_csv, "results/seedmaps/{run}_conversion_rates.csv", "")
+    viability_thr = args.viability_thresholds or "results/sweeps/viability_best_thresholds.csv"
+    ibtracs_default = "data/tracks/tracks_subset.csv"
+    ibtracs_path = args.ibtracs or (ibtracs_default if Path(ibtracs_default).exists() else None)
+
     # --- STEP 1: quick QA maps (simple scatter maps) ---
     if not args.skip_quick_maps:
         script = HERE / "report_make_maps.py"
         step_args = [
-            "--union-csv", args.union_csv,
-            "--patches-csv", args.patches_csv,
+            "--union-csv", union_csv,
+            "--patches-csv", patches_csv,
             "--out-dir", str(maps_dir / "quick"),
         ]
         ok, code = run_step("quick-maps", script, step_args)
@@ -380,7 +403,7 @@ def main() -> int:
         script = HERE / "plot_seed_map_cartopy.py"
         out_png = maps_dir / "seeds_union_cartopy.png"
         step_args = [
-            "--seeds", args.union_csv,
+            "--seeds", union_csv,
             "--out-png", str(out_png),
             "--title", f"Seeds (union by hour) — {args.run_name}",
         ]
@@ -389,19 +412,19 @@ def main() -> int:
             return code
 
     # --- STEP 3: IBTrACS + seeds overlay ---
-    if (args.ibtracs is not None) and (not args.skip_ibtracs_maps):
+    if (ibtracs_path is not None) and (not args.skip_ibtracs_maps):
         script = HERE / "plot_seeds_with_ibtracs.py"
         out_png = maps_dir / "seeds_with_ibtracs.png"
         step_args = [
-            "--ibtracs", args.ibtracs,
+            "--ibtracs", ibtracs_path,
             "--out-png", str(out_png),
         ]
         # prefer matches if present; otherwise union seeds
-        matches_path = Path(args.matches_csv)
+        matches_path = Path(matches_csv)
         if matches_path.exists():
             step_args += ["--matches", str(matches_path)]
         else:
-            step_args += ["--seeds", args.union_csv]
+            step_args += ["--seeds", union_csv]
 
         if args.ibtracs_area:
             step_args += ["--area", args.ibtracs_area]
@@ -413,11 +436,11 @@ def main() -> int:
             return code
 
     # --- STEP 4: seed–track match map (cartopy) ---
-    if (not args.skip_ibtracs_maps) and Path(args.matches_csv).exists():
+    if (not args.skip_ibtracs_maps) and Path(matches_csv).exists():
         script = HERE / "plot_seed_track_map_cartopy.py"
         out_png = maps_dir / "seed_track_map.png"
         step_args = [
-            "--matches", args.matches_csv,
+            "--matches", matches_csv,
             "--out", str(out_png),
         ]
         ok, code = run_step("seed-track-map", script, step_args)
@@ -429,12 +452,20 @@ def main() -> int:
     step_args = [
         "--run-name", args.run_name,
         "--out-dir", str(run_dir),
-        "--seed-summary", args.seed_summary,
+        "--seed-summary", seed_summary,
         "--alerts-dir", args.alerts_dir,
-        "--include-conversion", args.conversion_csv,
+        "--viability-thresholds", viability_thr,
     ]
-    if args.seed_analysis:
-        step_args += ["--seed-analysis", args.seed_analysis]
+    if seed_analysis:
+        step_args += ["--seed-analysis", seed_analysis]
+    if conversion_csv:
+        step_args += ["--include-conversion", conversion_csv]
+    if ibtracs_path:
+        step_args += ["--ibtracs", ibtracs_path]
+    if args.ibtracs_area:
+        step_args += ["--ibtracs-area", args.ibtracs_area]
+    if args.ibtracs_normalize_lon:
+        step_args += ["--ibtracs-normalize-lon", args.ibtracs_normalize_lon]
 
     ok, code = run_step("summary", script, step_args)
     if not ok and args.strict:
@@ -484,9 +515,9 @@ def main() -> int:
         # - core seed artifacts (original run)
         # - per-run summary
         must_exist = [
-            args.seed_summary,
-            args.patches_csv,
-            args.matches_csv,
+            seed_summary,
+            patches_csv,
+            matches_csv,
         ]
         # summary text lives in run_dir, file name driven by run-name logic
         safe_run = args.run_name.strip().replace(" ", "_")

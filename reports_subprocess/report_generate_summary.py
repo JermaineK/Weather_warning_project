@@ -26,6 +26,7 @@ This script assumes:
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np  # noqa: F401 (kept in case we expand stats later)
@@ -44,6 +45,19 @@ def read_text_safe(p: Path) -> str:
 
 def exists_nonempty(p: Path) -> bool:
     return bool(p and p.exists() and p.stat().st_size > 0)
+
+
+def read_table_any(path: Path, columns=None, nrows=None):
+    """
+    Lightweight CSV/Parquet reader with safe fallbacks.
+    """
+    try:
+        if path.suffix.lower() in {".parquet", ".pq"}:
+            df = pd.read_parquet(path, columns=columns)
+            return df.head(nrows) if nrows else df
+        return pd.read_csv(path, usecols=columns, nrows=nrows)
+    except Exception:
+        return None
 
 
 def slugify_name(name: str) -> str:
@@ -85,6 +99,13 @@ def main():
         help="Folder containing alerts_* CSVs (for presence snapshot).",
     )
     ap.add_argument(
+        "--conversion-csv",
+        "--include-conversion",
+        dest="conversion_csv",
+        default=None,
+        help="Optional conversion/proto-outcomes CSV to embed in the summary.",
+    )
+    ap.add_argument(
         "--viability-targets",
         default="data/grid_train_gse_panel_targets.parquet",
         help="Panel with y_viable/t_to_storm_min_h for conversion snapshot (optional).",
@@ -95,9 +116,30 @@ def main():
         help="Viability model metrics JSON (optional).",
     )
     ap.add_argument(
+        "--viability-thresholds",
+        default="results/sweeps/viability_best_thresholds.csv",
+        help="Per-lead viability thresholds CSV (optional).",
+    )
+    ap.add_argument(
         "--viability-horizons",
         default="24,48,72,120",
         help="Comma-separated horizons (hours) for conversion snapshot.",
+    )
+    ap.add_argument(
+        "--ibtracs",
+        default=None,
+        help="Optional IBTrACS subset (not required; surfaced for reference).",
+    )
+    ap.add_argument(
+        "--ibtracs-area",
+        default=None,
+        help='Optional AOI string used elsewhere (surfaced for reference).',
+    )
+    ap.add_argument(
+        "--ibtracs-normalize-lon",
+        choices=["none", "-180..180", "0..360"],
+        default="-180..180",
+        help="Lon frame used elsewhere (surfaced for reference).",
     )
     ap.add_argument(
         "--extras",
@@ -108,7 +150,22 @@ def main():
     ap.add_argument("--chunk-rows", type=int, default=None, help="Ignored; accepted for pipeline compatibility.")
     ap.add_argument("--chunksize", type=int, default=None, help="Alias for --chunk-rows (ignored).")
     ap.add_argument("--parquet-rows", type=int, default=None, help="Ignored; accepted for pipeline compatibility.")
-    args = ap.parse_args()
+    argv = []
+    skip = False
+    raw = sys.argv[1:]
+    for i, tok in enumerate(raw):
+        if skip:
+            skip = False
+            continue
+        if tok == "--ibtracs-normalize-lon" and i + 1 < len(raw):
+            argv.append(f"--ibtracs-normalize-lon={raw[i+1].strip()}")
+            skip = True
+        elif tok.startswith("--ibtracs-normalize-lon="):
+            lhs, rhs = tok.split("=", 1)
+            argv.append(f"{lhs}={rhs.strip()}")
+        else:
+            argv.append(tok)
+    args = ap.parse_args(argv)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -135,6 +192,16 @@ def main():
                 # We don't fail the report if one file is unreadable
                 continue
 
+    # ---- IBTrACS presence snapshot ----
+    ibtracs_txt = ""
+    if args.ibtracs:
+        ib_path = Path(args.ibtracs)
+        if exists_nonempty(ib_path):
+            size_mb = ib_path.stat().st_size / 1e6
+            ibtracs_txt = f"{ib_path} (size ~{size_mb:.1f} MB)"
+        else:
+            ibtracs_txt = f"{ib_path} (missing or empty)"
+
     # ---- Viability conversion snapshot (optional) ----
     conv_txt = ""
     horizons = []
@@ -147,20 +214,64 @@ def main():
     if exists_nonempty(conv_path):
         try:
             cols = ["t_to_storm_min_h", "y_viable"]
-            df = pd.read_parquet(conv_path, columns=cols)
+            df = read_table_any(conv_path, columns=cols)
+            if df is None:
+                df = pd.DataFrame(columns=cols)
+            lead_vals = pd.to_numeric(df["t_to_storm_min_h"], errors="coerce")
+            yv = pd.to_numeric(df.get("y_viable", pd.Series(dtype=float)), errors="coerce")
             rows = []
+            start = 0.0
             for h in horizons:
-                mask = pd.to_numeric(df["t_to_storm_min_h"], errors="coerce").le(h)
-                mask &= df["t_to_storm_min_h"].notna()
-                subset = df.loc[mask]
-                total = len(subset)
-                pos = subset["y_viable"].sum() if "y_viable" in subset else 0
-                rate = (subset["y_viable"].mean() if total > 0 else np.nan) if "y_viable" in subset else np.nan
-                rows.append({"horizon_h": h, "rows": int(total), "y_viable_mean": float(rate) if pd.notna(rate) else np.nan, "positives": float(pos)})
+                mask = lead_vals.gt(start) & lead_vals.le(float(h))
+                subset = yv.loc[mask]
+                total = int(mask.sum())
+                pos = float(subset.sum()) if total > 0 else 0.0
+                rate = float(subset.mean()) if total > 0 else np.nan
+                rows.append(
+                    {
+                        "horizon": f"({start},{h}]",
+                        "rows": total,
+                        "y_viable_mean": rate if pd.notna(rate) else np.nan,
+                        "positives": pos,
+                    }
+                )
+                start = float(h)
+            # trailing bucket > last horizon
+            tail_mask = lead_vals.gt(start)
+            if tail_mask.any():
+                subset = yv.loc[tail_mask]
+                total = int(tail_mask.sum())
+                pos = float(subset.sum()) if total > 0 else 0.0
+                rate = float(subset.mean()) if total > 0 else np.nan
+                rows.append(
+                    {
+                        "horizon": f"> {start}",
+                        "rows": total,
+                        "y_viable_mean": rate if pd.notna(rate) else np.nan,
+                        "positives": pos,
+                    }
+                )
             conv = pd.DataFrame(rows)
             conv_txt = conv.to_string(index=False)
         except Exception:
             conv_txt = ""
+
+    # ---- Viability threshold snapshot (optional) ----
+    thr_txt = ""
+    thr_path = Path(args.viability_thresholds)
+    if exists_nonempty(thr_path):
+        tbl = read_table_any(thr_path)
+        if tbl is None:
+            tbl = read_table_any(thr_path, nrows=50)
+        if tbl is not None and not tbl.empty:
+            # allow various lead column spellings
+            for cand in ["lead_h", "lead", "lead_hours"]:
+                if cand in tbl.columns:
+                    tbl = tbl.rename(columns={cand: "lead_h"})
+                    break
+            keep = [c for c in ["lead_h", "thr_Fbeta", "thr_fbeta", "thr_F1", "Fbeta", "F1", "precision", "recall", "coverage"] if c in tbl.columns]
+            if keep:
+                thr_txt = tbl[keep].head(12).to_string(index=False)
 
     # ---- Viability metrics snapshot (optional) ----
     metrics_txt = ""
@@ -168,16 +279,39 @@ def main():
     if exists_nonempty(metrics_path):
         try:
             m = json.loads(metrics_path.read_text())
-            # Pick a few commonly logged metrics if present
-            keys = ["roc_auc", "pr_auc", "brier", "opt_threshold", "neg_pos_ratio", "sample_frac"]
+            base = m.get("overall", m) if isinstance(m, dict) else {}
+            keys = [
+                "roc_auc",
+                "pr_auc",
+                "brier",
+                "f1",
+                "fbeta",
+                "opt_threshold",
+                "thr_Fbeta",
+                "neg_pos_ratio",
+                "sample_frac",
+            ]
             lines = []
             for k in keys:
-                if k in m:
-                    lines.append(f"{k}: {m[k]}")
+                if k in base:
+                    lines.append(f"{k}: {base[k]}")
+            if not lines and isinstance(m, dict):
+                for k, v in m.items():
+                    if isinstance(v, (int, float, str)) and len(lines) < 8:
+                        lines.append(f"{k}: {v}")
             if lines:
                 metrics_txt = "\n".join(lines)
         except Exception:
             metrics_txt = ""
+
+    # ---- Proto outcomes / conversion CSV (optional) ----
+    proto_txt = ""
+    if args.conversion_csv:
+        proto_path = Path(args.conversion_csv)
+        if exists_nonempty(proto_path):
+            tbl = read_table_any(proto_path, nrows=500)
+            if tbl is not None and not tbl.empty:
+                proto_txt = tbl.head(20).to_string(index=False)
 
     # ---- Extras ----
     try:
@@ -212,17 +346,38 @@ def main():
             f"{alert_rows_sampled} (for basic presence/health check only)\n\n"
         )
 
+        if ibtracs_txt:
+            f.write("IBTrACS reference\n")
+            f.write("-" * 72 + "\n")
+            f.write(f"{ibtracs_txt}\n")
+            if args.ibtracs_area:
+                f.write(f"AOI: {args.ibtracs_area}\n")
+            if args.ibtracs_normalize_lon:
+                f.write(f"Lon frame: {args.ibtracs_normalize_lon}\n")
+            f.write("\n")
+
         # Viability conversion snapshot
         if conv_txt:
             f.write("Viability conversion snapshot (t_to_storm_min_h)\n")
             f.write("-" * 72 + "\n")
             f.write(conv_txt.strip() + "\n\n")
 
+        # Viability thresholds
+        if thr_txt:
+            f.write("Viability thresholds (sweep)\n")
+            f.write("-" * 72 + "\n")
+            f.write(thr_txt.strip() + "\n\n")
+
         # Viability metrics
         if metrics_txt:
             f.write("Viability model metrics\n")
             f.write("-" * 72 + "\n")
             f.write(metrics_txt.strip() + "\n\n")
+
+        if proto_txt:
+            f.write("Proto outcomes / conversion rates\n")
+            f.write("-" * 72 + "\n")
+            f.write(proto_txt.strip() + "\n\n")
 
         # Extras
         if extras:

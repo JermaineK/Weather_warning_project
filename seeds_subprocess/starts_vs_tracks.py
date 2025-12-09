@@ -29,7 +29,7 @@ Notes
 """
 
 from __future__ import annotations
-import argparse, os, math
+import argparse, os, math, sys
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
@@ -40,7 +40,7 @@ import pandas as pd
 # ------------------------ IO helpers ------------------------
 
 CANDIDATE_TIME_COLS = ["time", "time_h", "datetime", "valid_time", "forecast_time"]
-CANDIDATE_FLAG_COLS = ["__flag__", "alert_final", "alert", "flag"]
+CANDIDATE_FLAG_COLS = ["__flag__", "any_alert", "alert_final", "alert_base", "alert", "flag"]
 
 def read_any(path: str, **kw) -> pd.DataFrame:
     p = str(path)
@@ -190,45 +190,67 @@ def load_seeds(path: str,
                time_col: Optional[str],
                flag_col: Optional[str],
                normalize_lon_mode: str,
-               area: Optional[str]) -> Tuple[pd.DataFrame, str, str]:
-    df = read_any(path).replace([np.inf,-np.inf], np.nan)
+               area: Optional[str],
+               chunk_rows: int = 0) -> Tuple[pd.DataFrame, str, str]:
+    def _iter():
+        if path.lower().endswith(".parquet") or chunk_rows <= 0:
+            yield read_any(path)
+        else:
+            for chunk in pd.read_csv(path, compression="infer", low_memory=False, chunksize=int(chunk_rows)):
+                yield chunk
 
-    # Pick time column
-    tcol = time_col or next((c for c in CANDIDATE_TIME_COLS if c in df.columns), None)
-    if tcol is None:
-        raise ValueError(f"{path}: need a time column (tried {CANDIDATE_TIME_COLS}).")
-    t = to_utc_naive(df[tcol])
-    df = df.loc[t.notna()].copy(); df[tcol] = t[t.notna()]
+    dfs = []
+    for df in _iter():
+        if df is None or df.empty:
+            continue
+        df = df.replace([np.inf,-np.inf], np.nan)
 
-    # Pick flag column
-    fcol = flag_col or next((c for c in CANDIDATE_FLAG_COLS if c in df.columns), None)
-    if fcol is None:
-        # If none present, assume "1" for all rows (treat every row as a seed hit)
-        df["__flag__auto__"] = 1
-        fcol = "__flag__auto__"
-    df[fcol] = pd.to_numeric(df[fcol], errors="coerce").fillna(0).astype(int)
+        # Pick time column
+        tcol = time_col or next((c for c in CANDIDATE_TIME_COLS if c in df.columns), None)
+        if tcol is None:
+            raise ValueError(f"{path}: need a time column (tried {CANDIDATE_TIME_COLS}).")
+        t = to_utc_naive(df[tcol])
+        df = df.loc[t.notna()].copy(); df[tcol] = t[t.notna()]
 
-    # Numerics + lon norm
-    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    df["lon"] = norm_lon(df["lon"], normalize_lon_mode)
-    df = df.dropna(subset=[tcol, "lat", "lon"]).reset_index(drop=True)
+        # Pick flag column
+        fcol = flag_col or next((c for c in CANDIDATE_FLAG_COLS if c in df.columns), None)
+        if fcol is None:
+            df["__flag__auto__"] = 1
+            fcol = "__flag__auto__"
+        df[fcol] = pd.to_numeric(df[fcol], errors="coerce").fillna(0).astype(int)
 
-    # AOI
-    a = parse_area(area)
-    if a:
-        latN, lonW, latS, lonE = a
-        df = df.loc[(df["lat"] <= latN) & (df["lat"] >= latS) &
-                    (df["lon"] >= lonW) & (df["lon"] <= lonE)].reset_index(drop=True)
+        # Numerics + lon norm
+        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+        df["lon"] = norm_lon(df["lon"], normalize_lon_mode)
+        df = df.dropna(subset=[tcol, "lat", "lon"]).reset_index(drop=True)
 
-    # Force hourly
-    df["time_h"] = df[tcol].dt.floor("h")
-    return df, tcol, fcol
+        # AOI
+        a = parse_area(area)
+        if a:
+            latN, lonW, latS, lonE = a
+            df = df.loc[(df["lat"] <= latN) & (df["lat"] >= latS) &
+                        (df["lon"] >= lonW) & (df["lon"] <= lonE)].reset_index(drop=True)
+
+        df["time_h"] = df[tcol].dt.floor("h")
+        dfs.append(df)
+
+    if not dfs:
+        return pd.DataFrame(columns=["time_h","lat","lon"]), time_col or "time", flag_col or "__flag__auto__"
+    df_all = pd.concat(dfs, ignore_index=True)
+    return df_all, tcol, fcol
 
 def load_tracks(path: str,
                 time_offset_h: float = 0.0,
                 normalize_lon_mode: str = "none",
-                area: Optional[str] = None) -> pd.DataFrame:
-    tr = read_any(path)
+                area: Optional[str] = None,
+                chunk_rows: int = 0) -> pd.DataFrame:
+    if path.lower().endswith(".parquet") or chunk_rows <= 0:
+        tr = read_any(path)
+    else:
+        trs = []
+        for chunk in pd.read_csv(path, compression="infer", low_memory=False, chunksize=int(chunk_rows)):
+            trs.append(chunk)
+        tr = pd.concat(trs, ignore_index=True) if trs else pd.DataFrame()
     time_col = "obs_time" if "obs_time" in tr.columns else ("time" if "time" in tr.columns else None)
     if time_col is None:
         raise ValueError(f"{path}: need an 'obs_time' (or 'time') column")
@@ -417,27 +439,46 @@ def main():
     ap.add_argument("--seeds", required=True, help="Seed cells CSV/Parquet (time,lat,lon,flag).")
     ap.add_argument("--tracks", required=True, help="Best-track CSV/Parquet from prepare_besttrack_intensity.py.")
     ap.add_argument("--out-dir", required=True, help="Output directory.")
+    ap.add_argument("--run-name", default="run", help="Run name prefix for outputs.")
     ap.add_argument("--time-col", default=None, help="Seed time column (default: auto).")
-    ap.add_argument("--flag-col", default=None, help="Seed flag column (default: auto; tries __flag__, alert_final, alert, flag).")
+    ap.add_argument("--flag-col", default="any_alert", help="Seed flag column (default: any_alert->alert_final fallback).")
     ap.add_argument("--min-run-hours", type=int, default=72, help="Minimum run length to qualify as a seed start (default 72).")
     ap.add_argument("--connectivity", type=int, choices=[4,8], default=4, help="Connectivity for clustering (default 4).")
     ap.add_argument("--radius-deg", type=float, default=1.0, help="Radius for matching to tracks (degrees).")
     ap.add_argument("--time-tol-hours", type=float, default=6.0, help="+/- hours around seed start for matching.")
-    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="none", help="Normalize longitudes for BOTH inputs.")
+    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="-180..180", type=str, help="Normalize longitudes for BOTH inputs.")
     ap.add_argument("--area", default=None, help="Optional AOI 'latN,lonW,latS,lonE' after lon normalization.")
     ap.add_argument("--track-time-offset-hours", type=float, default=0.0, help="Shift all track times by this many hours.")
+    ap.add_argument("--chunk-rows", type=int, default=0, help="Optional chunk size for CSV seeds/tracks (0=off).")
     ap.add_argument("--save-parquet", action="store_true", help="Also write Parquet copies of outputs.")
-    args = ap.parse_args()
+    # preprocess normalize-lon to handle tokens like "-180..180"
+    argv = []
+    skip = False
+    raw = sys.argv[1:]
+    for i, tok in enumerate(raw):
+        if skip:
+            skip = False
+            continue
+        if tok == "--normalize-lon" and i + 1 < len(raw):
+            argv.append(f"--normalize-lon={raw[i+1].strip()}")
+            skip = True
+        elif tok.startswith("--normalize-lon="):
+            lhs, rhs = tok.split("=", 1)
+            argv.append(f"{lhs}={rhs.strip()}")
+        else:
+            argv.append(tok)
+    args = ap.parse_args(argv)
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) Load
     seeds, tcol, fcol = load_seeds(args.seeds, args.time_col, args.flag_col,
-                                   args.normalize_lon, args.area)
+                                   args.normalize_lon, args.area, chunk_rows=int(args.chunk_rows))
     tracks = load_tracks(args.tracks,
                          time_offset_h=args.track_time_offset_hours,
                          normalize_lon_mode=args.normalize_lon,
-                         area=args.area)
+                         area=args.area,
+                         chunk_rows=int(args.chunk_rows))
 
     # Quick domain stats
     tmin, tmax = seeds["time_h"].min(), seeds["time_h"].max()
@@ -453,7 +494,7 @@ def main():
     else:
         starts["issue_hour"] = starts["time_h"]  # alias for readability
     # Save
-    p_points = out_dir / "seed_starts_points.csv"
+    p_points = out_dir / f"{args.run_name}_seed_starts_points.csv"
     starts.to_csv(p_points, index=False)
     if args.save_parquet:
         starts.to_parquet(out_dir / "seed_starts_points.parquet", index=False)
@@ -475,7 +516,7 @@ def main():
                 lon_min=c["lon_min"], lon_max=c["lon_max"],
             ))
     patches = pd.DataFrame(patches_rows).sort_values(["time_h","patch_id"], ignore_index=True)
-    p_patches = out_dir / "seed_patches.csv"
+    p_patches = out_dir / f"{args.run_name}_seed_patches.csv"
     patches.to_csv(p_patches, index=False)
     if args.save_parquet:
         patches.to_parquet(out_dir / "seed_patches.parquet", index=False)
@@ -484,7 +525,7 @@ def main():
     matches = match_patches_to_tracks(patches, tracks,
                                       radius_deg=float(args.radius_deg),
                                       time_tol_h=float(args.time_tol_hours))
-    p_matches = out_dir / "seed_track_matches.csv"
+    p_matches = out_dir / f"{args.run_name}_seed_track_matches.csv"
     matches.to_csv(p_matches, index=False)
     if args.save_parquet:
         matches.to_parquet(out_dir / "seed_track_matches.parquet", index=False)
@@ -504,7 +545,7 @@ def main():
         if s.empty: return "n=0"
         return f"n={len(s)}  median={s.median():.1f}h  p25={_q(s,0.25):.1f}h  p75={_q(s,0.75):.1f}h  max={s.max():.1f}h"
 
-    txt = out_dir / "seed_summary.txt"
+    txt = out_dir / f"{args.run_name}_seed_summary.txt"
     with open(txt, "w", encoding="utf-8") as f:
         f.write("Seed–Track Analysis Summary\n")
         f.write("------------------------------------------------------------\n")

@@ -29,7 +29,7 @@ Notes:
 - If cartopy is missing, falls back to plain axes (no coastlines).
 """
 
-import argparse, os
+import argparse, os, sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -102,6 +102,28 @@ def pick_ci(df, names):
             return low[n.lower()]
     return None
 
+
+def _resolve_seed_coords(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize seed coordinate column names across legacy/new starts_vs_tracks outputs.
+    """
+    rename_map = {}
+    cols = set(df.columns)
+    if {"seed_lat", "seed_lon"}.issubset(cols):
+        rename_map["seed_lat"] = "lat"
+        rename_map["seed_lon"] = "lon"
+    elif {"seed_lat_deg", "seed_lon_deg"}.issubset(cols):
+        rename_map["seed_lat_deg"] = "lat"
+        rename_map["seed_lon_deg"] = "lon"
+    elif {"lat_cen", "lon_cen"}.issubset(cols):
+        rename_map["lat_cen"] = "lat"
+        rename_map["lon_cen"] = "lon"
+    elif {"lat", "lon"}.issubset(cols):
+        return df
+    if rename_map:
+        return df.rename(columns=rename_map)
+    raise ValueError("Need seed lat/lon columns (seed_lat/seed_lon, seed_lat_deg/seed_lon_deg, lat_cen/lon_cen, or lat/lon).")
+
 def build_time_from_parts(df, parts):
     try:
         y = df[parts[0]].astype(int)
@@ -125,7 +147,7 @@ def main():
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
     ap.add_argument("--area", default=None, help="latN,lonW,latS,lonE (after lon normalization; anti-meridian ok)")
-    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="none")
+    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="none", type=str)
     ap.add_argument("--time-offset-hours", type=float, default=0.0, help="shift IBTrACS times")
     ap.add_argument("--out-png", default="results/maps/seeds_ibtracs.png")
     ap.add_argument("--storms-out", default=None)
@@ -133,7 +155,22 @@ def main():
     ap.add_argument("--seed-alpha", type=float, default=0.8)
     ap.add_argument("--seed-size", type=float, default=16.0)
     ap.add_argument("--dpi", type=int, default=180)
-    args = ap.parse_args()
+    argv = []
+    skip = False
+    raw = sys.argv[1:]
+    for i, tok in enumerate(raw):
+        if skip:
+            skip = False
+            continue
+        if tok == "--normalize-lon" and i + 1 < len(raw):
+            argv.append(f"--normalize-lon={raw[i+1].strip()}")
+            skip = True
+        elif tok.startswith("--normalize-lon="):
+            lhs, rhs = tok.split("=", 1)
+            argv.append(f"{lhs}={rhs.strip()}")
+        else:
+            argv.append(tok)
+    args = ap.parse_args(argv)
 
     Path(args.out_png).parent.mkdir(parents=True, exist_ok=True)
 
@@ -142,8 +179,9 @@ def main():
     seed_label = "Seeds"
     if args.matches:
         m = read_any(args.matches)
-        latc = pick_ci(m, ["seed_lat","lat"])
-        lonc = pick_ci(m, ["seed_lon","lon"])
+        m = _resolve_seed_coords(m)
+        latc = pick_ci(m, ["lat"])
+        lonc = pick_ci(m, ["lon"])
         tc   = pick_ci(m, ["seed_time","time","time_h"])
         if not (latc and lonc):
             raise ValueError(f"{args.matches}: need columns seed_lat/seed_lon or lat/lon")

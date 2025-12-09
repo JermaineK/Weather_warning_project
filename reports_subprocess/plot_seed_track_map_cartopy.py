@@ -62,7 +62,8 @@ def main():
 
     df = df.dropna(subset=[lat_c, lon_c]).reset_index(drop=True)
     if len(df) == 0:
-        raise RuntimeError("No valid coordinate rows to plot.")
+        print("[seed-track-map] no valid coordinate rows; skipping plot.")
+        return
 
     # Extent
     if args.lon_range and args.lat_range:

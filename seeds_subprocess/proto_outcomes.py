@@ -19,7 +19,7 @@ Key options:
 
 from __future__ import annotations
 
-import argparse, os, math
+import argparse, os, math, sys
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 
@@ -43,6 +43,14 @@ def read_any(p: str, **kw) -> pd.DataFrame:
     if p.lower().endswith((".parquet",".pq",".pqt")):
         return pd.read_parquet(p, **kw)
     return pd.read_csv(p, low_memory=False, **kw)
+
+def read_csv_chunked(path: str, chunk_rows: int) -> pd.DataFrame:
+    if chunk_rows and chunk_rows > 0 and (path.lower().endswith(".csv") or path.lower().endswith(".csv.gz")):
+        parts = []
+        for chunk in pd.read_csv(path, low_memory=False, compression="infer", chunksize=int(chunk_rows)):
+            parts.append(chunk)
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    return read_any(path)
 
 def to_utc_naive(series: pd.Series, fmt: Optional[str] = None) -> pd.Series:
     raw = series.astype(str).str.strip().str.replace("Z","",regex=False)
@@ -287,10 +295,11 @@ def label_tracks_kdtree(track_pts: pd.DataFrame,
                 if T is None or G is None or G.empty:
                     continue
                 dist, idx = T.query(P, k=1, return_distance=True)
-                dmin = float(dist.min())
+                dmin = float(np.min(dist))
                 if dmin < best_d:
                     best_d = dmin
-                    j = int(idx[np.argmin(dist)])
+                    flat_idx = np.argmin(dist)
+                    j = int(np.asarray(idx).reshape(-1)[flat_idx])
                     matched = G.iloc[j][sid]
         else:
             # Fallback: brute force windowed search
@@ -331,7 +340,7 @@ def main():
     ap.add_argument("--features", default=None, help="Optional CSV/Parquet features with CAPE/CIN/T2M to join.")
     ap.add_argument("--ibtracs", required=True, help="IBTrACS CSV/Parquet (v04 list or similar).")
     ap.add_argument("--time-format", default=None, help="Optional strptime format for non-standard time columns.")
-    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="-180..180")
+    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="-180..180", type=str)
     ap.add_argument("--aoi", default=None, help='Optional AOI "latN,lonW,latS,lonE" after lon normalization.')
     ap.add_argument("--link-radius-km", type=float, default=75.0)
     ap.add_argument("--max-gap-hours", type=int, default=1)
@@ -341,12 +350,29 @@ def main():
     ap.add_argument("--out-dir", default="results/seedmaps")
     ap.add_argument("--run-name", default="run")
     ap.add_argument("--write-parquet", action="store_true", help="Also write Parquet copies.")
-    args = ap.parse_args()
+    ap.add_argument("--chunk-rows", type=int, default=0, help="Optional chunk size for CSV inputs (0=off).")
+    # preprocess normalize-lon to handle tokens like "-180..180"
+    argv = []
+    skip = False
+    raw = sys.argv[1:]
+    for i, tok in enumerate(raw):
+        if skip:
+            skip = False
+            continue
+        if tok == "--normalize-lon" and i + 1 < len(raw):
+            argv.append(f"--normalize-lon={raw[i+1].strip()}")
+            skip = True
+        elif tok.startswith("--normalize-lon="):
+            lhs, rhs = tok.split("=", 1)
+            argv.append(f"{lhs}={rhs.strip()}")
+        else:
+            argv.append(tok)
+    args = ap.parse_args(argv)
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- load seeds
-    s = read_any(args.seeds)
+    s = read_csv_chunked(args.seeds, args.chunk_rows)
     tcol = pick_time_col(s)
     s["time"] = to_utc_naive(s[tcol], args.time_format)
     s["lat"]  = pd.to_numeric(s["lat"], errors="coerce")
@@ -365,7 +391,7 @@ def main():
 
     # ---- optional: join CAPE/CIN/T2M
     if args.features:
-        f = read_any(args.features)
+        f = read_csv_chunked(args.features, args.chunk_rows)
         # normalize time/coords
         if "time" not in f.columns:
             for c in ["valid_time","datetime","time_h"]:

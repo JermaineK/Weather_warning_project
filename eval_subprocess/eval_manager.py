@@ -6,6 +6,7 @@ eval_manager.py
 Unified front door for evaluation & core plotting tools:
 
   - eval_alert_hits.py            (hits)
+  - eval_viability_leads.py       (viability-leads)
   - eval_leadtime_grid.py         (leadtime)
   - eval_leadtime_grid_progress.py(leadtime-progress)
   - eval_leadtime_motion.py       (motion)
@@ -26,6 +27,11 @@ python eval_manager.py hits \
   --truth-col storm_window \
   --normalize-lon -180..180 \
   --out-csv results/eval/alerts_run_lead72_eval.csv
+
+# 1b) Viability model skill by lead (t_to_storm_min_h)
+python eval_manager.py viability-leads \
+  --run-name coral_sea_demo \
+  --lead-hours 24 48 72 120
 
 # 2) Lead-time skill on the grid (strict future labels)
 python eval_manager.py leadtime \
@@ -103,6 +109,7 @@ HERE = Path(__file__).resolve().parent
 # Map high-level tools -> script filenames in this directory
 SCRIPT_MAP: Dict[str, str] = {
     # Core evals
+    "viability-leads":  "eval_viability_leads.py",
     "hits":              "eval_alert_hits.py",
     "leadtime":          "eval_leadtime_grid.py",
     "leadtime-progress": "eval_leadtime_grid_progress.py",
@@ -123,6 +130,8 @@ ALIASES: Dict[str, str] = {
     "lt":            "leadtime",
     "lt-progress":   "leadtime-progress",
     "progress":      "leadtime-progress",
+    "viability":     "viability-leads",
+    "viable":        "viability-leads",
     "hm":            "hourly-metrics",
     "hr":            "hourly-rollup",
     "skill":         "plot-skill",
@@ -170,6 +179,60 @@ def find_script(tool: str) -> Path:
         f"Tried: {tried}"
     )
 
+
+def _has_flag(args: list[str], flag: str) -> bool:
+    return any(a == flag or a.startswith(flag + "=") for a in args)
+
+
+def _apply_run_defaults(tool: str, run_name: str | None, extra: list[str]) -> list[str]:
+    """
+    When --run-name is provided, inject sensible defaults for common tools
+    so pipeline.yaml can stay terse.
+    """
+    if not run_name:
+        return extra
+
+    out = list(extra)
+
+    def ensure(flag: str, *vals: str):
+        if _has_flag(out, flag):
+            return
+        out.extend([flag, *map(str, vals)])
+
+    if tool == "viability-leads":
+        ensure("--panel", "data/grid_train_gse_panel_targets.parquet")
+        ensure("--model", "models/viability_model.pkl")
+        ensure("--model-metrics", "models/viability_model_metrics.json")
+        if not _has_flag(out, "--lead-hours"):
+            out.extend(["--lead-hours", "24", "48", "72", "120"])
+        ensure("--lead-col", "t_to_storm_min_h")
+        ensure("--target", "y_viable")
+        if not _has_flag(out, "--out"):
+            ensure("--out", f"results/metrics/{run_name}_viability_leads.csv")
+
+    elif tool == "hits":
+        ensure("--labelled", "data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet")
+        ensure("--normalize-lon", "-180..180")
+        if not _has_flag(out, "--out-csv"):
+            ensure("--out-csv", f"results/metrics/{run_name}_alert_hits.csv")
+
+    elif tool == "hourly-metrics":
+        if not _has_flag(out, "--alerts"):
+            ensure("--alerts", f"results/alerts/alerts_{run_name}_final.parquet")
+        if not _has_flag(out, "--tag"):
+            ensure("--tag", run_name)
+        ensure("--normalize-lon", "-180..180")
+        if not _has_flag(out, "--out"):
+            ensure("--out", f"results/metrics/{run_name}_hourly_metrics.csv")
+
+    elif tool == "hourly-rollup":
+        if not _has_flag(out, "--alerts"):
+            ensure("--alerts", f"results/alerts/alerts_{run_name}_final.parquet")
+        if not _has_flag(out, "--out"):
+            ensure("--out", f"results/metrics/{run_name}_hourly_rollup.parquet")
+
+    return out
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Evaluation & plotting manager (hits, lead-time, hourly metrics, skill vs tracks, per-storm overlays)",
@@ -190,14 +253,21 @@ def main() -> int:
         action="store_true",
         help="Append --quiet to the downstream tool if it supports it.",
     )
+    ap.add_argument(
+        "--run-name",
+        default=None,
+        help="Optional run name to auto-fill common paths (panel/model/out under results/metrics).",
+    )
 
     # Parse known to allow pass-through of everything else
     ns, extra = ap.parse_known_args()
 
-    script = find_script(ns.tool)
+    tool = normalize_tool(ns.tool)
+    script = find_script(tool)
     cmd = [sys.executable, str(script)]
     if ns.quiet:
         cmd.append("--quiet")
+    extra = _apply_run_defaults(tool, ns.run_name, list(extra))
     cmd.extend(extra)
 
     print(f"\n$ {' '.join(map(str, cmd))}")

@@ -24,29 +24,31 @@ It builds a new run folder, calls all relevant report/map scripts, and ensures n
 Example:
 python reports_and_maps_manager.py \
   --run-name coral_sea_demo_lead72 \
-  --union-csv results/seedmaps/seed_union_byhour.csv \
-  --patches-csv results/seedmaps/seed_patches.csv \
-  --matches-csv results/seedmaps/seed_track_matches.csv \
-  --seed-summary  results/seedmaps/seed_summary.txt \
-  --seed-analysis results/seedmaps/seed_analysis.txt \
+  --union-csv results/seedmaps/coral_sea_demo_union_byhour.csv \
+  --patches-csv results/seedmaps/coral_sea_demo_seed_patches.csv \
+  --matches-csv results/seedmaps/coral_sea_demo_seed_track_matches.csv \
+  --seed-summary  results/seedmaps/coral_sea_demo_seed_summary.txt \
+  --seed-analysis results/seedmaps/coral_sea_demo_seed_analysis.txt \
   --alerts-dir results/alerts \
-  --conversion-csv results/seedmaps/conversion_rates.csv \
-  --ibtracs data/ibtracs/ibtracs.ALL.list.v04r01.csv
+  --conversion-csv results/seedmaps/coral_sea_demo_conversion_rates.csv \
+  --viability-thresholds results/sweeps/viability_best_thresholds.csv \
+  --ibtracs data/tracks/tracks_subset.csv
 
 After completion, you'll find everything under:
 results/reports/YYYYMMDD_runNNN/
 
 Manager flags (common):
---run-name <string>              # Required. Appears in summary file.
+--run-name <string>              # Required. Also drives default seed/alert paths.
 --run-root <dir>                 # Folder where runNNN folders are created.
 --run-date YYYYMMDD              # Optional override; default = today UTC.
---union-csv <file>               # Seed union-by-hour.
---patches-csv <file>             # Seed patches.
---matches-csv <file>             # Seed–track matched pairs.
---seed-summary <file>            # Plain-text summary from seed stage.
+--union-csv <file>               # Seed union-by-hour (default: results/seedmaps/<run>_union_byhour.csv).
+--patches-csv <file>             # Seed patches (default: results/seedmaps/<run>_seed_patches.csv).
+--matches-csv <file>             # Seed–track matched pairs (default: results/seedmaps/<run>_seed_track_matches.csv).
+--seed-summary <file>            # Plain-text summary from seed stage (default: results/seedmaps/<run>_seed_summary.txt).
 --seed-analysis <file>           # Optional extra analysis text.
 --alerts-dir <directory>         # Alerts used for sanity checks.
---conversion-csv <file>          # Optional proto-outcome rates.
+--conversion-csv <file>          # Optional proto-outcome rates (defaults to <run>_conversion_rates.csv if present).
+--viability-thresholds <file>    # Optional viability sweep output for the summary (defaults to results/sweeps/viability_best_thresholds.csv).
 --ibtracs <file>                 # If provided, includes storm overlays.
 --ibtracs-area "latN,lonW,latS,lonE"
 --ibtracs-normalize-lon <mode>   # none | -180..180 | 0..360
@@ -66,7 +68,10 @@ Inputs:
 --seed-summary (txt)
 --seed-analysis (optional txt)
 --alerts-dir (presence snapshot)
---include-conversion (optional CSV)
+--include-conversion/--conversion-csv (optional CSV)
+--viability-targets (optional parquet for t_to_storm_min_h / y_viable snapshot)
+--viability-metrics (optional JSON metrics from training)
+--viability-thresholds (optional CSV from sweep)
 
 Output:
 

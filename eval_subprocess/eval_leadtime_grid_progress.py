@@ -62,6 +62,16 @@ def read_any(path: str, columns=None) -> pd.DataFrame:
     return pd.read_csv(path, low_memory=False)
 
 
+def parse_leads(raw) -> list[int]:
+    leads: list[int] = []
+    for tok in raw:
+        for part in str(tok).replace(",", " ").split():
+            if not part:
+                continue
+            leads.append(int(float(part)))
+    return leads
+
+
 # ---------- tiny progress helpers ----------
 def pbar(iterable, total, title=""):
     done = 0
@@ -269,7 +279,7 @@ def main():
     ap.add_argument("--labelled", required=True, help="CSV(.gz) or Parquet labelled grid.")
     ap.add_argument("--model", required=True, help="Joblib bundle with model + feature metadata.")
     ap.add_argument("--target", required=True, choices=["storm", "near_storm", "pregen"])
-    ap.add_argument("--lead-hours", nargs="+", type=int, required=True)
+    ap.add_argument("--lead-hours", nargs="+", type=str, required=True)
     ap.add_argument("--chunk-rows", type=int, default=2_000_000)
     ap.add_argument(
         "--checkpoint-dir",
@@ -290,7 +300,8 @@ def main():
     print(f"Labelled : {args.labelled}")
     print(f"Model    : {args.model}")
     print(f"Target   : {args.target}")
-    print(f"Leads    : {args.lead_hours}")
+    lead_hours = parse_leads(args.lead_hours)
+    print(f"Leads    : {lead_hours}")
 
     # Load bundle
     model_global, scaler, FEATS, imp_stats, clip_stats, per_lead = _load_bundle(args.model)
@@ -341,13 +352,13 @@ def main():
 
     # If we have per-lead estimators, score separately per lead. Otherwise, score once with the global model.
     per_lead_probs = {}
-    have_any_perlead = any((L in per_lead) for L in args.lead_hours)
+    have_any_perlead = any((L in per_lead) for L in lead_hours)
     if have_any_perlead:
         print(
             "[EVAL] Using per-lead estimators where available; falling back to global otherwise.",
             flush=True,
         )
-        for L in args.lead_hours:
+        for L in lead_hours:
             est = per_lead.get(L, model_global)
             tag = L if (L in per_lead) else None  # separate checkpoints per true per-lead
             per_lead_probs[L] = score_probs(est, ckpt_tag=tag)
@@ -357,7 +368,7 @@ def main():
             flush=True,
         )
         p_global = score_probs(model_global, ckpt_tag=None)
-        for L in args.lead_hours:
+        for L in lead_hours:
             per_lead_probs[L] = p_global
 
     # coincident metrics (global target now vs probs used for first lead shown)
@@ -367,7 +378,7 @@ def main():
         .astype(int)
         .to_numpy()
     )
-    anyL = args.lead_hours[0]
+    anyL = lead_hours[0]
     mets0 = safe_metrics(y0, per_lead_probs[anyL])
     print(
         f"[COINCIDENT] AUC={mets0['AUC']:.3f}  "
@@ -385,7 +396,7 @@ def main():
 
     # lead metrics (each lead gets its own probabilities if per-lead model present)
     labels_per_h = {}
-    for h in args.lead_hours:
+    for h in lead_hours:
         print(f"Preparing lead +{h}h labels …", flush=True)
         yh = labeler(df, args.target, hours=h)
         posh = int(yh.sum())

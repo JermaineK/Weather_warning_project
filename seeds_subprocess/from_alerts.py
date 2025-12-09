@@ -27,7 +27,7 @@ Key upgrades:
 
 from __future__ import annotations
 
-import argparse, glob, os
+import argparse, glob, os, sys
 from pathlib import Path
 from typing import Optional, Iterable
 
@@ -39,8 +39,8 @@ import pandas as pd
 TIME_CANDIDATES = ["time", "valid_time", "t", "datetime"]
 LAT_CANDIDATES  = ["lat", "latitude", "Lat", "Latitude"]
 LON_CANDIDATES  = ["lon", "longitude", "Lon", "Longitude"]
-PROB_CANDIDATES = ["prob", "prob_max", "p", "score", "max_prob_hour"]
-FLAG_CANDIDATES = ["alert_final", "alert", "flag", "is_event", "label"]
+PROB_CANDIDATES = ["prob_viable", "prob", "prob_max", "p", "score", "max_prob_hour"]
+FLAG_CANDIDATES = ["alert_final", "alert_base", "alert", "flag", "is_event", "label"]
 
 def to_utc_naive(series: pd.Series, fmt: Optional[str]) -> pd.Series:
     raw = series.astype(str).str.strip().str.replace("Z", "", regex=False)
@@ -138,24 +138,44 @@ def _normalize_and_project(df: pd.DataFrame,
 
 def main():
     ap = argparse.ArgumentParser(description="Build hourly proto-seeds from alert files.")
-    ap.add_argument("--alerts", required=True,
-                    help="Glob of alert files, e.g. results/alerts/alerts_*_thr*.csv.gz (CSV/Parquet supported)")
-    ap.add_argument("--prob-col", default=None, help="Explicit probability column override")
-    ap.add_argument("--flag-col", default=None, help="Explicit alert flag column override")
+    ap.add_argument("--alerts", required=False, default=None,
+                    help="Glob of alert files, e.g. results/alerts/alerts_*_final.parquet (CSV/Parquet supported)")
+    ap.add_argument("--prob-col", default="prob_viable", help="Explicit probability column override (default: prob_viable)")
+    ap.add_argument("--flag-col", default="alert_final", help="Explicit alert flag column override (default: alert_final)")
     ap.add_argument("--time-floor", default="H", help="Time floor (pandas offset alias); default: H")
     ap.add_argument("--thr", type=float, default=None,
                     help="Optional prob threshold; keep rows with prob_max>=thr OR any_alert>0")
     ap.add_argument("--normalize-lon", choices=["none", "-180..180", "0..360"], default="-180..180",
+                    type=str,
                     help="Longitude normalization for inputs (default -180..180)")
     ap.add_argument("--area", default=None,
                     help='Optional AOI "latN,lonW,latS,lonE" applied after lon normalization')
     ap.add_argument("--chunk-rows", type=int, default=0,
                     help="Chunk size for large CSVs (0 disables chunking)")
     ap.add_argument("--out-dir", default="results/seedmaps")
-    ap.add_argument("--run-name", default="proto")
+    ap.add_argument("--run-name", default="run")
     ap.add_argument("--time-format", default=None, help="Optional strptime format for non-standard time strings")
     ap.add_argument("--write-parquet", action="store_true", help="Also write Parquet copies next to CSVs")
-    args = ap.parse_args()
+    # preprocess normalize-lon to handle tokens like "-180..180"
+    argv = []
+    skip = False
+    raw = sys.argv[1:]
+    for i, tok in enumerate(raw):
+        if skip:
+            skip = False
+            continue
+        if tok == "--normalize-lon" and i + 1 < len(raw):
+            argv.append(f"--normalize-lon={raw[i+1].strip()}")
+            skip = True
+        elif tok.startswith("--normalize-lon="):
+            lhs, rhs = tok.split("=", 1)
+            argv.append(f"{lhs}={rhs.strip()}")
+        else:
+            argv.append(tok)
+    args = ap.parse_args(argv)
+
+    if args.alerts is None:
+        args.alerts = f"results/alerts/alerts_{args.run_name}_final.parquet"
 
     paths = sorted(glob.glob(args.alerts))
     if not paths:

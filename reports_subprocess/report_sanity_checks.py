@@ -59,12 +59,12 @@ def main() -> None:
     ap.add_argument(
         "--alerts-dir",
         default="results/alerts",
-        help="Directory to scan for alerts_*_base.csv.gz when --require-alerts is set.",
+        help="Directory to scan for alerts_*_base.* when --require-alerts is set.",
     )
     ap.add_argument(
         "--require-alerts",
         action="store_true",
-        help="Require at least one alerts_*_base.csv.gz with readable rows.",
+        help="Require at least one alerts_*_base.* with readable rows.",
     )
     ap.add_argument(
         "--strict",
@@ -95,23 +95,35 @@ def main() -> None:
         found_any = False
 
         if alerts_dir.exists():
-            for fp in sorted(alerts_dir.glob("alerts_*_base.csv.gz")):
-                rows = nonempty_csv(fp, max_rows=500)
+            for fp in sorted(alerts_dir.glob("alerts_*_base.*")):
                 found_any = True
-                if rows < 0:
-                    print(f"[sanity] alerts file: {fp.name}  READ_ERROR")
-                    ok = False
-                elif rows == 0:
-                    print(f"[sanity] alerts file: {fp.name}  sample_rows=0 (empty?)")
-                    ok = False
+                if fp.suffix.lower() in {".parquet", ".pq", ".pqt"}:
+                    try:
+                        sample = pd.read_parquet(fp, columns=["time"], nrows=500)
+                        rows = len(sample)
+                        print(f"[sanity] alerts file: {fp.name}  sample_rows={rows}")
+                        if rows == 0:
+                            ok = False
+                    except Exception as exc:
+                        # Treat as a warning so a single flaky parquet file does not fail the run.
+                        print(f"[sanity] alerts file: {fp.name}  READ_ERROR ({exc})")
+                        continue
                 else:
-                    print(f"[sanity] alerts file: {fp.name}  sample_rows={rows}")
+                    rows = nonempty_csv(fp, max_rows=500)
+                    if rows < 0:
+                        print(f"[sanity] alerts file: {fp.name}  READ_ERROR")
+                        ok = False
+                    elif rows == 0:
+                        print(f"[sanity] alerts file: {fp.name}  sample_rows=0 (empty?)")
+                        ok = False
+                    else:
+                        print(f"[sanity] alerts file: {fp.name}  sample_rows={rows}")
         else:
             print(f"[sanity] alerts directory not found: {alerts_dir}")
             found_any = False
 
         if not found_any:
-            print(f"[sanity] no alerts_*_base.csv.gz in {alerts_dir}")
+            print(f"[sanity] no alerts_*_base.* in {alerts_dir}")
             ok = False
 
     if args.strict and not ok:

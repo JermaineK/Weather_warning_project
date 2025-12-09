@@ -12,7 +12,7 @@ Optional:
   <prob_col> (configurable; default 'prob')
 """
 
-import argparse, glob, math
+import argparse, glob, math, sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -128,7 +128,10 @@ def read_many(paths, cols_needed, prob_col):
         try:
             usecols = [c for c in cols_needed if c not in ("prob", prob_col)] + [prob_col]
             usecols = list(dict.fromkeys(usecols))  # preserve order, dedupe
-            df = pd.read_csv(p, usecols=lambda c: (c in usecols) or (c == "prob"), low_memory=False)
+            if str(p).lower().endswith((".parquet", ".pq", ".pqt")):
+                df = pd.read_parquet(p, columns=None)
+            else:
+                df = pd.read_csv(p, usecols=lambda c: (c in usecols) or (c == "prob"), low_memory=False)
             if "prob" in df.columns and prob_col not in df.columns:
                 df.rename(columns={"prob": prob_col}, inplace=True)
             df["_src"] = p
@@ -143,19 +146,66 @@ def expand_alert_patterns(patterns):
         out.extend(glob.glob(pat))
     return sorted(set(out))
 
+
+def _write_output(df: pd.DataFrame, path: str):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    suf = p.suffix.lower()
+    if suf in (".parquet", ".pq", ".pqt"):
+        df.to_parquet(p, index=False)
+    else:
+        df.to_csv(p, index=False)
+
 # -------------------- main --------------------
 
 def main():
     ap = argparse.ArgumentParser(description="Compute hourly alert metrics with optional cluster stats.")
-    ap.add_argument("--alerts", nargs="+", required=True, help="Glob pattern(s) to alerts CSVs.")
+    ap.add_argument("--alerts", nargs="+", required=False, default=None, help="Glob pattern(s) to alerts CSVs.")
     ap.add_argument("--flag-col", default="alert_final", help="Binary alert flag column.")
-    ap.add_argument("--prob-col", default="prob", help="Probability column name if present (default: prob).")
-    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="none",
+    ap.add_argument("--prob-col", default="prob_viable", help="Probability column name if present (default: prob_viable).")
+    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="-180..180",
+                    type=str,
                     help="Normalize longitude before clustering/metrics.")
     ap.add_argument("--area", default=None, help='Optional AOI "latN,lonW,latS,lonE" after lon normalization.')
-    ap.add_argument("--tag", default="run", help="Short tag to include in output (e.g. 'thr' or 'den').")
-    ap.add_argument("--out", required=True, help="Output CSV path for hourly KPIs.")
-    args = ap.parse_args()
+    ap.add_argument("--tag", default=None, help="Short tag to include in output (e.g. 'thr' or 'den').")
+    ap.add_argument("--out", required=False, default=None, help="Output CSV path for hourly KPIs.")
+    ap.add_argument("--run-name", default=None, help="Optional run name to auto-fill tag/paths (alerts_<run>_*).")
+    # Chunk hints (accepted for compatibility; not used)
+    ap.add_argument("--chunk-rows", type=int, default=None, help="Accepted for compatibility; not used.")
+    ap.add_argument("--chunksize", type=int, default=None, help="Alias for --chunk-rows.")
+    ap.add_argument("--parquet-rows", type=int, default=None, help="Accepted for compatibility; not used.")
+    # preprocess normalize-lon to handle tokens like "-180..180"
+    argv = []
+    skip = False
+    raw = sys.argv[1:]
+    for i, tok in enumerate(raw):
+        if skip:
+            skip = False
+            continue
+        if tok == "--normalize-lon" and i + 1 < len(raw):
+            val = raw[i + 1].strip()
+            argv.append(f"--normalize-lon={val}")
+            skip = True
+        elif tok.startswith("--normalize-lon="):
+            lhs, rhs = tok.split("=", 1)
+            argv.append(f"{lhs}={rhs.strip()}")
+        else:
+            argv.append(tok)
+    args = ap.parse_args(argv)
+
+    if args.alerts is None:
+        if args.run_name:
+            args.alerts = [f"results/alerts/alerts_{args.run_name}_*.csv.gz"]
+        else:
+            raise SystemExit("--alerts is required (or provide --run-name for defaults).")
+
+    if args.tag is None:
+        args.tag = args.run_name or "run"
+    if args.out is None:
+        args.out = (
+            f"results/metrics/{args.run_name}_hourly_metrics.csv"
+            if args.run_name else "results/metrics/hourly_metrics.csv"
+        )
 
     paths = expand_alert_patterns(args.alerts)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -165,12 +215,13 @@ def main():
 
     if df.empty:
         # Empty skeleton
-        pd.DataFrame(columns=[
+        empty = pd.DataFrame(columns=[
             "_hour","_tag","rows","active","coverage",
             "n_clusters","mean_cluster_area_km2","median_cluster_area_km2",
             "mean_prob_active","max_prob_hour",
             "n_files","hour_start"
-        ]).to_csv(args.out, index=False)
+        ])
+        _write_output(empty, args.out)
         print(f"[write] {args.out} (no rows)")
         return
 
@@ -238,7 +289,7 @@ def main():
             "n_files","hour_start"]
     out = out[cols].sort_values("_hour").reset_index(drop=True)
 
-    out.to_csv(args.out, index=False)
+    _write_output(out, args.out)
     print(f"[write] {args.out} (rows={len(out)})")
 
 if __name__ == "__main__":

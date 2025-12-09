@@ -29,14 +29,45 @@ def _read_any(path: str) -> pd.DataFrame:
     return pd.read_csv(path, low_memory=False)
 
 
-def _write_any(path: str, df: pd.DataFrame) -> None:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if _is_parquet(str(p)):
-        df.to_parquet(p, index=False)
-        return
-    comp = "gzip" if p.name.lower().endswith(".gz") else "infer"
-    df.to_csv(p, index=False, compression=comp, date_format="%Y-%m-%d %H:%M:%S")
+class _StreamWriter:
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._mode = "parquet" if _is_parquet(str(self.path)) else "csv"
+        self._parquet_writer = None
+        self._header_written = False
+
+    def write(self, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        if self._mode == "parquet":
+            import pyarrow as pa  # type: ignore
+            import pyarrow.parquet as pq  # type: ignore
+
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if self._parquet_writer is None:
+                if self.path.exists():
+                    self.path.unlink()
+                self._parquet_writer = pq.ParquetWriter(self.path, table.schema)
+            self._parquet_writer.write_table(table)
+            return
+
+        comp = "gzip" if self.path.name.lower().endswith(".gz") else "infer"
+        self.path.write_text("") if not self.path.exists() else None
+        df.to_csv(
+            self.path,
+            index=False,
+            compression=comp,
+            date_format="%Y-%m-%d %H:%M:%S",
+            mode="a" if self._header_written else "w",
+            header=not self._header_written,
+        )
+        self._header_written = True
+
+    def close(self) -> None:
+        if self._parquet_writer is not None:
+            self._parquet_writer.close()
+            self._parquet_writer = None
 
 
 def main() -> None:
@@ -95,7 +126,7 @@ def main() -> None:
 
     # streaming read/write
     is_parquet = _is_parquet(args.panel)
-    writer = None
+    writer = _StreamWriter(args.out)
     total = 0
     t0_global = None
 
@@ -112,12 +143,10 @@ def main() -> None:
     for ch in iterator:
         df_chunk = ch
         df_chunk, t0_global = process_chunk(df_chunk, t0_global)
-        if writer is None:
-            # init output based on first chunk type
-            writer = _write_any
-        _write_any(args.out, df_chunk if writer is _write_any else df_chunk)
+        writer.write(df_chunk)
         total += len(df_chunk)
 
+    writer.close()
     print(f"[done] wrote slow-tick features -> {args.out}  (rows={total:,})")
 
 

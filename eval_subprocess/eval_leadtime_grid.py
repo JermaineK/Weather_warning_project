@@ -68,11 +68,21 @@ def parse_args():
     ap.add_argument(
         "--lead-hours",
         nargs="+",
-        type=int,
-        default=[24, 48],
+        type=str,
+        default=["24", "48"],
         help="Lead horizons in hours, e.g. 6 12 24 48.",
     )
     return ap.parse_args()
+
+
+def parse_leads(raw) -> list[int]:
+    leads: list[int] = []
+    for tok in raw:
+        for part in str(tok).replace(",", " ").split():
+            if not part:
+                continue
+            leads.append(int(float(part)))
+    return leads
 
 
 def load_any(path: str) -> pd.DataFrame:
@@ -171,6 +181,7 @@ def safe_metrics(y, p):
 
 def main():
     args = parse_args()
+    lead_hours = parse_leads(args.lead_hours)
     use, sc, clf = load_model(args.model)
     df = prep_df(args.labelled, use, args.target)
 
@@ -192,7 +203,7 @@ def main():
         )
 
     # Per-lead evaluation with strict-future windows
-    for h in args.lead_hours:
+    for h in lead_hours:
         y = future_max_within_hours(df, args.target, hours=h)
         m = safe_metrics(y, p)
         pos = int(y.sum())

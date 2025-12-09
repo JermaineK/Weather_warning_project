@@ -23,6 +23,7 @@ python hourly_rollup.py \
 """
 
 import argparse
+import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -51,13 +52,45 @@ def write_any(path, df):
 
 def main():
     ap = argparse.ArgumentParser(description="Hourly roll-up of alert risks/flags.")
-    ap.add_argument("--alerts", required=True, help="CSV(.gz)/Parquet with cols time,lat,lon,+risk/flags")
+    ap.add_argument("--alerts", required=False, default=None, help="CSV(.gz)/Parquet with cols time,lat,lon,+risk/flags")
     ap.add_argument("--flag-col", default="alert_final",
                     help="Final alert flag to count (e.g., alert_final). If missing, skip.")
     ap.add_argument("--risk-cols", default=None,
                     help="Comma-separated risk columns to aggregate (default: auto-detect 'risk*').")
-    ap.add_argument("--out", required=True, help="Output CSV(.gz)/Parquet")
-    args = ap.parse_args()
+    ap.add_argument("--out", required=False, default=None, help="Output CSV(.gz)/Parquet")
+    ap.add_argument("--run-name", default=None, help="Optional run name to auto-fill alerts/out paths.")
+    # Chunk hints for compatibility
+    ap.add_argument("--chunk-rows", type=int, default=None, help="Accepted for compatibility; not used.")
+    ap.add_argument("--chunksize", type=int, default=None, help="Alias for --chunk-rows.")
+    ap.add_argument("--parquet-rows", type=int, default=None, help="Accepted for compatibility; not used.")
+    # preprocess normalize-lon similar to other scripts
+    argv = []
+    skip = False
+    raw = sys.argv[1:]
+    for i, tok in enumerate(raw):
+        if skip:
+            skip = False
+            continue
+        if tok == "--normalize-lon" and i + 1 < len(raw):
+            argv.append(f"--normalize-lon={raw[i+1].strip()}")
+            skip = True
+        elif tok.startswith("--normalize-lon="):
+            lhs, rhs = tok.split("=", 1)
+            argv.append(f"{lhs}={rhs.strip()}")
+        else:
+            argv.append(tok)
+    args = ap.parse_args(argv)
+
+    if args.alerts is None:
+        if args.run_name:
+            args.alerts = f"results/alerts/alerts_{args.run_name}_final.csv.gz"
+        else:
+            raise SystemExit("--alerts is required (or provide --run-name for defaults).")
+    if args.out is None:
+        args.out = (
+            f"results/metrics/{args.run_name}_hourly_rollup.parquet"
+            if args.run_name else "results/metrics/hourly_rollup.parquet"
+        )
 
     # Load minimal columns first; expand later for risks/flag
     df = read_any(args.alerts, parse_dates=["time"])

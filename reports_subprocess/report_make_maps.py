@@ -7,13 +7,20 @@ Quick, dependency-light QA maps:
   - scatter of seed union points (by hour or cell)
   - scatter of patch centroids
 
-Intended to be called by a higher-level run manager which:
-  - Creates a unique run folder, e.g. results/reports/20251122_run001
-  - Passes that as --out-dir (optionally plus a figs/ subfolder)
+Pipeline-aware defaults:
+  * If --run-name is provided and no explicit paths are given:
+      union file   -> results/seedmaps/<run_name>_union_byhour.csv
+      patches file -> results/seedmaps/<run_name>_seed_patches.csv
+      out dir      -> results/reports/<run_name>/figs
+  * If explicit paths are given, they win.
+  * If neither run-name nor explicit paths are given, fall back to the
+    legacy defaults:
+      union file   -> results/seedmaps/union_byhour.csv
+      patches file -> results/seedmaps/seed_patches.csv
+      out dir      -> results/figs
 
 This script does *not* try to manage run IDs itself; it just writes PNGs
-into the given --out-dir without overwriting protection (the manager
-is responsible for making that unique per run).
+into the given --out-dir. Overwrite protection is the caller's job.
 """
 
 import argparse
@@ -94,27 +101,69 @@ def plot_points(df: pd.DataFrame, out_png: Path, title: str, value_col: str | No
     print(f"[maps] wrote {out_png}")
 
 
+def _infer_union_path(run_name: str | None, explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit)
+    if run_name:
+        return Path("results/seedmaps") / f"{run_name}_union_byhour.csv"
+    return Path("results/seedmaps/union_byhour.csv")
+
+
+def _infer_patches_path(run_name: str | None, explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit)
+    if run_name:
+        return Path("results/seedmaps") / f"{run_name}_seed_patches.csv"
+    return Path("results/seedmaps/seed_patches.csv")
+
+
+def _infer_out_dir(run_name: str | None, explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit)
+    if run_name:
+        return Path("results/reports") / run_name / "figs"
+    return Path("results/figs")
+
+
+def _read_any(path: Path) -> pd.DataFrame:
+    suf = "".join(path.suffixes).lower()
+    if suf.endswith((".parquet", ".pq", ".pqt")):
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Simple PNG maps for quick QA (union + patch centroids).")
     ap.add_argument(
         "--run-name",
         default=None,
-        help="Optional logical run label (used only in titles; manager should provide per-run out-dir).",
+        help="Logical run label; used in titles and to infer default input/output paths.",
     )
     ap.add_argument(
+        "--union-path",
         "--union-csv",
-        default="results/seedmaps/union_byhour.csv",
-        help="Seed union CSV/Parquet with at least lat,lon[,prob_max].",
+        default=None,
+        help=(
+            "Explicit path to seed union file (CSV/Parquet with lat,lon[,prob_max]). "
+            "If omitted, inferred from --run-name."
+        ),
     )
     ap.add_argument(
+        "--patches-path",
         "--patches-csv",
-        default="results/seedmaps/seed_patches.csv",
-        help="Seed patches CSV/Parquet with lat_cen,lon_cen.",
+        default=None,
+        help=(
+            "Explicit path to seed patches file (CSV/Parquet with lat_cen,lon_cen). "
+            "If omitted, inferred from --run-name."
+        ),
     )
     ap.add_argument(
         "--out-dir",
-        default="results/figs",
-        help="Output folder for PNGs (manager should make this per-run).",
+        default=None,
+        help=(
+            "Output folder for PNGs. If omitted, uses results/reports/<run_name>/figs when --run-name is set, "
+            "else results/figs."
+        ),
     )
     ap.add_argument(
         "--union-value-col",
@@ -123,18 +172,15 @@ def main():
     )
     args = ap.parse_args()
 
-    out_dir = Path(args.out_dir)
+    out_dir = _infer_out_dir(args.run_name, args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     run_label = f" — {args.run_name}" if args.run_name else ""
 
     # Union map
     try:
-        upath = Path(args.union_csv)
-        if upath.suffix.lower() in (".parquet", ".pq", ".pqt"):
-            u = pd.read_parquet(upath)
-        else:
-            u = pd.read_csv(upath)
+        upath = _infer_union_path(args.run_name, args.union_path)
+        u = _read_any(upath)
         if {"lat", "lon"}.issubset(u.columns):
             plot_points(
                 u,
@@ -145,17 +191,14 @@ def main():
         else:
             print(f"[maps] union file missing lat/lon: {upath}")
     except FileNotFoundError:
-        print(f"[maps] union file not found: {args.union_csv}")
+        print(f"[maps] union file not found: {upath}")
     except Exception as e:
-        print(f"[maps] error reading union file {args.union_csv}: {e}")
+        print(f"[maps] error reading union file {upath}: {e}")
 
     # Patch centroids
     try:
-        ppath = Path(args.patches_csv)
-        if ppath.suffix.lower() in (".parquet", ".pq", ".pqt"):
-            p = pd.read_parquet(ppath)
-        else:
-            p = pd.read_csv(ppath)
+        ppath = _infer_patches_path(args.run_name, args.patches_path)
+        p = _read_any(ppath)
         if {"lat_cen", "lon_cen"}.issubset(p.columns):
             rename = p.rename(columns={"lat_cen": "lat", "lon_cen": "lon"})
             plot_points(
@@ -167,9 +210,9 @@ def main():
         else:
             print(f"[maps] patches file missing lat_cen/lon_cen: {ppath}")
     except FileNotFoundError:
-        print(f"[maps] patches file not found: {args.patches_csv}")
+        print(f"[maps] patches file not found: {ppath}")
     except Exception as e:
-        print(f"[maps] error reading patches file {args.patches_csv}: {e}")
+        print(f"[maps] error reading patches file {ppath}: {e}")
 
     print(f"[maps] QA PNGs (if any) are under {out_dir}")
 

@@ -350,6 +350,15 @@ def main() -> None:
     selected_id_set: Set[object] = {
         v for v in (_to_python_id(x) for x in selected_ids) if v is not None
     }
+    if args.max_rows and len(selected_id_set) > args.max_rows:
+        orig_size = len(selected_id_set)
+        rng = np.random.default_rng(args.seed)
+        sampled = rng.choice(list(selected_id_set), size=args.max_rows, replace=False)
+        selected_id_set = set(sampled)
+        print(
+            f"[pass1] max_rows cap: downsampled selected IDs to {len(selected_id_set):,} "
+            f"(from {orig_size:,})"
+        )
     print(
         f"[pass1] total selected IDs after combining positives + quiet (unique) = "
         f"{len(selected_id_set):,}"
@@ -361,6 +370,7 @@ def main() -> None:
     # ----- PASS 2: STREAM FULL FILE AND FILTER BY ID -----
     writer = _SubsetWriter(out_path)
     total_kept = 0
+    found_ids: Set[object] = set()
 
     print(f"[pass2] streaming full {src} and filtering by {id_col} ∈ selected_id_set")
     for i, chunk in enumerate(_iter_full_file(src, chunksize=args.chunksize), start=1):
@@ -379,22 +389,14 @@ def main() -> None:
             print(f"[pass2] chunk {i}: kept 0 rows (cum={total_kept:,})")
             continue
 
-        if args.max_rows and total_kept + kept_here > args.max_rows:
-            remaining = args.max_rows - total_kept
-            if remaining <= 0:
-                print("[pass2] reached max_rows cap; stopping.")
-                break
-            sub = sub.sample(n=remaining, random_state=args.seed)
-            kept_here = len(sub)
-            print(f"[pass2] chunk {i}: cap triggered, taking only {kept_here} rows.")
-
         writer.write(sub)
         total_kept += kept_here
+        found_ids.update(sub[id_col].apply(_to_python_id))
 
         print(f"[pass2] chunk {i}: kept {kept_here:,} rows (cum={total_kept:,})")
 
-        if args.max_rows and total_kept >= args.max_rows:
-            print("[pass2] reached max_rows cap; stopping.")
+        if len(found_ids) >= len(selected_id_set):
+            print("[pass2] seen all selected IDs; stopping early.")
             break
 
     writer.close()

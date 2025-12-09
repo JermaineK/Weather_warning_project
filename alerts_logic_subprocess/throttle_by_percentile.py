@@ -1,10 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, os
+import argparse
+import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
+
+def _strip_choice(val: str) -> str:
+    return str(val).strip()
+
+def _preprocess_norm(argv: list[str]) -> list[str]:
+    """
+    Allow --normalize-lon values that look like options (e.g., -180..180) by
+    rewriting them to --normalize-lon=<value> before argparse runs.
+    """
+    out = []
+    skip = False
+    for i, tok in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if tok == "--normalize-lon" and i + 1 < len(argv):
+            val = argv[i + 1]
+            out.append(f"--normalize-lon={val}")
+            skip = True
+        else:
+            out.append(tok)
+    return out
 
 # ---------------- I/O helpers (aligned with denoise) ----------------
 
@@ -71,8 +94,9 @@ def main():
     ap = argparse.ArgumentParser(
         description="Throttle per-hour by keeping the top quantile (optionally only among alert rows)."
     )
-    ap.add_argument("--alerts", required=True, help="Alerts file: CSV/CSV.GZ/Parquet; needs time, lat, lon, flag/score cols")
-    ap.add_argument("--out", required=True, help="Output file: CSV/CSV.GZ/Parquet")
+    ap.add_argument("--alerts", required=False, default=None,
+                    help="Alerts file: CSV/CSV.GZ/Parquet; needs time, lat, lon, flag/score cols")
+    ap.add_argument("--out", required=False, default=None, help="Output file: CSV/CSV.GZ/Parquet")
 
     # Selection logic
     ap.add_argument("--keep-quantile", type=float, default=0.90, help="Fraction to keep per hour (default: 0.90)")
@@ -87,20 +111,34 @@ def main():
     ap.add_argument("--time-col", default="time", help="Time column name (default: time)")
     ap.add_argument("--time-format", default=None, help="Optional strftime for custom time parsing")
     ap.add_argument("--prob-col", default=None, help="Legacy probability/score column (deprecated; use --score-col)")
-    ap.add_argument("--score-col", default="risk",
-                    help="Score column for ranking (default: 'risk'; falls back to --prob-col if not present).")
-    ap.add_argument("--flag-col", default=None,
+    ap.add_argument("--score-col", default="prob_viable",
+                    help="Score column for ranking (default: 'prob_viable'; falls back to --prob-col if not present).")
+    ap.add_argument("--flag-col", default="alert_base",
                     help="Binary alert flag column; auto-detects among ['alert','alert_throttled','alert_rule'] if omitted.")
     ap.add_argument("--only-alerts", action="store_true",
                     help="Throttle only among rows where <flag-col> == 1")
 
     # Geo & debug
-    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="none",
-                    help="Normalize longitudes before processing (default: none)")
+    ap.add_argument("--normalize-lon", choices=["none","-180..180","0..360"], default="-180..180",
+                    type=_strip_choice,
+                    help="Normalize longitudes before processing (default: -180..180)")
     ap.add_argument("--area", default=None, help='Optional crop "latN,lonW,latS,lonE" after lon normalization')
     ap.add_argument("--sparse-output", action="store_true", help="Write only rows kept after throttling.")
     ap.add_argument("--debug", action="store_true", help="Print ranges and hourly counts")
-    args = ap.parse_args()
+    ap.add_argument("--run-name", default=None, help="Optional run name for default inputs/outputs.")
+    argv = _preprocess_norm(sys.argv[1:])
+    args = ap.parse_args(argv)
+
+    if args.alerts is None:
+        if args.run_name:
+            args.alerts = f"results/alerts/alerts_{args.run_name}_base.parquet"
+        else:
+            raise SystemExit("--alerts is required (or provide --run-name for defaults).")
+    if args.out is None:
+        args.out = (
+            f"results/alerts/alerts_{args.run_name}_thr.parquet"
+            if args.run_name else "results/alerts/alerts_thr.parquet"
+        )
 
     # ---- Load
     df = read_any(args.alerts).replace([np.inf,-np.inf], np.nan)

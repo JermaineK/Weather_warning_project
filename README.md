@@ -327,6 +327,17 @@ Storm tracks are typically under `data/tracks/tracks\_subset.csv`.
 
 
 
+## Subprocess cheatsheet (viability-first defaults)
+
+- Alerts logic (`alerts_logic_subprocess/`): defaults point at `models/viability_model.pkl` and emit `prob_viable`/`alert_final`. See `alerts_logic_subprocess/Alerts_logic_subprocess.txt`.
+- Sweeps (`sweep_subprocess/`): viability threshold finder uses `y_viable` + `t_to_storm_min_h`; outputs `results/sweeps/viability_best_thresholds.csv`. See `sweep_subprocess/Sweep_subprocess.txt`.
+- Seeds (`seeds_subprocess/`): `from-alerts` expects `prob_viable` + `alert_final`, writing `<run>_union_byhour.csv`, `<run>_seed_patches.csv`, and matches. See `seeds_subprocess/Seed_and_Track_Toolkit.txt`.
+- Reports (`reports_subprocess/`): manager infers per-run paths from `--run-name`, surfaces viability metrics/thresholds, and points maps at the new seed outputs. See `reports_subprocess/Reports_and_maps_subprocess.txt`.
+- Eval (`eval_subprocess/`): alert hits can use `t_to_storm_min_h` truth mode; hourly metrics default to `prob_viable`.
+- Chunking: many workers accept `--chunk-rows`/`--parquet-rows`; enable them on large tables to stay memory-safe.
+
+
+
 ---
 
 

@@ -12,6 +12,7 @@ Patched version:
 """
 
 import argparse
+import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -114,24 +115,50 @@ def temporal_persist(df: pd.DataFrame, flag_col: str, persist_hours: int) -> pd.
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Denoise alerts (spatial neighbors + temporal persistence).")
-    ap.add_argument("--alerts", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--flag-col", default="alert_final",
-                    help="Binary alert flag column (default: alert_final; falls back to 'alert' if missing).")
-    ap.add_argument("--persist-hours", type=int, default=1)
+    ap.add_argument("--alerts", required=False, default=None)
+    ap.add_argument("--out", required=False, default=None)
+    ap.add_argument("--flag-col", default="alert_base",
+                    help="Binary alert flag column to denoise (default: alert_base; falls back to 'alert' if missing).")
+    ap.add_argument("--flag-out", default="alert_final",
+                    help="Output flag column name (default: alert_final; if empty, overwrite flag-col).")
+    ap.add_argument("--persist-hours", type=int, default=3)
     ap.add_argument("--min-neighbors", type=int, default=3)
     ap.add_argument("--connectivity", type=int, choices=[4,8], default=4)
     ap.add_argument("--min-area", type=int, default=0)  # reserved
-    ap.add_argument("--sparse-output", action="store_true")
+    ap.add_argument("--sparse-output", dest="sparse_output", action="store_true")
     ap.add_argument("--overwrite", action="store_true")
-    ap.add_argument("--score-col", default="risk",
-                    help="Optional score/probability column to passthrough (default: risk; ignored if absent).")
+    ap.add_argument("--score-col", default="prob_viable",
+                    help="Optional score/probability column to passthrough (default: prob_viable; ignored if absent).")
     ap.add_argument("--extra-cols", default="",
                     help="Comma-separated list of extra columns to passthrough if present.")
-    return ap.parse_args()
+    ap.add_argument("--run-name", default=None, help="Optional run name for default inputs/outputs.")
+    argv = []
+    skip = False
+    # preprocess normalize-lon for consistency with other scripts (accept leading-space token forms)
+    raw = sys.argv[1:]
+    for i, tok in enumerate(raw):
+        if skip:
+            skip = False
+            continue
+        if tok == "--normalize-lon" and i + 1 < len(raw):
+            argv.append(f"--normalize-lon={raw[i+1]}")
+            skip = True
+        else:
+            argv.append(tok)
+    return ap.parse_args(argv)
 
 def main():
     args = parse_args()
+    if args.alerts is None:
+        if args.run_name:
+            args.alerts = f"results/alerts/alerts_{args.run_name}_thr.parquet"
+        else:
+            raise SystemExit("--alerts is required (or provide --run-name for defaults).")
+    if args.out is None:
+        args.out = (
+            f"results/alerts/alerts_{args.run_name}_final.parquet"
+            if args.run_name else "results/alerts/alerts_final.parquet"
+        )
     if Path(args.out).exists() and not args.overwrite:
         print(f"[skip] exists: {args.out}")
         return
@@ -145,6 +172,8 @@ def main():
         flag_col = "alert"
     else:
         raise ValueError(f"Need a flag column '{args.flag_col}' or 'alert'.")
+
+    flag_out = args.flag_out if args.flag_out else flag_col
 
     # keep original geometry; normalize types and floor to hour
     df = df.copy()
@@ -195,11 +224,13 @@ def main():
         if c in df.columns and c not in out.columns:
             out[c] = df[c]
 
-    # Final flag
-    out[flag_col] = df["_kept"].astype(int)
+    # Final flag(s)
+    out[flag_out] = df["_kept"].astype(int)
+    if flag_out != flag_col and flag_col not in out.columns:
+        out[flag_col] = df["_kept"].astype(int)
 
-    if args.sparse-output:
-        out = out.loc[out[flag_col] == 1].reset_index(drop=True)
+    if args.sparse_output:
+        out = out.loc[out[flag_out] == 1].reset_index(drop=True)
 
     write_any(args.out, out)
     print(f"[denoise] wrote {len(out):,} rows -> {args.out}")
