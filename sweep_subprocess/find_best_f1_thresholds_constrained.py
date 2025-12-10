@@ -747,6 +747,30 @@ def main():
         else:
             print(f"[warn] lead_col={args.lead_col} not found; falling back to success/target logic")
 
+    # helper for chunked scoring to avoid long silent runs
+    def score_probs(estimator, X_mat, batch_rows: int = 1_000_000):
+        n = len(X_mat)
+        if n == 0:
+            return np.array([], dtype=np.float64)
+        # choose batch: respect hint if provided
+        if args.chunk_rows or args.chunksize or args.parquet_rows:
+            hint = args.chunk_rows or args.chunksize or args.parquet_rows
+            if hint and hint > 0:
+                batch_rows = max(100_000, int(hint))
+        prob_out = np.empty(n, dtype=np.float64)
+        for start in range(0, n, batch_rows):
+            end = min(n, start + batch_rows)
+            if hasattr(estimator, "predict_proba"):
+                prob_out[start:end] = estimator.predict_proba(X_mat[start:end])[:, 1].astype(np.float64)
+            else:
+                from scipy.special import expit
+                dec = estimator.decision_function(X_mat[start:end]).astype(np.float64)
+                prob_out[start:end] = expit(dec)
+            if n > batch_rows:
+                pct = 100.0 * end / n
+                print(f"    scored {end:,}/{n:,} rows ({pct:.1f}%)", flush=True)
+        return prob_out
+
     for i, h in enumerate(leads, start=1):
         print(
             f"\nLead +{h}h - scoring probabilities and sweeping thresholds . "
@@ -761,12 +785,7 @@ def main():
             print("  • no per-lead estimator; using global", flush=True)
 
         # Score probs for this lead
-        if hasattr(est, "predict_proba"):
-            prob = est.predict_proba(X)[:, 1].astype(np.float64)
-        else:
-            from scipy.special import expit
-            dec = est.decision_function(X).astype(np.float64)
-            prob = expit(dec)
+        prob = score_probs(est, X)
 
         # Build success labels for this horizon
         if lead_vals is not None:
