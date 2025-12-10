@@ -87,6 +87,7 @@ def _subsample(
 
     if "lead_band" in df.columns:
         groups = []
+        total_rows = 0
         for _, gdf in df.groupby("lead_band"):
             pos = gdf[gdf[target] == 1]
             neg = gdf[gdf[target] == 0]
@@ -98,12 +99,20 @@ def _subsample(
             if neg_pos_ratio > 0:
                 keep_neg = min(len(neg), int(neg_pos_ratio * len(pos)))
                 neg = neg.sample(n=keep_neg, random_state=seed)
-            groups.append(pd.concat([pos, neg], axis=0))
+            g_take = pd.concat([pos, neg], axis=0)
+            groups.append(g_take)
+            total_rows += len(g_take)
+            # keep accumulator bounded
+            if max_train_rows and total_rows > max_train_rows * 2:
+                merged = pd.concat(groups, axis=0)
+                merged = merged.sample(n=max_train_rows, random_state=seed)
+                groups = [merged]
+                total_rows = len(merged)
         if groups:
             df_fit = pd.concat(groups, axis=0)
             if max_train_rows and len(df_fit) > max_train_rows:
                 df_fit = df_fit.sample(n=max_train_rows, random_state=seed)
-            return df_fit
+            return df_fit.sample(frac=1.0, random_state=seed)
 
     # fallback: original class-balanced sampling
     pos = df[df[target] == 1]
@@ -114,9 +123,7 @@ def _subsample(
     df_fit = pd.concat([pos, neg], axis=0)
     if max_train_rows and len(df_fit) > max_train_rows:
         df_fit = df_fit.sample(n=max_train_rows, random_state=seed)
-    else:
-        df_fit = df_fit.sample(frac=1.0, random_state=seed)
-    return df_fit
+    return df_fit.sample(frac=1.0, random_state=seed)
 
 
 def _prepare_xy(df: pd.DataFrame, features: Sequence[str], target: str):
