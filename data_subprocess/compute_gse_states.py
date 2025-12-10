@@ -48,9 +48,12 @@ def _write_any(path: str, df: pd.DataFrame) -> None:
         df.to_csv(p, index=False, date_format="%Y-%m-%d %H:%M:%S")
 
 
-def _digitize_levels(series: pd.Series, quantiles: Sequence[float]) -> pd.Series:
+def _digitize_levels(series: pd.Series, quantiles_or_edges: Sequence[float], edges: bool = False) -> pd.Series:
     vals = pd.to_numeric(series, errors="coerce")
-    bins = np.quantile(vals.dropna(), quantiles)
+    if edges:
+        bins = np.asarray(quantiles_or_edges, dtype=float)
+    else:
+        bins = np.quantile(vals.dropna(), quantiles_or_edges)
     # deduplicate bins to avoid warnings
     bins = np.unique(bins)
     if len(bins) < 2:
@@ -103,11 +106,11 @@ def main() -> None:
 
     chunk_rows = args.chunk_rows or args.chunksize
 
-    def attach_states(df: pd.DataFrame, bins_g, bins_s, bins_e) -> pd.DataFrame:
+    def attach_states(df: pd.DataFrame, bins_g, bins_s, bins_e, edges=False) -> pd.DataFrame:
         df = df.copy()
-        df["G_level"] = _digitize_levels(df.get(args.g_col, pd.Series(dtype=float)), bins_g)
-        df["S_level"] = _digitize_levels(df.get(args.s_col, pd.Series(dtype=float)), bins_s)
-        df["E_level"] = _digitize_levels(df.get(args.e_col, pd.Series(dtype=float)), bins_e)
+        df["G_level"] = _digitize_levels(df.get(args.g_col, pd.Series(dtype=float)), bins_g, edges=edges)
+        df["S_level"] = _digitize_levels(df.get(args.s_col, pd.Series(dtype=float)), bins_s, edges=edges)
+        df["E_level"] = _digitize_levels(df.get(args.e_col, pd.Series(dtype=float)), bins_e, edges=edges)
         df["GSE_str"] = (
             "G" + df["G_level"].astype(str) + "S" + df["S_level"].astype(str) + "E" + df["E_level"].astype(str)
         )
@@ -192,14 +195,14 @@ def main() -> None:
             pf = pq.ParquetFile(args.panel)
             for batch in pf.iter_batches(batch_size=chunk_rows):
                 dfc = batch.to_pandas()
-                dfc = attach_states(dfc, bins_g, bins_s, bins_e)
+                dfc = attach_states(dfc, bins_g, bins_s, bins_e, edges=True)
                 tbl = pa.Table.from_pandas(dfc, preserve_index=False)
                 if writer is None:
                     writer = pq.ParquetWriter(out_path, tbl.schema)
                 writer.write_table(tbl)
         else:
             for chunk in pd.read_csv(args.panel, chunksize=chunk_rows, low_memory=False):
-                dfc = attach_states(chunk, bins_g, bins_s, bins_e)
+                dfc = attach_states(chunk, bins_g, bins_s, bins_e, edges=True)
                 tbl = pa.Table.from_pandas(dfc, preserve_index=False)
                 if writer is None:
                     writer = pq.ParquetWriter(out_path, tbl.schema)
@@ -211,12 +214,12 @@ def main() -> None:
         if is_parquet:
             pf = pq.ParquetFile(args.panel)
             for batch in pf.iter_batches(batch_size=chunk_rows):
-                dfc = attach_states(batch.to_pandas(), bins_g, bins_s, bins_e)
+                dfc = attach_states(batch.to_pandas(), bins_g, bins_s, bins_e, edges=True)
                 dfc.to_csv(out_path, mode="w" if first else "a", index=False, header=first)
                 first = False
         else:
             for chunk in pd.read_csv(args.panel, chunksize=chunk_rows, low_memory=False):
-                dfc = attach_states(chunk, bins_g, bins_s, bins_e)
+                dfc = attach_states(chunk, bins_g, bins_s, bins_e, edges=True)
                 dfc.to_csv(out_path, mode="w" if first else "a", index=False, header=first)
                 first = False
 
