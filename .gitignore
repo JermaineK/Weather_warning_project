@@ -47,6 +47,8 @@ data/**/*.nc
 # BUT allow track/reference files:
 !data/tracks/
 !data/tracks/*.csv
+# Explicitly ignore oversized IBTrACS CSV to avoid pushing >100MB
+data/tracks/ibtracs.ALL.list.v04r01.csv
 
 ########################
 ## MODEL ARTIFACTS    ##
