@@ -187,14 +187,17 @@ def main():
     alert_rows_sampled = 0
     alert_files = 0
     if alerts_dir.exists():
-        for p in alerts_dir.glob("alerts_*.csv*"):
+        alert_paths = list(alerts_dir.glob("alerts_*.csv*")) + list(alerts_dir.glob("alerts_*.parquet"))
+        for p in alert_paths:
             alert_files += 1
             try:
-                # Just sample a few rows to prove the file is readable / non-empty
-                c = pd.read_csv(p, nrows=1000)
-                alert_rows_sampled += len(c)
+                if p.suffix.lower() in {".parquet", ".pq"}:
+                    c = pd.read_parquet(p, columns=None)
+                else:
+                    c = pd.read_csv(p, nrows=1000)
+                alert_rows_sampled += min(len(c), 1000)
             except Exception:
-                # We don't fail the report if one file is unreadable
+                # Do not hard-fail on a bad file
                 continue
 
     # ---- IBTrACS presence snapshot ----
