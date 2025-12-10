@@ -502,6 +502,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-precision", type=float, default=0.12)
     ap.add_argument("--max-coverage", type=float, default=0.25)
     ap.add_argument("--fbeta", type=float, default=0.5)
+    ap.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Optional cap on rows for scoring; if set and table is larger, a random sample is used.",
+    )
     ap.add_argument("--out", required=True, help="CSV to save lead->thresholds")
     ap.add_argument(
         "--save-table",
@@ -650,6 +656,9 @@ def main():
 
     # Load & sanitize
     base = read_any(args.labelled, columns=columns)
+    if args.max_rows and len(base) > args.max_rows:
+        base = base.sample(n=int(args.max_rows), random_state=42)
+        print(f"[info] sampled down to {len(base):,} rows (max_rows={args.max_rows})")
 
     # Ensure core cols exist (target may be missing only if success exists—handled below)
     need = {"time", "lat", "lon"}
