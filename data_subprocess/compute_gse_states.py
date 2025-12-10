@@ -60,7 +60,8 @@ def _digitize_levels(series: pd.Series, quantiles_or_edges: Sequence[float], edg
         return pd.Series(np.nan, index=series.index, dtype=float)
     # np.digitize returns 1..len(bins); shift to 0-based levels
     levels = np.digitize(vals, bins[1:-1], right=False)
-    return levels.astype("Int64")
+    # use pandas dtype conversion for compatibility across numpy/pandas versions
+    return pd.Series(levels, index=series.index, copy=False).astype("int64")
 
 
 def main() -> None:
