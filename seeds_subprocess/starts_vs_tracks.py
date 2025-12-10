@@ -489,6 +489,13 @@ def main():
 
     # 2) Seed starts (per point)
     starts = find_seed_starts(seeds, tcol, fcol, min_run_hours=int(args.min_run_hours))
+    if not starts.empty:
+        lat_counts = starts["lat"].round(3).value_counts()
+        if not lat_counts.empty:
+            top_lat = lat_counts.index[0]
+            frac = lat_counts.iloc[0] / len(starts)
+            if frac > 0.2:
+                print(f"[warn] starts: {frac:.1%} share lat~{top_lat}; possible flattening upstream.")
     if starts.empty:
         print("[seed] no starts found with current min-run-hours.")
     else:
@@ -516,6 +523,13 @@ def main():
                 lon_min=c["lon_min"], lon_max=c["lon_max"],
             ))
     patches = pd.DataFrame(patches_rows).sort_values(["time_h","patch_id"], ignore_index=True)
+    if not patches.empty:
+        lat_counts = patches["lat_cen"].round(3).value_counts()
+        if not lat_counts.empty:
+            top_lat = lat_counts.index[0]
+            frac = lat_counts.iloc[0] / len(patches)
+            if frac > 0.2:
+                print(f"[warn] patches: {frac:.1%} centroids share lat~{top_lat}; check seeds/area/normalization.")
     p_patches = out_dir / f"{args.run_name}_seed_patches.csv"
     patches.to_csv(p_patches, index=False)
     if args.save_parquet:
@@ -525,6 +539,13 @@ def main():
     matches = match_patches_to_tracks(patches, tracks,
                                       radius_deg=float(args.radius_deg),
                                       time_tol_h=float(args.time_tol_hours))
+    if not matches.empty:
+        lat_counts = matches["lat_cen"].round(3).value_counts()
+        if not lat_counts.empty:
+            top_lat = lat_counts.index[0]
+            frac = lat_counts.iloc[0] / len(matches)
+            if frac > 0.2:
+                print(f"[warn] matches: {frac:.1%} matched centroids share lat~{top_lat}; potential flattening persists.")
     p_matches = out_dir / f"{args.run_name}_seed_track_matches.csv"
     matches.to_csv(p_matches, index=False)
     if args.save_parquet:
