@@ -223,6 +223,11 @@ def main() -> int:
         default=None,
         help="Optional viability thresholds CSV (default: results/sweeps/viability_best_thresholds.csv).",
     )
+    ap.add_argument(
+        "--storm-timeseries",
+        default="data/storm_timeseries_panel.parquet",
+        help="Optional storm-centric time-series panel to surface in the summary.",
+    )
 
     # IBTrACS / storm overlays
     ap.add_argument(
@@ -473,6 +478,7 @@ def main() -> int:
         "--seed-summary", seed_summary,
         "--alerts-dir", args.alerts_dir,
         "--viability-thresholds", viability_thr,
+        "--storm-timeseries", args.storm_timeseries,
     ]
     if seed_analysis:
         step_args += ["--seed-analysis", seed_analysis]

@@ -121,6 +121,11 @@ def main():
         help="Per-lead viability thresholds CSV (optional).",
     )
     ap.add_argument(
+        "--storm-timeseries",
+        default=None,
+        help="Optional storm-centric time-series panel (CSV/Parquet) to surface basic stats.",
+    )
+    ap.add_argument(
         "--seed-union",
         default=None,
         help="Seed union file (csv/parquet) to derive slow-tick diagnostics (optional).",
@@ -209,6 +214,36 @@ def main():
             ibtracs_txt = f"{ib_path} (size ~{size_mb:.1f} MB)"
         else:
             ibtracs_txt = f"{ib_path} (missing or empty)"
+
+    # ---- Storm time-series snapshot (optional) ----
+    storm_ts_txt = ""
+    if args.storm_timeseries:
+        st_path = Path(args.storm_timeseries)
+        if exists_nonempty(st_path):
+            try:
+                # sample a few rows to avoid huge loads
+                cols = None
+                # try to detect storm id/time columns for a minimal summary
+                sample = read_table_any(st_path, nrows=1000)
+                if sample is not None and not sample.empty:
+                    time_col = next((c for c in sample.columns if c in ("time", "obs_time", "valid_time")), None)
+                    id_col = next((c for c in sample.columns if c in ("storm_id", "sid", "name", "storm")), None)
+                    n_rows = len(sample)
+                    uniq_ids = sample[id_col].nunique() if id_col and id_col in sample else 0
+                    t_min = t_max = None
+                    if time_col and time_col in sample:
+                        t_parsed = pd.to_datetime(sample[time_col], errors="coerce", utc=True).dt.tz_convert(None)
+                        t_min = t_parsed.min()
+                        t_max = t_parsed.max()
+                    storm_ts_txt = f"{st_path} | sample rows={n_rows}"
+                    if uniq_ids:
+                        storm_ts_txt += f" | unique storms (sample)={uniq_ids}"
+                    if t_min and t_max:
+                        storm_ts_txt += f" | time span (sample): {t_min} -> {t_max}"
+                else:
+                    storm_ts_txt = f"{st_path} (empty sample)"
+            except Exception as e:
+                storm_ts_txt = f"{st_path} (error reading: {e})"
 
     # ---- Viability conversion snapshot (optional) ----
     conv_txt = ""
@@ -413,6 +448,11 @@ def main():
             if args.ibtracs_normalize_lon:
                 f.write(f"Lon frame: {args.ibtracs_normalize_lon}\n")
             f.write("\n")
+
+        if storm_ts_txt:
+            f.write("Storm time-series snapshot\n")
+            f.write("-" * 72 + "\n")
+            f.write(f"{storm_ts_txt}\n\n")
 
         # Viability conversion snapshot
         if conv_txt:
