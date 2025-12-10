@@ -36,7 +36,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import List, Tuple
 
@@ -55,7 +55,7 @@ def make_run_dir(root: Path, date_str: str | None) -> Path:
     Returns the newly created directory.
     """
     if date_str is None:
-        date_str = datetime.utcnow().strftime("%Y%m%d")
+        date_str = datetime.now(UTC).strftime("%Y%m%d")
 
     root.mkdir(parents=True, exist_ok=True)
 

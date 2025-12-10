@@ -251,6 +251,15 @@ def main():
 
     agg = agg.rename(columns={"time_h": "time"})
 
+    # Quick diagnostic: warn if many rows collapse to a single latitude (flattening)
+    if not agg.empty:
+        lat_mode = agg["lat"].round(3).value_counts()
+        if not lat_mode.empty:
+            top_lat = lat_mode.index[0]
+            frac = lat_mode.iloc[0] / len(agg)
+            if frac > 0.2:
+                print(f"[warn] {frac:.1%} of rows share lat~{top_lat}; check upstream lon/lat handling.")
+
     # Optional slowtick join for diagnostics / maps
     if args.slowtick_panel:
         slow_cols = [c.strip() for c in args.slowtick_cols.split(",") if c.strip()]
