@@ -39,7 +39,11 @@ def main():
     ap.add_argument("--out", default="results/maps/seed_track_map.png", help="Output image path.")
     ap.add_argument("--lat-range", nargs=2, type=float, default=None, help="Optional map latitude range.")
     ap.add_argument("--lon-range", nargs=2, type=float, default=None, help="Optional map longitude range.")
-    ap.add_argument("--overlay-prob", default=None, help="Optional numeric column for coloring seeds (e.g., prob).")
+    ap.add_argument("--overlay-prob", default=None, help="Optional numeric column for coloring seeds (e.g., prob_max).")
+    ap.add_argument("--min-prob", type=float, default=None, help="Optional minimum overlay-prob to keep.")
+    ap.add_argument("--top-quantile", type=float, default=None, help="Optional quantile filter on overlay-prob.")
+    ap.add_argument("--per-storm", action="store_true", help="If storm id is present, emit one map per storm.")
+    ap.add_argument("--storm-id-col", default=None, help="Storm id column name in matches (e.g., storm_id or name).")
     ap.add_argument("--use-tiles", action="store_true", help="Add background tiles (requires internet).")
     ap.add_argument("--dpi", type=int, default=200)
     args = ap.parse_args()
@@ -59,6 +63,15 @@ def main():
     for c in [lat_c, lon_c, lat_t, lon_t]:
         if c and c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Optional prob-based filters
+    if args.overlay_prob and args.overlay_prob in df.columns:
+        vals = pd.to_numeric(df[args.overlay_prob], errors="coerce")
+        if args.min_prob is not None:
+            df = df.loc[vals >= float(args.min_prob)]
+        if args.top_quantile is not None:
+            cutoff = vals.quantile(float(args.top_quantile))
+            df = df.loc[vals >= cutoff]
 
     df = df.dropna(subset=[lat_c, lon_c]).reset_index(drop=True)
     if len(df) == 0:
@@ -93,48 +106,64 @@ def main():
         print(f"[map] saved (simple) -> {args.out}")
         return
 
-    # cartopy path
-    fig = plt.figure(figsize=(9,7))
-    if args.use_tiles:
-        tiler = StamenTerrain()
-        ax = plt.axes(projection=tiler.crs)
-        ax.add_image(tiler, 6)
-    else:
-        ax = plt.axes(projection=ccrs.PlateCarree())
-        ax.add_feature(cfeature.LAND, facecolor="lightgray", alpha=0.6)
-        ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
-        ax.add_feature(cfeature.BORDERS, linewidth=0.3, edgecolor="gray")
-        ax.gridlines(draw_labels=True, linewidth=0.4, linestyle="--", alpha=0.6)
+    # renderer
+    def render(ddf: pd.DataFrame, out_path: str, title: str):
+        fig = plt.figure(figsize=(9,7))
+        if args.use_tiles:
+            tiler = StamenTerrain()
+            ax = plt.axes(projection=tiler.crs)
+            ax.add_image(tiler, 6)
+        else:
+            ax = plt.axes(projection=ccrs.PlateCarree())
+            ax.add_feature(cfeature.LAND, facecolor="lightgray", alpha=0.6)
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
+            ax.add_feature(cfeature.BORDERS, linewidth=0.3, edgecolor="gray")
+            ax.gridlines(draw_labels=True, linewidth=0.4, linestyle="--", alpha=0.6)
 
-    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+        ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
 
-    # --- Seed plotting ---
-    if args.overlay_prob and args.overlay_prob in df.columns:
-        vals = pd.to_numeric(df[args.overlay_prob], errors="coerce")
-        sc = ax.scatter(df[lon_c], df[lat_c], s=15, c=vals, cmap="viridis",
-                        transform=ccrs.PlateCarree(), label="Seeds", alpha=0.8)
-        cb = plt.colorbar(sc, ax=ax, orientation="vertical", shrink=0.7)
-        cb.set_label(args.overlay_prob)
-    else:
-        ax.scatter(df[lon_c], df[lat_c], s=15, color="tab:blue", transform=ccrs.PlateCarree(),
-                   alpha=0.7, label="Seeds")
+        if args.overlay_prob and args.overlay_prob in ddf.columns:
+            vals = pd.to_numeric(ddf[args.overlay_prob], errors="coerce")
+            sc = ax.scatter(ddf[lon_c], ddf[lat_c], s=18, c=vals, cmap="viridis",
+                            transform=ccrs.PlateCarree(), label="Seeds", alpha=0.8)
+            cb = plt.colorbar(sc, ax=ax, orientation="vertical", shrink=0.7)
+            cb.set_label(args.overlay_prob)
+        else:
+            ax.scatter(ddf[lon_c], ddf[lat_c], s=18, color="tab:blue", transform=ccrs.PlateCarree(),
+                       alpha=0.7, label="Seeds")
 
-    # --- Track overlay + connectors ---
-    if lat_t and lon_t:
-        ax.scatter(df[lon_t], df[lat_t], s=25, color="tab:red", marker="x",
-                   transform=ccrs.PlateCarree(), label="Track")
-        # connecting lines
-        for _, r in df.iterrows():
-            ax.plot([r[lon_c], r[lon_t]], [r[lat_c], r[lat_t]],
-                    color="gray", lw=0.5, alpha=0.5, transform=ccrs.PlateCarree())
+        if lat_t and lon_t:
+            ax.scatter(ddf[lon_t], ddf[lat_t], s=25, color="tab:red", marker="x",
+                       transform=ccrs.PlateCarree(), label="Track")
+            for _, r in ddf.iterrows():
+                ax.plot([r[lon_c], r[lon_t]], [r[lat_c], r[lat_t]],
+                        color="gray", lw=0.5, alpha=0.5, transform=ccrs.PlateCarree())
 
-    ax.legend(loc="lower left", frameon=False)
-    ax.set_title("Seed–Track Matches")
+        ax.legend(loc="lower left", frameon=False)
+        ax.set_title(title)
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(args.out, dpi=args.dpi, bbox_inches="tight")
-    plt.close()
-    print(f"[map] saved -> {args.out}")
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, dpi=args.dpi, bbox_inches="tight")
+        plt.close()
+        print(f"[map] saved -> {out_path}")
+
+    # per-storm if requested
+    if args.per_storm:
+        sid_col = args.storm_id_col
+        if sid_col is None:
+            for cand in ("storm_id", "name", "sid"):
+                if cand in df.columns:
+                    sid_col = cand
+                    break
+        if sid_col and sid_col in df.columns:
+            out_base = Path(args.out).with_suffix("")
+            ext = Path(args.out).suffix or ".png"
+            for sid, grp in df.groupby(sid_col):
+                render(grp, f"{out_base}_storm_{sid}{ext}", f"Seed–Track Matches — {sid}")
+            return
+
+    # single map
+    render(df, args.out, "Seed–Track Matches")
 
 
 if __name__ == "__main__":

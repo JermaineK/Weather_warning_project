@@ -32,6 +32,27 @@ def _load_cartopy():
             f"Import error: {e}"
         )
 
+def _load_tracks(path, normalize_lon_mode, area):
+    tp = str(path).lower()
+    if tp.endswith((".parquet", ".parq", ".pq")):
+        tr = pd.read_parquet(path)
+    else:
+        tr = pd.read_csv(path)
+    if not {"lat", "lon", "time"}.issubset(tr.columns):
+        return None
+    tr = tr.copy()
+    tr["lat"] = pd.to_numeric(tr["lat"], errors="coerce")
+    tr["lon"] = _norm_lon(tr["lon"], normalize_lon_mode)
+    ttime = pd.to_datetime(tr["time"], utc=True, errors="coerce").dt.tz_convert(None)
+    tr = tr.assign(time=ttime).dropna(subset=["lat", "lon", "time"])
+    if area:
+        latN, lonW, latS, lonE = _parse_area(area)
+        tr = tr.loc[
+            (tr["lat"] <= latN) & (tr["lat"] >= latS) & (tr["lon"] >= lonW) & (tr["lon"] <= lonE)
+        ]
+    return tr if not tr.empty else None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Cartopy seed map renderer")
     ap.add_argument("--seeds", required=True, help="CSV/Parquet with at least: lat, lon[, value][, time]")
@@ -48,6 +69,8 @@ def main():
     ap.add_argument("--storm-radius-deg", type=float, default=5.0, help="Lat/lon padding around track bbox for filtering.")
     ap.add_argument("--storm-window-before-h", type=float, default=240.0, help="Hours before track times to include seeds.")
     ap.add_argument("--storm-window-after-h", type=float, default=72.0, help="Hours after track times to include seeds.")
+    ap.add_argument("--per-storm", action="store_true", help="If tracks provided, emit one map per storm id/name.")
+    ap.add_argument("--storm-id-col", default=None, help="ID column in tracks (e.g., storm_id or name).")
     ap.add_argument("--title", default=None, help="Figure title")
     ap.add_argument("--dpi", type=int, default=180)
     args = ap.parse_args()
@@ -74,44 +97,12 @@ def main():
         cutoff = vals.quantile(float(args.top_quantile))
         df = df.loc[vals >= cutoff]
     # Optional filter: restrict to storms window/bbox
+    tracks_df = None
     if args.tracks:
         try:
-            tp = str(args.tracks).lower()
-            if tp.endswith((".parquet",".parq",".pq")):
-                tr = pd.read_parquet(args.tracks)
-            else:
-                tr = pd.read_csv(args.tracks)
-            if {"lat","lon","time"}.issubset(tr.columns):
-                tr = tr.copy()
-                tr["lat"] = pd.to_numeric(tr["lat"], errors="coerce")
-                tr["lon"] = _norm_lon(tr["lon"], args.normalize_lon)
-                ttime = pd.to_datetime(tr["time"], utc=True, errors="coerce").dt.tz_convert(None)
-                tr = tr.assign(time=ttime).dropna(subset=["lat","lon","time"])
-                if args.area:
-                    latN, lonW, latS, lonE = _parse_area(args.area)
-                    tr = tr.loc[(tr["lat"] <= latN) & (tr["lat"] >= latS) &
-                                (tr["lon"] >= lonW) & (tr["lon"] <= lonE)]
-                if not tr.empty:
-                    tmin = tr["time"].min() - pd.Timedelta(hours=args.storm_window_before_h)
-                    tmax = tr["time"].max() + pd.Timedelta(hours=args.storm_window_after_h)
-                    lat_min = tr["lat"].min() - args.storm_radius_deg
-                    lat_max = tr["lat"].max() + args.storm_radius_deg
-                    lon_min = tr["lon"].min() - args.storm_radius_deg
-                    lon_max = tr["lon"].max() + args.storm_radius_deg
-                    if args.time_col and args.time_col in df.columns:
-                        tcol = args.time_col
-                    else:
-                        # auto-detect time column
-                        tcol = "time" if "time" in df.columns else None
-                    if tcol:
-                        tseeds = pd.to_datetime(df[tcol], utc=True, errors="coerce").dt.tz_convert(None)
-                        df = df.loc[
-                            tseeds.between(tmin, tmax)
-                            & df["lat"].between(lat_min, lat_max)
-                            & df["lon"].between(lon_min, lon_max)
-                        ]
+            tracks_df = _load_tracks(args.tracks, args.normalize_lon, args.area)
         except Exception as e:
-            print(f"[map] warning: failed to apply track filter: {e}")
+            print(f"[map] warning: failed to load tracks {args.tracks}: {e}")
     df = df.dropna(subset=["lat","lon"]).reset_index(drop=True)
     if len(df) > 20000:
         df = df.sample(20000, random_state=42)
@@ -141,7 +132,7 @@ def main():
     ccrs, cfeature = _load_cartopy()
     import matplotlib.pyplot as plt
 
-    def _render(ddf, out_path, title):
+    def _render(ddf, out_path, title, tracks=None):
         proj = ccrs.PlateCarree()
         fig = plt.figure(figsize=(10, 6))
         ax = plt.axes(projection=proj)
@@ -173,6 +164,30 @@ def main():
         else:
             ax.scatter(ddf["lon"], ddf["lat"], s=18, alpha=0.85, transform=proj)
 
+        # Optional track overlay
+        if tracks is not None and not tracks.empty:
+            ax.plot(tracks["lon"], tracks["lat"], color="tab:red", lw=1.2, alpha=0.8, transform=proj, label="Track")
+            ax.scatter(
+                tracks["lon"].iloc[:1],
+                tracks["lat"].iloc[:1],
+                color="tab:red",
+                s=30,
+                marker="x",
+                transform=proj,
+                label="Track start",
+            )
+            ax.scatter(
+                tracks["lon"].iloc[-1:],
+                tracks["lat"].iloc[-1:],
+                color="tab:red",
+                s=24,
+                marker="o",
+                facecolors="none",
+                transform=proj,
+                label="Track end",
+            )
+            ax.legend(loc="lower left", frameon=False)
+
         ax.gridlines(draw_labels=True, linewidth=0.3, color="gray", alpha=0.5, linestyle="--")
         if title:
             ax.set_title(title, fontsize=12)
@@ -181,16 +196,55 @@ def main():
         plt.close(fig)
         print(f"[map] wrote {out_path}")
 
-    # Single map or per-hour
+    # Utility to filter seeds to track window/bbox
+    def filter_to_tracks(seeds_df: pd.DataFrame, tr: pd.DataFrame) -> pd.DataFrame:
+        tcol = args.time_col if args.time_col and args.time_col in seeds_df.columns else ("time" if "time" in seeds_df.columns else None)
+        if tcol is None:
+            return seeds_df
+        tseeds = pd.to_datetime(seeds_df[tcol], utc=True, errors="coerce").dt.tz_convert(None)
+        lat_min = tr["lat"].min() - args.storm_radius_deg
+        lat_max = tr["lat"].max() + args.storm_radius_deg
+        lon_min = tr["lon"].min() - args.storm_radius_deg
+        lon_max = tr["lon"].max() + args.storm_radius_deg
+        tmin = tr["time"].min() - pd.Timedelta(hours=args.storm_window_before_h)
+        tmax = tr["time"].max() + pd.Timedelta(hours=args.storm_window_after_h)
+        return seeds_df.loc[
+            tseeds.between(tmin, tmax)
+            & seeds_df["lat"].between(lat_min, lat_max)
+            & seeds_df["lon"].between(lon_min, lon_max)
+        ]
+
+    # Single map, per-hour, or per-storm
+    if args.per_storm and tracks_df is not None:
+        id_col = args.storm_id_col
+        if id_col is None:
+            for cand in ("storm_id", "name", "sid"):
+                if cand in tracks_df.columns:
+                    id_col = cand
+                    break
+        if id_col is None or id_col not in tracks_df.columns:
+            print("[map] per-storm requested but no storm id column found; falling back to single map.")
+        else:
+            for sid, tr_grp in tracks_df.groupby(id_col):
+                seeds_sub = filter_to_tracks(df, tr_grp)
+                if seeds_sub.empty:
+                    continue
+                ttl = f"{args.title or 'Seeds'} - storm {sid}"
+                base = Path(args.out_png).with_suffix("")
+                ext = Path(args.out_png).suffix or ".png"
+                out = f"{base}_storm_{sid}{ext}"
+                _render(seeds_sub, out, ttl, tr_grp)
+            return
+
     if args.per_hour and "_time_h" in df.columns:
         for th, grp in df.groupby("_time_h", sort=True):
             suffix = f"_{th:%Y%m%d_%H%M}"
             base, ext = (Path(args.out_png).with_suffix("").as_posix(), Path(args.out_png).suffix or ".png")
             out = f"{base}{suffix}{ext}"
             ttl = args.title or "Seeds"
-            _render(grp, out, f"{ttl} — {th:%Y-%m-%d %H:00}")
+            _render(grp, out, f"{ttl} - {th:%Y-%m-%d %H:00}")
     else:
-        _render(df, args.out_png, args.title or "Seeds")
+        _render(df, args.out_png, args.title or "Seeds", tracks_df)
 
 if __name__ == "__main__":
     main()

@@ -52,6 +52,7 @@ SCRIPT_MAP: Dict[str, str] = {
     "gse-panel":         "build_gse_panel_from_subset.py",
     "gse-lagged":        "build_gse_lagged.py",
     "slowtick-features": "build_slowtick_features.py",
+    "gse-states":        "compute_gse_states.py",
     "viability-targets": "build_viability_targets.py",
     "train-viability":   "train_viability_model.py",
     "storm-timeseries":  "build_storm_timeseries_by_id.py",
@@ -83,6 +84,11 @@ ALIASES: Dict[str, str] = {
     # slowtick features
     "slowtick-feat":     "slowtick-features",
     "slowtick_feat":     "slowtick-features",
+
+    # GSE states
+    "gse-states":        "gse-states",
+    "gse_states":        "gse-states",
+    "states":            "gse-states",
 
     # viability targets
     "targets":             "viability-targets",

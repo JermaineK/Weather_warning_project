@@ -189,7 +189,7 @@ features:
 # 2) Data stage (staging; GSE panel; viability)
 # =====================================================================
 data_stage:
-  enabled: true
+  enabled: false
   steps:
     # 2.1 Build slim lookup panel (all rows) from the ID'd feature file
     - mode: lookup-panel
@@ -247,6 +247,17 @@ data_stage:
       period-hours: 24.0
       use-modulated: true
 
+    # 2.6b Discretised G/S/E states (for diagnostics/markov analysis)
+    - mode: gse-states
+      enabled: false
+      panel: data/grid_train_gse_panel_slowtick.parquet
+      out: data/grid_train_gse_panel_states.parquet
+      g-col: G_struct
+      s-col: S_shear
+      e-col: E_energy
+      quantiles: "0,0.2,0.4,0.6,0.8,1.0"
+      slow-phase-bins: 8
+
     # 2.7 Viability targets / labels
     - mode: viability-targets
       enabled: true
@@ -290,7 +301,7 @@ data_stage:
 
     # 2.9 Storm-centric time series panel (optional)
     - mode: storm-timeseries
-      enabled: false
+      enabled: true
       labelled-with-id: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
       tracks: data/tracks/tracks_subset.csv
       out: data/storm_timeseries_panel.parquet
@@ -304,7 +315,7 @@ data_stage:
 # 3) Alerts logic (viability -> alerts_final)
 # =====================================================================
 alerts_logic:
-  enabled: true
+  enabled: false
   steps:
     - mode: viability-pipeline
       run-name: coral_sea_demo
@@ -346,7 +357,7 @@ seeds:
     run-name: coral_sea_demo
     normalize-lon: *norm
     area: *area
-    radius-deg: 2.5
+    radius-deg: 4.0
     time-tol-hours: 18
     min-run-hours: 24
     save-parquet: true
@@ -366,7 +377,7 @@ seeds:
 # 5) Sweep (viability thresholds)
 # =====================================================================
 sweep:
-  enabled: true
+  enabled: false
   steps:
     - mode: best-constrained
       enabled: true
@@ -389,7 +400,7 @@ sweep:
 # 6) Evaluation (model + alerts)
 # =====================================================================
 eval:
-  enabled: true
+  enabled: false
   steps:
     # Viability model skill vs t_to_storm_min_h leads
     - mode: viability-leads
