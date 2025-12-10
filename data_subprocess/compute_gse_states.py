@@ -20,6 +20,12 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except Exception:  # optional; chunked parquet requires pyarrow
+    pa = None
+    pq = None
 
 
 def _is_parquet(path: str) -> bool:
@@ -85,33 +91,136 @@ def main() -> None:
         default=8,
         help="Number of bins for slow-phase discretisation (if slow cols present).",
     )
+    # Chunking hints (accepted for pipeline compatibility)
+    ap.add_argument("--chunk-rows", type=int, default=None, help="Optional chunk size for streaming.")
+    ap.add_argument("--chunksize", type=int, default=None, help="Alias for chunk-rows.")
+    ap.add_argument("--parquet-rows", type=int, default=None, help="Ignored; accepted for compatibility.")
     args = ap.parse_args()
 
     quantiles = [float(q) for q in args.quantiles.split(",") if q.strip() != ""]
     if quantiles[0] != 0.0 or quantiles[-1] != 1.0:
         raise SystemExit("Quantiles must start at 0 and end at 1.")
 
-    df = _read_any(args.panel)
+    chunk_rows = args.chunk_rows or args.chunksize
 
-    # G/S/E levels
-    df["G_level"] = _digitize_levels(df.get(args.g_col, pd.Series(dtype=float)), quantiles)
-    df["S_level"] = _digitize_levels(df.get(args.s_col, pd.Series(dtype=float)), quantiles)
-    df["E_level"] = _digitize_levels(df.get(args.e_col, pd.Series(dtype=float)), quantiles)
+    def attach_states(df: pd.DataFrame, bins_g, bins_s, bins_e) -> pd.DataFrame:
+        df = df.copy()
+        df["G_level"] = _digitize_levels(df.get(args.g_col, pd.Series(dtype=float)), bins_g)
+        df["S_level"] = _digitize_levels(df.get(args.s_col, pd.Series(dtype=float)), bins_s)
+        df["E_level"] = _digitize_levels(df.get(args.e_col, pd.Series(dtype=float)), bins_e)
+        df["GSE_str"] = (
+            "G" + df["G_level"].astype(str) + "S" + df["S_level"].astype(str) + "E" + df["E_level"].astype(str)
+        )
+        if args.slow_cos_col in df.columns and args.slow_sin_col in df.columns:
+            phase = np.arctan2(pd.to_numeric(df[args.slow_sin_col], errors="coerce"),
+                               pd.to_numeric(df[args.slow_cos_col], errors="coerce"))
+            bins_phase = np.linspace(-np.pi, np.pi, args.slow_phase_bins + 1)
+            df["slow_phase_bin"] = pd.cut(phase, bins=bins_phase, labels=False, include_lowest=True)
+        return df
 
-    df["GSE_str"] = (
-        "G" + df["G_level"].astype(str) + "S" + df["S_level"].astype(str) + "E" + df["E_level"].astype(str)
-    )
+    if not chunk_rows:
+        # simple full-table path
+        df = _read_any(args.panel)
+        df = attach_states(df, quantiles, quantiles, quantiles)
+        _write_any(args.out, df)
+        print(f"[gse-states] wrote {len(df):,} rows -> {args.out}")
+        return
 
-    # Slow phase (optional)
-    slow_cols_present = args.slow_cos_col in df.columns and args.slow_sin_col in df.columns
-    if slow_cols_present:
-        phase = np.arctan2(pd.to_numeric(df[args.slow_sin_col], errors="coerce"),
-                           pd.to_numeric(df[args.slow_cos_col], errors="coerce"))
-        bins = np.linspace(-np.pi, np.pi, args.slow_phase_bins + 1)
-        df["slow_phase_bin"] = pd.cut(phase, bins=bins, labels=False, include_lowest=True)
+    # chunked path with approximate quantiles from sampled chunks
+    print(f"[gse-states] chunking with chunk_rows={chunk_rows} (quantiles estimated from samples)")
+    pstr = str(args.panel).lower()
+    is_parquet = pstr.endswith((".parquet", ".parq", ".pq"))
+    if is_parquet and pq is None:
+        print("[gse-states] pyarrow not available; falling back to full read.")
+        df = _read_any(args.panel)
+        df = attach_states(df, quantiles, quantiles, quantiles)
+        _write_any(args.out, df)
+        print(f"[gse-states] wrote {len(df):,} rows -> {args.out}")
+        return
 
-    _write_any(args.out, df)
-    print(f"[gse-states] wrote {len(df):,} rows -> {args.out}")
+    # Pass 1: sample values to estimate quantile bins
+    sample_limit = 1_000_000
+    rng = np.random.default_rng(42)
+    samples = {col: [] for col in (args.g_col, args.s_col, args.e_col)}
+
+    def extend_samples(arr: np.ndarray, key: str):
+        arr = pd.to_numeric(pd.Series(arr), errors="coerce").dropna().to_numpy()
+        if arr.size == 0:
+            return
+        take = min(arr.size, max(1, sample_limit // 10))
+        choice = rng.choice(arr, size=take, replace=False) if arr.size > take else arr
+        buf = samples[key]
+        buf.append(choice)
+        # truncate if too large
+        total = sum(len(x) for x in buf)
+        if total > sample_limit:
+            merged = np.concatenate(buf)
+            buf.clear()
+            buf.append(rng.choice(merged, size=sample_limit, replace=False))
+
+    if is_parquet:
+        pf = pq.ParquetFile(args.panel)
+        for batch in pf.iter_batches(batch_size=chunk_rows, columns=[args.g_col, args.s_col, args.e_col]):
+            tbl = batch.to_pandas()
+            extend_samples(tbl[args.g_col].to_numpy(), args.g_col)
+            extend_samples(tbl[args.s_col].to_numpy(), args.s_col)
+            extend_samples(tbl[args.e_col].to_numpy(), args.e_col)
+    else:
+        for chunk in pd.read_csv(args.panel, chunksize=chunk_rows, low_memory=False):
+            extend_samples(chunk.get(args.g_col, []), args.g_col)
+            extend_samples(chunk.get(args.s_col, []), args.s_col)
+            extend_samples(chunk.get(args.e_col, []), args.e_col)
+
+    def build_bins(key: str):
+        arrs = samples[key]
+        if not arrs:
+            return quantiles
+        arr = np.concatenate(arrs)
+        return np.quantile(arr, quantiles)
+
+    bins_g = build_bins(args.g_col)
+    bins_s = build_bins(args.s_col)
+    bins_e = build_bins(args.e_col)
+    print(f"[gse-states] bins G:{bins_g} S:{bins_s} E:{bins_e}")
+
+    # Pass 2: stream, transform, and write
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.suffix.lower() in (".parquet", ".pq", ".parq"):
+        writer = None
+        if is_parquet:
+            pf = pq.ParquetFile(args.panel)
+            for batch in pf.iter_batches(batch_size=chunk_rows):
+                dfc = batch.to_pandas()
+                dfc = attach_states(dfc, bins_g, bins_s, bins_e)
+                tbl = pa.Table.from_pandas(dfc, preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(out_path, tbl.schema)
+                writer.write_table(tbl)
+        else:
+            for chunk in pd.read_csv(args.panel, chunksize=chunk_rows, low_memory=False):
+                dfc = attach_states(chunk, bins_g, bins_s, bins_e)
+                tbl = pa.Table.from_pandas(dfc, preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(out_path, tbl.schema)
+                writer.write_table(tbl)
+        if writer:
+            writer.close()
+    else:
+        first = True
+        if is_parquet:
+            pf = pq.ParquetFile(args.panel)
+            for batch in pf.iter_batches(batch_size=chunk_rows):
+                dfc = attach_states(batch.to_pandas(), bins_g, bins_s, bins_e)
+                dfc.to_csv(out_path, mode="w" if first else "a", index=False, header=first)
+                first = False
+        else:
+            for chunk in pd.read_csv(args.panel, chunksize=chunk_rows, low_memory=False):
+                dfc = attach_states(chunk, bins_g, bins_s, bins_e)
+                dfc.to_csv(out_path, mode="w" if first else "a", index=False, header=first)
+                first = False
+
+    print(f"[gse-states] wrote (chunked) -> {args.out}")
 
 
 if __name__ == "__main__":
