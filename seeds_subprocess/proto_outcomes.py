@@ -44,12 +44,24 @@ def read_any(p: str, **kw) -> pd.DataFrame:
         return pd.read_parquet(p, **kw)
     return pd.read_csv(p, low_memory=False, **kw)
 
-def read_csv_chunked(path: str, chunk_rows: int) -> pd.DataFrame:
+def read_csv_chunked(path: str, chunk_rows: int, max_rows: Optional[int] = None) -> pd.DataFrame:
+    """
+    Read CSV in chunks; if max_rows is set, stop once that many rows have been gathered.
+    """
     if chunk_rows and chunk_rows > 0 and (path.lower().endswith(".csv") or path.lower().endswith(".csv.gz")):
         parts = []
+        total = 0
         for chunk in pd.read_csv(path, low_memory=False, compression="infer", chunksize=int(chunk_rows)):
             parts.append(chunk)
-        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+            total += len(chunk)
+            if max_rows and total >= max_rows:
+                break
+        if not parts:
+            return pd.DataFrame()
+        df = pd.concat(parts, ignore_index=True)
+        if max_rows and len(df) > max_rows:
+            df = df.sample(n=max_rows, random_state=42)
+        return df
     return read_any(path)
 
 def to_utc_naive(series: pd.Series, fmt: Optional[str] = None) -> pd.Series:
@@ -351,6 +363,7 @@ def main():
     ap.add_argument("--run-name", default="run")
     ap.add_argument("--write-parquet", action="store_true", help="Also write Parquet copies.")
     ap.add_argument("--chunk-rows", type=int, default=0, help="Optional chunk size for CSV inputs (0=off).")
+    ap.add_argument("--max-rows", type=int, default=None, help="Optional cap on seed rows (sample if larger).")
     # preprocess normalize-lon to handle tokens like "-180..180"
     argv = []
     skip = False
@@ -372,7 +385,11 @@ def main():
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- load seeds
-    s = read_csv_chunked(args.seeds, args.chunk_rows)
+    s = read_csv_chunked(args.seeds, args.chunk_rows, args.max_rows)
+    if args.max_rows and len(s) > args.max_rows:
+        s = s.sample(n=int(args.max_rows), random_state=42)
+        print(f"[info] seeds sampled to {len(s):,} rows (max_rows={args.max_rows})")
+    print(f"[info] loaded seeds rows={len(s):,}")
     tcol = pick_time_col(s)
     s["time"] = to_utc_naive(s[tcol], args.time_format)
     s["lat"]  = pd.to_numeric(s["lat"], errors="coerce")
@@ -387,11 +404,17 @@ def main():
         s = crop_area(s, aoi)
 
     # per-hour simple structure
-    s = pd.concat([structure_per_hour(g) for _, g in s.groupby("time")], ignore_index=True)
+    structured = []
+    for idx, (ts, g) in enumerate(s.groupby("time"), start=1):
+        structured.append(structure_per_hour(g))
+        if idx % 500 == 0:
+            print(f"[info] structure pass: {idx} hours processed", flush=True)
+    s = pd.concat(structured, ignore_index=True)
 
     # ---- optional: join CAPE/CIN/T2M
     if args.features:
         f = read_csv_chunked(args.features, args.chunk_rows)
+        print(f"[info] loaded features rows={len(f):,}")
         # normalize time/coords
         if "time" not in f.columns:
             for c in ["valid_time","datetime","time_h"]:
@@ -416,6 +439,7 @@ def main():
     linked = link_tracks(s[keep_cols].copy(),
                          link_radius_km=args.link_radius_km,
                          max_gap_hours=args.max_gap_hours)
+    print(f"[info] linked proto-tracks: rows={len(linked):,} tracks={linked['track_id'].nunique():,}")
 
     # ---- points table + rank index within track
     pts = linked.copy()
@@ -425,6 +449,7 @@ def main():
     counts = pts.groupby("track_id").size().rename("n_hours").reset_index()
     good_ids = counts.loc[counts["n_hours"] >= int(args.min_track_hours), "track_id"].tolist()
     pts = pts[pts["track_id"].isin(good_ids)].reset_index(drop=True)
+    print(f"[info] filtered tracks to >= {args.min_track_hours}h: tracks={len(good_ids):,} rows={len(pts):,}")
 
     # ---- per-track summary
     def qnan(x, q):
