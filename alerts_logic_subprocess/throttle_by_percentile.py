@@ -201,6 +201,8 @@ def main():
     has_score = (score_col is not None) and (score_col in df.columns)
     if has_score:
         df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
+    else:
+        print(f"[THROTTLE] warning: score column '{score_col}' not found; throttling will use random ordering per hour.")
 
     # Flag handling & selection universe
     if args.only_alerts:
@@ -216,16 +218,18 @@ def main():
     else:
         elig = df.copy()
 
-    # Deterministic tie-break
-    lat_i = (elig["lat"].to_numpy() * 10000).round().astype(np.int64)
-    lon_i = (elig["lon"].to_numpy() * 10000).round().astype(np.int64)
-    elig["__tiebreak__"] = lat_i * 1_000_000 + lon_i
-
-    sort_cols = ["time_h", "__tiebreak__"]
+    # Ordering: prefer score desc; otherwise, per-hour random to avoid lat bias
     if has_score:
+        lat_i = (elig["lat"].to_numpy() * 10000).round().astype(np.int64)
+        lon_i = (elig["lon"].to_numpy() * 10000).round().astype(np.int64)
+        elig["__tiebreak__"] = lat_i * 1_000_000 + lon_i
         s = elig[score_col].astype(float).fillna(-np.inf)
         elig["__negscore__"] = -s  # descending score via ascending sort
         sort_cols = ["time_h", "__negscore__", "__tiebreak__"]
+    else:
+        rng = np.random.default_rng(42)
+        elig["__rand__"] = rng.random(len(elig))
+        sort_cols = ["time_h", "__rand__"]
 
     # Pre-select “protected” rows by score threshold (survival guard)
     protected_idx = pd.Index([])
@@ -283,7 +287,7 @@ def main():
         print(f"[THROTTLE] sparse-output: kept {len(out):,}/{before:,} rows", flush=True)
 
     # Clean temp cols and write
-    out.drop(columns=[c for c in ["__tiebreak__","__negscore__","time_h"] if c in out],
+    out.drop(columns=[c for c in ["__tiebreak__","__negscore__","__rand__","time_h"] if c in out],
              inplace=True, errors="ignore")
     write_any(args.out, out)
     print(f"Wrote {args.out} | throttled: {kept:,}/{total:,}", flush=True)
