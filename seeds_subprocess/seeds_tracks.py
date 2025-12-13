@@ -54,6 +54,11 @@ CANDIDATES = {
         "analyze.py",
         "seeds_analyze.py",
     ],
+    "gse-tracks": [
+        "track_seed_gse_states.py",
+        "gse_seed_tracks.py",
+        "track_gse_states.py",
+    ],
     "from-alerts": [
         "from_alerts.py",
         "seeds_from_alerts.py",

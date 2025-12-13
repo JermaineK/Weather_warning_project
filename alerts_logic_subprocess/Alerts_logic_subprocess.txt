@@ -13,6 +13,7 @@ viability_pipeline.py
 One-shot viability chain: apply thresholds -> throttle -> denoise (prob_viable/alert_final defaults).
 labelled grid + viability model
 alerts_<run>_{base,thr,final}.parquet
+ --overwrite accepted to clear existing outputs before writing.
 
 Tool (manager tool)
 Script file

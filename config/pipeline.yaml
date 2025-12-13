@@ -18,7 +18,7 @@ defaults:
   start: &start "2025-02-01"
   end:   &end   "2025-05-01"
   hours: &hours "0..23"
-  normalize_lon: &norm " -180..180"
+  normalize_lon: &norm "-180..180"
   area: &area " -5,125,-35,175"   # widened Coral Sea + surroundings
   time_format:
 
@@ -66,7 +66,7 @@ fetch:
 # 1) Features (NC → Parquet/CSV)
 # =====================================================================
 features:
-  enabled: false
+  enabled: true
   steps:
     # 1. Base grid from ERA5 single-level
     - mode: build
@@ -119,7 +119,7 @@ features:
       outfile: data/grid_FMA_gka.parquet
       overwrite: true
 
-    # 7. Integrate ERA5 thermo (u10/v10/msl/t2m) back in (exact (time,lat,lon) join)
+    # 6. Integrate ERA5 thermo (u10/v10/msl/t2m) back in (exact (time,lat,lon) join)
     - mode: integrate-thermo
       enabled: false
       features: data/grid_FMA_gka.parquet
@@ -130,7 +130,7 @@ features:
       normalize_lon: *norm
       overwrite: true
 
-    # 8. Spherical-feedback features (SFI / SFI2)
+    # 7. Spherical-feedback features (SFI / SFI2)
     - mode: spherical-feedback
       enabled: false
       infile:  data/grid_FMA_gka_realthermo.parquet
@@ -150,7 +150,7 @@ features:
       w_thermo: 0.10
       overwrite: false
 
-    # 9. Multi-scale GKA (spiral probe on S/S3 etc.)
+    # 8. Multi-scale GKA (spiral probe on S/S3 etc.)
     - mode: gka-ms
       enabled: false
       infile:  data/grid_FMA_gka_realthermo_sph.parquet
@@ -159,7 +159,7 @@ features:
       overwrite: true
       verbose: true
 
-    # 10. Attach labels to fully-enriched feature table
+    # 9. Attach labels to fully-enriched feature table
     - mode: join-labels-grid
       enabled: false
       features: data/grid_FMA_gka_realthermo_sph_ms.parquet
@@ -177,7 +177,7 @@ features:
       chunk-hours: 72
       overwrite: true
 
-    # 11. Add row_id at the end of feature enrichment
+    # 10. Add row_id at the end of feature enrichment
     - mode: add-ids
       enabled: false
       infile:  data/grid_labelled_FMA_gka_realthermo_sph_ms.parquet
@@ -189,8 +189,21 @@ features:
 # 2) Data stage (staging; GSE panel; viability)
 # =====================================================================
 data_stage:
-  enabled: false
+  enabled: true
   steps:
+    # 2.0 Optional symmetry/OAM-inspired metrics after full ID table
+    - mode: symmetry
+      enabled: true
+      panel:   data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+      out:     data/grid_labelled_FMA_gka_realthermo_sph_ms_id_sym.parquet
+      intensity-col: gka_kappa   # fallback auto-picks gka_kappa > S > wspd > zeta > msl
+      radius-cells: 3
+      n-radii: 3
+      theta-bins: 16
+      null-baseline: false
+      overwrite: true
+      chunk-rows: 200000
+
     # 2.1 Build slim lookup panel (all rows) from the ID'd feature file
     - mode: lookup-panel
       enabled: false
@@ -260,8 +273,8 @@ data_stage:
 
     # 2.7 Viability targets / labels
     - mode: viability-targets
-      enabled: true
-      panel: data/grid_train_gse_panel_slowtick.parquet
+      enabled: false
+      panel: data/grid_train_gse_panel_states.parquet
       out: data/grid_train_gse_panel_targets.parquet
       lead-col: t_to_storm_min_h
       horizon-max: 240
@@ -272,7 +285,7 @@ data_stage:
 
     # 2.8 Train viability model
     - mode: train-viability
-      enabled: true
+      enabled: false
       train: data/grid_train_gse_panel_targets.parquet
       target: y_viable
       features:
@@ -301,7 +314,7 @@ data_stage:
 
     # 2.9 Storm-centric time series panel (optional)
     - mode: storm-timeseries
-      enabled: true
+      enabled: false
       labelled-with-id: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
       tracks: data/tracks/tracks_subset.csv
       out: data/storm_timeseries_panel.parquet
@@ -324,13 +337,14 @@ alerts_logic:
       labelled: data/grid_train_gse_panel_targets.parquet
       model: models/viability_model.pkl
       thr: 0.37
-      keep-quantile: 0.90
+      keep-quantile: 0.5
       persist-hours: 1
       min-neighbors: 3
       normalize-lon: *norm
       base-out: results/alerts/alerts_coral_sea_demo_base.parquet
       thr-out: results/alerts/alerts_coral_sea_demo_thr.parquet
       out: results/alerts/alerts_coral_sea_demo_final.parquet
+      overwrite: true
 
 
 # =====================================================================
@@ -339,7 +353,7 @@ alerts_logic:
 seeds:
   enabled: true
   from_alerts:
-    enabled: true
+    enabled: false
     alerts: results/alerts/alerts_coral_sea_demo_final.parquet
     prob-col: prob_viable
     flag-col: alert_final
@@ -348,9 +362,9 @@ seeds:
     area: *area
     out-dir: results/seedmaps
     chunk-rows: 400000
-    write-parquet: true
+    write-parquet: false
   starts:
-    enabled: true
+    enabled: false
     seeds: results/seedmaps/coral_sea_demo_union_byhour.csv
     tracks: data/tracks/tracks_subset.csv
     out-dir: results/seedmaps
@@ -359,11 +373,11 @@ seeds:
     area: *area
     radius-deg: 4.0
     time-tol-hours: 18
-    min-run-hours: 24
-    save-parquet: true
+    min-run-hours: 30
+    save-parquet: false
     chunk-rows: 400000
   outcomes:
-    enabled: true
+    enabled: false
     seeds: results/seedmaps/coral_sea_demo_union_byhour.csv
     ibtracs: data/tracks/tracks_subset.csv
     run-name: coral_sea_demo
@@ -371,13 +385,37 @@ seeds:
     normalize-lon: *norm
     lookahead-hours: 120
     chunk-rows: 400000
+    structure-radius-km: 150
+    points-format: both
+  gse_tracks:
+    enabled: true
+    panel: data/grid_train_gse_panel_states.parquet
+    out-dir: results/seedmaps
+    run-name: coral_sea_demo
+    normalize-lon: *norm
+    prob-col: prob_viable
+    flag-col: y_viable
+    thr-file: results/sweeps/viability_best_thresholds.parquet
+    thr-lead: 240
+    thr-column: thr_Fbeta
+    direction-col: zeta
+    link-radius-km: 90
+    max-gap-hours: 1
+    min-track-hours: 2
+    shear-quantile: 0.8
+    dg-eps: 0.05
+    ibtracs: data/tracks/tracks_subset.csv
+    storm-radius-km: 150
+    lookahead-hours: 240
+    chunk-rows: 400000
+    write-parquet: false
 
 
 # =====================================================================
 # 5) Sweep (viability thresholds)
 # =====================================================================
 sweep:
-  enabled: false
+  enabled: true
   steps:
     - mode: best-constrained
       enabled: true
@@ -400,7 +438,7 @@ sweep:
 # 6) Evaluation (model + alerts)
 # =====================================================================
 eval:
-  enabled: false
+  enabled: true
   steps:
     # Viability model skill vs t_to_storm_min_h leads
     - mode: viability-leads

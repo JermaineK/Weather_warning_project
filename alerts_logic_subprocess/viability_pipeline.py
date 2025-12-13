@@ -56,6 +56,7 @@ def parse_args():
     ap.add_argument("--thr-out", default=None, help="Override throttled output path.")
     ap.add_argument("--out", default=None, help="Override final output path.")
     ap.add_argument("--dry-run", action="store_true", help="Print commands without running.")
+    ap.add_argument("--overwrite", action="store_true", help="Allow replacing existing outputs (clears files first).")
     # Compatibility: accept chunking hints without using them
     ap.add_argument("--chunk-rows", type=int, default=None, help="Ignored; accepted for pipeline compatibility.")
     ap.add_argument("--chunksize", type=int, default=None, help="Alias for --chunk-rows (ignored).")
@@ -70,6 +71,14 @@ def main() -> int:
     thr_out = args.thr_out or f"results/alerts/alerts_{args.run_name}_thr.parquet"
     final_out = args.out or f"results/alerts/alerts_{args.run_name}_final.parquet"
     flag_thr = args.flag_col_thr or args.flag_col_base
+
+    if args.overwrite:
+        for p in (base_out, thr_out, final_out):
+            try:
+                Path(p).unlink()
+                print(f"[viability-pipeline] removed existing output: {p}")
+            except FileNotFoundError:
+                pass
 
     steps = [
         [

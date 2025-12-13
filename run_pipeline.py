@@ -442,6 +442,7 @@ def run_seeds(sec: Dict[str, Any]) -> None:
     raw_steps = [
         ("from-alerts", sec.get("from_alerts")),
         ("proto-outcomes", sec.get("outcomes")),
+        ("gse-tracks", sec.get("gse_tracks")),
         ("starts-vs-tracks", sec.get("starts")),
         ("analyze", sec.get("analyze")),
     ]

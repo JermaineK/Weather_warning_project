@@ -19,6 +19,7 @@ Modes -> scripts
   join                -> join_labels_grid.py (alias)
   add-ids             -> add_row_id.py
   id                  -> add_row_id.py (alias)
+  symmetry            -> compute_symmetry_features.py
 """
 from __future__ import annotations
 import argparse
@@ -38,6 +39,7 @@ ROUTING: Dict[str, str] = {
     "patch":              "features_patch.py",
     "gka":                "compute_gka_features.py",
     "gka-ms":             "compute_gka_multiscale.py",
+    "symmetry":           "compute_symmetry_features.py",
     "integrate-thermo":   "integrate_era5_thermo.py",
     "spherical-feedback": "compute_spherical_feedback.py",
     "spherical":          "compute_spherical_feedback.py",  # alias
@@ -60,6 +62,7 @@ FLAG_MAPS: Dict[str, Dict[str, str]] = {
     "patch": {},
     "gka": {},
     "gka-ms": {},
+    "symmetry": {},
     "integrate-thermo": {},
     "spherical-feedback": {},
     "bulk-shear": {},

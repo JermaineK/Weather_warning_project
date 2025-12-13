@@ -26,13 +26,22 @@ from typing import Optional, Tuple, Dict, List
 import numpy as np
 import pandas as pd
 
-# Optional speedup for storm matching
+# Optional speedup for storm matching + neighbor counts
 try:
-    from sklearn.neighbors import KDTree
+    from sklearn.neighbors import KDTree, BallTree
     _HAVE_SK = True
+    _HAVE_BALLTREE = True
 except Exception:
-    KDTree = None
-    _HAVE_SK = False
+    try:
+        from sklearn.neighbors import BallTree  # type: ignore
+        KDTree = None  # type: ignore
+        _HAVE_SK = False
+        _HAVE_BALLTREE = True
+    except Exception:
+        KDTree = None  # type: ignore
+        BallTree = None  # type: ignore
+        _HAVE_SK = False
+        _HAVE_BALLTREE = False
 
 # ------------------ I/O + common helpers ------------------
 
@@ -126,12 +135,33 @@ def pick_cape_cols(df: pd.DataFrame) -> Dict[str,str]:
 # ------------------ structure features ------------------
 
 def structure_per_hour(df_hour: pd.DataFrame, radius_km: float = 100.0) -> pd.DataFrame:
-    latv, lonv = df_hour["lat"].to_numpy(), df_hour["lon"].to_numpy()
+    """
+    Count neighbours within radius_km for one hour. Uses haversine KDTree when
+    sklearn is available; falls back to O(n^2) if not. If radius_km<=0, return
+    zeros to avoid heavy computation.
+    """
+    if df_hour.empty:
+        return df_hour.copy()
+    if radius_km <= 0:
+        out = df_hour.copy()
+        out["nbr_100km"] = 0.0
+        return out
+
+    latv = df_hour["lat"].to_numpy()
+    lonv = df_hour["lon"].to_numpy()
     n = len(df_hour)
-    nn = np.zeros(n, dtype=float)
-    for i in range(n):
-        d = hav_km(latv[i], lonv[i], latv, lonv)
-        nn[i] = np.sum((d <= radius_km) & (d > 0))
+
+    if _HAVE_BALLTREE:
+        # BallTree supports haversine directly
+        coords = np.c_[np.radians(latv), np.radians(lonv)]
+        tree = BallTree(coords, metric="haversine")
+        rad = radius_km / 6371.0  # Earth radius ~6371 km
+        nn = tree.query_radius(coords, r=rad, count_only=True) - 1  # exclude self
+    else:
+        nn = np.zeros(n, dtype=float)
+        for i in range(n):
+            d = hav_km(latv[i], lonv[i], latv, lonv)
+            nn[i] = np.sum((d <= radius_km) & (d > 0))
     out = df_hour.copy()
     out["nbr_100km"] = nn
     return out
@@ -357,11 +387,19 @@ def main():
     ap.add_argument("--link-radius-km", type=float, default=75.0)
     ap.add_argument("--max-gap-hours", type=int, default=1)
     ap.add_argument("--storm-radius-km", type=float, default=150.0)
+    ap.add_argument("--structure-radius-km", type=float, default=100.0,
+                    help="Neighbour-count radius per hour (0 to skip; uses haversine KDTree when available).")
     ap.add_argument("--lookahead-hours", type=int, default=120)
     ap.add_argument("--min-track-hours", type=int, default=2)
     ap.add_argument("--out-dir", default="results/seedmaps")
     ap.add_argument("--run-name", default="run")
     ap.add_argument("--write-parquet", action="store_true", help="Also write Parquet copies.")
+    ap.add_argument(
+        "--points-format",
+        choices=["csv", "parquet", "both"],
+        default="csv",
+        help="Format for track_points output (tracks/conversion follow CSV + optional parquet).",
+    )
     ap.add_argument("--chunk-rows", type=int, default=0, help="Optional chunk size for CSV inputs (0=off).")
     ap.add_argument("--max-rows", type=int, default=None, help="Optional cap on seed rows (sample if larger).")
     # preprocess normalize-lon to handle tokens like "-180..180"
@@ -406,7 +444,7 @@ def main():
     # per-hour simple structure
     structured = []
     for idx, (ts, g) in enumerate(s.groupby("time"), start=1):
-        structured.append(structure_per_hour(g))
+        structured.append(structure_per_hour(g, radius_km=args.structure_radius_km))
         if idx % 500 == 0:
             print(f"[info] structure pass: {idx} hours processed", flush=True)
     s = pd.concat(structured, ignore_index=True)
@@ -508,22 +546,35 @@ def main():
 
     # ---- write outputs
     base = f"{args.run_name}"
-    out_pts   = Path(args.out_dir) / f"{base}_track_points.csv"
-    out_tr    = Path(args.out_dir) / f"{base}_tracks.csv"
-    out_conv  = Path(args.out_dir) / f"{base}_conversion_rates.csv"
+    out_pts_base = Path(args.out_dir) / f"{base}_track_points"
+    out_tr_base  = Path(args.out_dir) / f"{base}_tracks"
+    out_conv_base= Path(args.out_dir) / f"{base}_conversion_rates"
 
-    pts.to_csv(out_pts, index=False, date_format="%Y-%m-%d %H:00:00")
-    tracks.to_csv(out_tr, index=False, date_format="%Y-%m-%d %H:00:00")
-    conv_df.to_csv(out_conv, index=False)
+    want_csv = args.points_format in ("csv", "both")
+    want_parquet_pts = args.points_format in ("parquet", "both") or args.write_parquet
+
+    if want_csv:
+        out_pts_csv = out_pts_base.with_suffix(".csv")
+        pts.to_csv(out_pts_csv, index=False, date_format="%Y-%m-%d %H:00:00")
+        print(f"[write] {out_pts_csv} rows={len(pts)}")
+    if want_parquet_pts:
+        out_pts_parq = out_pts_base.with_suffix(".parquet")
+        pts.to_parquet(out_pts_parq, index=False)
+        print(f"[write] {out_pts_parq} rows={len(pts)}")
+
+    out_tr_csv = out_tr_base.with_suffix(".csv")
+    tracks.to_csv(out_tr_csv, index=False, date_format="%Y-%m-%d %H:00:00")
+    out_conv_csv = out_conv_base.with_suffix(".csv")
+    conv_df.to_csv(out_conv_csv, index=False)
+    print(f"[write] {out_tr_csv} rows={len(tracks)}")
+    print(f"[write] {out_conv_csv} rows={len(conv_df)}")
 
     if args.write_parquet:
-        pts.to_parquet(str(out_pts) + ".parquet", index=False)
-        tracks.to_parquet(str(out_tr) + ".parquet", index=False)
-        conv_df.to_parquet(str(out_conv) + ".parquet", index=False)
+        tracks.to_parquet(str(out_tr_csv) + ".parquet", index=False)
+        conv_df.to_parquet(str(out_conv_csv) + ".parquet", index=False)
 
-    print(f"[write] {out_pts} rows={len(pts)}")
-    print(f"[write] {out_tr} rows={len(tracks)}")
-    print(f"[write] {out_conv} rows={len(conv_df)}")
+    print(f"[write] {out_tr_csv} rows={len(tracks)}")
+    print(f"[write] {out_conv_csv} rows={len(conv_df)}")
 
 if __name__ == "__main__":
     main()

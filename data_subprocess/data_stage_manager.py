@@ -58,6 +58,7 @@ SCRIPT_MAP: Dict[str, str] = {
     "storm-timeseries":  "build_storm_timeseries_by_id.py",
     "join-labels-grid":  "join_labels_grid.py",
     "lookup-panel":      "build_lookup_panel.py",
+    "symmetry":          "../features_subprocess/compute_symmetry_features.py",
 }
 
 ALIASES: Dict[str, str] = {
@@ -112,6 +113,7 @@ ALIASES: Dict[str, str] = {
     "lookup_panel":      "lookup-panel",
 
     # diagnostics
+    "symmetry":          "symmetry",
 }
 
 

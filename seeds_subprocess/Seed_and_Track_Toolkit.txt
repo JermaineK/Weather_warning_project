@@ -9,6 +9,7 @@ Core tools (via seeds_tracks.py)
   starts-vs-tracks -> seed starts -> patches -> track matching + lead stats
   proto-outcomes   -> link proto-tracks and label outcomes vs IBTrACS
   analyze          -> quick summaries of seed grids
+  gse-tracks       -> track_seed_gse_states.py (G/S/E states + shear role, linked tracks + transitions)
 
 Modern defaults (viability world)
   - prob-col  : prob_viable
@@ -59,8 +60,25 @@ python seeds_tracks.py analyze \
   --normalize-lon "-180..180" \
   --out-dir results/seedmaps
 
+4) GSE seed state tracking (supportive vs destructive shear)
+python seeds_tracks.py gse-tracks \
+  --panel data/grid_train_gse_panel_states.parquet \
+  --thr-file results/sweeps/viability_best_thresholds.parquet \
+  --thr-lead 240 \
+  --prob-col prob_viable \
+  --flag-col alert_final \
+  --direction-col zeta \
+  --ibtracs data/tracks/tracks_subset.csv \
+  --link-radius-km 90 \
+  --chunk-rows 400000 \
+  --run-name coral_sea_demo \
+  --out-dir results/seedmaps \
+  --write-parquet
+
 Chunking
   - from-alerts: --chunk-rows for large CSV alerts (silent when 0/parquet).
   - starts-vs-tracks: --chunk-rows for CSV seeds/tracks (parquet ignored).
   - proto-outcomes: --chunk-rows for CSV seeds/features.
   - analyze: --chunk-rows for CSV inputs; parquet unaffected.
+  - gse-tracks: --chunk-rows for CSV/parquet panels (filters first, then links seeds in-memory).
+  - proto-outcomes: set --structure-radius-km 0 to skip expensive neighbour counts (uses haversine KDTree if installed when >0).
