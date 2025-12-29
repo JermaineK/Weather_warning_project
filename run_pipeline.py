@@ -320,6 +320,46 @@ def _load_json(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _load_stage_manifest_for_autofix(run_name: str | None) -> Dict[str, Any]:
+    if not run_name:
+        return {}
+    safe_run = _safe_run_name(run_name)
+    path = Path("results/runs") / safe_run / "manifests" / "stages.json"
+    data = _load_json(path)
+    stages = data.get("stages", {})
+    return stages if isinstance(stages, dict) else {}
+
+
+def _autofix_stale_reason(
+    section: str,
+    mode: str,
+    step: Dict[str, Any],
+    stages: Dict[str, Any],
+) -> str | None:
+    if not step.get("skip_if_exists"):
+        return None
+    outputs = _output_paths(step)
+    if outputs and not any(p.exists() for p in outputs):
+        return None
+    entry = stages.get(f"{section}.{mode}")
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("health_ok") is False:
+        return "previous_health_failed"
+    prev_fp = entry.get("input_fingerprint")
+    try:
+        curr_fp, _ = _step_fingerprint(section, mode, step)
+    except Exception:
+        curr_fp = None
+    if prev_fp and curr_fp and prev_fp != curr_fp:
+        return "input_fingerprint_mismatch"
+    prev_outputs = {o.get("path") for o in entry.get("outputs", []) if isinstance(o, dict) and o.get("path")}
+    curr_outputs = {str(p) for p in outputs} if outputs else set()
+    if prev_outputs and curr_outputs and prev_outputs != curr_outputs:
+        return "output_path_mismatch"
+    return None
+
+
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
@@ -1014,6 +1054,8 @@ def _autofix_config(
     add_overwrite: bool = False,
 ) -> None:
     changes: List[str] = []
+    run_name = cfg.get("run_name") or RUN_NAME
+    stages_manifest = _load_stage_manifest_for_autofix(run_name)
 
     for section in sections:
         steps = _section_steps_for_fix(cfg, section)
@@ -1060,8 +1102,23 @@ def _autofix_config(
             mode = str(step.get("mode", "")).strip()
             if step.get("enabled") is False:
                 continue
-            step_for_preflight = _apply_table_format(step, convert_existing=False)
+            step_for_preflight = dict(step)
+            step_for_preflight = _apply_runtime_hints(step_for_preflight)
+            step_for_preflight = _apply_table_format(step_for_preflight, convert_existing=False)
             pref = preflight_step(section, step_for_preflight)
+            stale_reason = _autofix_stale_reason(section, mode, step_for_preflight, stages_manifest)
+            if stale_reason:
+                target = _find_step_ref(cfg, section, mode) or step
+                has_overwrite = "overwrite" in target
+                if has_overwrite or add_overwrite:
+                    if target.get("overwrite") is not True:
+                        target["overwrite"] = True
+                        changes.append(f"overwrite {section}.{mode}=true (stale: {stale_reason})")
+                else:
+                    print(
+                        f"[autofix] stale outputs detected for {section}.{mode} ({stale_reason}); "
+                        "rerun with --autofix-add-overwrite to force overwrite."
+                    )
             for issue in pref.input_issues:
                 for prod in issue.spec.produced_by or ():
                     if "." not in prod:
