@@ -1,1117 +1,355 @@
-\# Weather Warning Pipeline
+# Weather Warning Pipeline
 
+End-to-end system for building gridded features from ERA5, joining storm tracks,
+engineering geometric / spherical features, training models, generating alerts,
+and producing per-run reports.
 
+This repo is organized around thin "manager" scripts plus focused workers.
+Everything is orchestrated from a single YAML config via `run_pipeline.py`.
 
-End-to-end system for building gridded features from ERA5, joining storm tracks, engineering geometric / spherical features, sweeping ML models, and emitting alert-style products.
+## Recent updates
 
+- Reporting now writes into a dated run folder (`YYYYMMDD_run###`) and includes
+  `reporting_v2` outputs (MD/JSON + storm pages).
+- Object matching uses scored selection (top-K + spatial de-dup) and reports
+  both motion-based and flow-based directions.
+- Pipeline validation is fail-fast (inputs/columns/ordering) with an autofix
+  mode to enable missing dependencies.
+- YAML normalization is stricter: key aliases, whitespace stripping, and
+  canonical config output are built in.
+- `skip_if_exists` is supported in more tools (sweep best-constrained + eval).
+- Alerts now preserve `row_id` through denoise so specialist training can
+  use alert IDs.
 
+## Repository layout (current)
 
-The project is structured as a set of thin “manager” scripts plus small, focused workers. Everything is orchestrated from a single YAML config and `run\_pipeline.py`.
-
-
-
----
-
-
-
-\## High-level overview
-
-
-
-Data flow, in rough order:
-
-
-
-1\. \*\*Fetch\*\*
-
-&nbsp;  - Download / extract ERA5 single-level and pressure-level fields.
-
-&nbsp;  - Pull historical storm tracks (e.g. IBTrACS subsets).
-
-
-
-2\. \*\*Feature engineering (gridded)\*\*
-
-&nbsp;  - Flatten ERA5 single levels into `(time, lat, lon, vars)` features.
-
-&nbsp;  - Compute bulk shear from pressure-level winds.
-
-&nbsp;  - Patch in rolling / derivative / shear diagnostics.
-
-&nbsp;  - Add geometric-kernel analysis (GKA) features.
-
-&nbsp;  - Integrate “real” thermo back into the flattened table.
-
-&nbsp;  - Compute spherical feedback / SFI-style features.
-
-
-
-3\. \*\*Labels \& data staging\*\*
-
-&nbsp;  - Join storm tracks to the grid.
-
-&nbsp;  - Prepare model-ready train/val/test tables.
-
-
-
-4\. \*\*Sweeps, scoring, alerts\*\*
-
-&nbsp;  - Hyperparameter sweeps and model selection.
-
-&nbsp;  - Gridded scores.
-
-&nbsp;  - Alert logic and seeds/tracks analyses.
-
-&nbsp;  - Final reporting.
-
-
-
-You can run the whole thing with a single command and control each stage from YAML.
-
-
-
----
-
-
-
-\## Repository layout
-
-
-
-Key files and directories (only listing the pieces referenced by the current pipeline):
-
-
+Key files and directories referenced by the pipeline:
 
 ```text
+run_pipeline.py                   # Top-level orchestrator driven by YAML
+pipeline_contracts.py             # Step contracts, dependencies, column checks
 
-run\_pipeline.py                # Top-level orchestrator driven by YAML
+fetch_subprocess/
+  fetch_manager.py                # Front door for fetch modes
+  ...
 
+features_subprocess/
+  features_manager.py             # Front door for feature steps
+  build_features_grid.py          # Flatten ERA5 single levels -> grid features
+  features_bulk_shear.py          # Bulk shear from pressure-level winds
+  features_patch.py               # Rolling stats, shear proxy, S3, derivatives
+  compute_gka_features.py         # GKA / geometric-kernel features
+  integrate_era5_thermo.py         # Thermo integration
+  compute_spherical_feedback.py   # Spherical feedback / SFI features
 
+data_subprocess/
+  data_stage_manager.py           # Data staging (ids, transitions, panels)
+  train_calibrate_eval.py          # Base model training + calibration
+  train_alert_specialist.py        # Alert specialist training
+  predict_and_alert.py             # Base + specialist blending
 
-fetch\_subprocess/
+sweep_subprocess/
+  sweep_manager.py                 # Sweep orchestration
+  find_best_f1_thresholds_constrained.py
 
-&nbsp; fetch\_manager.py             # Front-door for all fetch modes
+alerts_logic_subprocess/
+  alerts_logic_manager.py          # Alert pipeline
+  apply_thresholds.py              # Base alerts
+  throttle_by_percentile.py        # Throttle
+  denoise_alerts.py                # Denoise (keeps row_id when present)
 
-&nbsp; era5\_merge\_singlelevels.py   # Merge ERA5 single-level monthly chunks
+eval_subprocess/
+  eval_manager.py                  # Eval front door
+  eval_viability_leads.py
+  hourly_metrics.py
+  hourly_rollup.py
 
-&nbsp; ...                          # Other fetch\_\* helpers
+seeds_subprocess/
+  seeds_tracks.py                  # Seeds / proto-outcomes / starts-vs-tracks
 
-
-
-features\_subprocess/
-
-&nbsp; features\_manager.py          # Front-door for feature steps
-
-
-
-&nbsp; build\_features\_grid.py       # Flatten ERA5 single levels → grid features
-
-&nbsp; features\_bulk\_shear.py       # Bulk shear from ERA5 pressure-level U/V
-
-&nbsp; features\_join\_features.py    # Join multiple feature tables
-
-&nbsp; join\_labels\_grid.py          # Join grid features with storm tracks
-
-&nbsp; features\_patch.py            # Rolling stats, shear proxy, S3, derivatives, gradients
-
-&nbsp; compute\_gka\_features.py      # GKA / geometric-kernel features on flat table
-
-&nbsp; integrate\_era5\_thermo.py     # Integrate ERA5 thermo back into large features
-
-&nbsp; compute\_spherical\_feedback.py# Spherical feedback / SFI features
-
-
-
-data\_subprocess/
-
-&nbsp; stage\_data.py                # Stage features + labels into model-ready tables
-
-&nbsp; build\_features\_and\_labels.py # Additional assembly, if used
-
-&nbsp; train\_calibrate\_eval.py      # Train models, calibrate, evaluate
-
-&nbsp; thresholds\_and\_alerts.py     # Threshold selection \& alert tables
-
-&nbsp; diagnostics\_packager.py      # Bundle diagnostics / artifacts
-
-
-
-sweep\_subprocess/
-
-&nbsp; sweep\_manager.py             # Model sweeps / chains
-
-
-
-score\_subprocess/
-
-&nbsp; grid\_score.py                # Unified scoring script for grid outputs
-
-
-
-alerts\_logic\_subprocess/
-
-&nbsp; alerts\_logic\_manager.py      # Alert logic pipeline
-
-
-
-eval\_subprocess/
-
-&nbsp; eval\_manager.py              # Evaluation rollups
-
-
-
-runtime\_subprocess/
-
-&nbsp; runtime\_manager.py           # Runtime / environment checks
-
-
+reports_subprocess/
+  reports_and_maps_manager.py      # Bundle reports into per-run folder
+  report_pack.py                   # Tables for reporting
+  reporting_v2.py                  # MD/JSON report + storm pages
+  match_objects_to_tracks.py       # Scored matching + directionality
+  plot_object_matches.py           # Maps: all objects, candidates, matches
 
 utils/
-
-&nbsp; quick\_gka\_summary.py         # Lightweight stats/summary for large GKA parquet files
-
-
-
-seeds\_tracks.py                # Seeds / proto-outcomes / starts-vs-tracks utilities
-
-reporting\_and\_results.py       # Final stitching \& reporting
-
-
-
-data/                          # Local outputs (parquet / csv / gz)
-
-data\_era5/extracted/           # ERA5 extracted NetCDFs
-
-&nbsp; .../era5\_single\_YYYYMM\_oper.nc
-
-&nbsp; .../era5\_pl\_\*\_uv.nc
-
-data/tracks/
-
-&nbsp; tracks\_subset.csv            # Track subset used for labelling
-
-````
-
-
-
----
-
-
-
-\## Pipeline orchestration and CLI entry points
-
-The top-level pipeline fans out into manager scripts, which in turn dispatch to the worker scripts listed above. Steps are driven by your YAML config and translated into CLI flags for each target.
-
-```
-run_pipeline.py
- ├─ run_fetch → fetch_subprocess/fetch_manager.py → era5_fetch_cds.py / era5_merge_singlelevels.py / ibtracs_fetch.py / prepare_besttrack_intensity.py (mode-driven)
-run_features -> features_subprocess/features_manager.py -> build_features_grid.py / compute_gka_features.py / integrate_era5_thermo.py / compute_spherical_feedback.py / features_bulk_shear.py / features_join_features.py (mode-driven; label join now lives under data_subprocess)
- ├─ run_data_stage → data_subprocess/data_stage_manager.py (mode-driven)
- ├─ run_sweep → sweep_subprocess/sweep_manager.py (mode-driven; supports “chain” recipe)
- ├─ run_score → grid_score.py (per-job args)
- ├─ run_alerts_logic → alerts_logic_subprocess/alerts_logic_manager.py (mode-driven)
- ├─ run_eval → eval_subprocess/eval_manager.py (mode-driven)
- ├─ run_seeds → seeds_subprocess/seeds_tracks.py (subcommands: from-alerts, proto-outcomes, starts-vs-tracks, analyze)
- ├─ run_report → reports_subprocess/reports_and_maps_manager.py (mode-driven steps, legacy single-step support)
- └─ run_misc → arbitrary scripts resolved relative to repo root
+  run_naming.py                    # YYYYMMDD_run### folder naming
+  config_normalize.py              # YAML normalization + aliasing
+  quick_gka_summary.py             # Lightweight stats for large GKA tables
 ```
 
-### Core arguments
+## Pipeline orchestration
 
-- `run_pipeline.py` requires `--config <YAML>` and optionally `--sections` (comma list; defaults to all sections in the order above).
-- Each YAML section block honors an `enabled` toggle; steps/jobs within sections can also set `enabled` and `skip_if_exists` (where supported) to bypass work when outputs already exist.
+`run_pipeline.py` is the only entry point you need. It validates the config,
+prints the plan, and dispatches each section to the appropriate manager.
 
-### Section-specific wiring
+Default section order:
 
-- **Fetch (`fetch.steps`)**: each step must supply `mode` (defaults to `ibtracs`) selecting the fetch tool; additional keys become CLI flags. The manager requires positional `tool` plus optional `--dry-run`, `--quiet`, `--print-preset`, and any downstream script flags (user args override presets; some env vars like `FETCH_AREA` may influence defaults).
-- **Features (`features.steps`)**: `mode` defaults to `build`. Supports `skip_if_exists` before dispatch. Manager requires positional `mode`, optional `--dry-run`, and passes through the remaining YAML keys (with small flag rewrites/CSV compaction for certain modes).
-- **Data staging / sweep / alerts_logic / eval**: each step requires/assumes `mode` (defaults are documented in code) plus arbitrary CLI-flags-as-keys. `sweep` special-cases `mode: chain` with optional `recipe` (default `run+pick`).
-- **Score (`score.jobs`)**: list of jobs without modes; all keys become CLI args to `grid_score.py`.
-- **Seeds**: top-level toggles subsections `from_alerts`, `outcomes`, `starts`, `analyze`; each subsection’s keys map to CLI flags for the corresponding `seeds_tracks.py` subcommand.
-- **Report (`report.steps`)**: each step needs `mode` (default `summary`); legacy single-block configs are coerced into one summary step; supports `skip_if_exists` before dispatch.
-- **Misc (`misc.steps`)**: each entry must provide `script`; other keys become CLI flags; optional `skip_if_exists` supported.
-
-
-
----
-
-
-
-\## Installation
-
-
-
-Use Python 3.10+ and a virtual environment.
-
-
-
-```bash
-
-python -m venv .venv
-
-source .venv/bin/activate   # Windows: .venv\\Scripts\\activate
-
-pip install -r requirements.txt
-
+```text
+fetch -> features -> data_stage -> training -> sweep -> score -> alerts_logic
+-> eval -> seeds -> report -> misc
 ```
 
-
-
-The exact `requirements.txt` will vary, but the project uses at least:
-
-
-
-\* `numpy`
-
-\* `pandas`
-
-\* `xarray`
-
-\* `pyarrow`
-
-\* `netcdf4` and/or `h5netcdf` and/or `scipy` (for NetCDF)
-
-\* `pyyaml`
-
-\* Standard scientific Python stack (scikit-learn, etc.) for downstream stages.
-
-
-
----
-
-
-
-\## Data requirements
-
-
-
-At minimum:
-
-
-
-\* \*\*ERA5 single-level NetCDFs\*\* for:
-
-
-
-&nbsp; \* `u10`, `v10` (10-m winds)
-
-&nbsp; \* `msl` (mean sea–level pressure)
-
-&nbsp; \* `t2m` (2-m temperature)
-
-\* \*\*ERA5 pressure-level NetCDFs\*\* for:
-
-
-
-&nbsp; \* U/V winds on pressure levels including at least 1000, 925, 500 hPa (for bulk shear).
-
-\* \*\*Storm tracks\*\* (e.g. IBTrACS subset) with:
-
-
-
-&nbsp; \* `time`, `lat`, `lon`, intensity / ID fields used by your labelling logic.
-
-
-
-All ERA5 files are expected under `data\_era5/extracted/` with patterns like:
-
-
-
-\* `data\_era5/extracted/\*\*/era5\_single\_YYYYMM\_oper.nc`
-
-\* `data\_era5/extracted/\*\*/era5\_pl\_\*\_uv.nc`
-
-
-
-Storm tracks are typically under `data/tracks/tracks\_subset.csv`.
-
-
-
-## Subprocess cheatsheet (viability-first defaults)
-
-- Alerts logic (`alerts_logic_subprocess/`): defaults point at `models/viability_model.pkl` and emit `prob_viable`/`alert_final`. See `alerts_logic_subprocess/Alerts_logic_subprocess.txt`.
-- Sweeps (`sweep_subprocess/`): viability threshold finder uses `y_viable` + `t_to_storm_min_h`; outputs `results/sweeps/viability_best_thresholds.csv`. See `sweep_subprocess/Sweep_subprocess.txt`.
-- Seeds (`seeds_subprocess/`): `from-alerts` expects `prob_viable` + `alert_final`, writing `<run>_union_byhour.csv`, `<run>_seed_patches.csv`, and matches. See `seeds_subprocess/Seed_and_Track_Toolkit.txt`.
-- Reports (`reports_subprocess/`): manager infers per-run paths from `--run-name`, surfaces viability metrics/thresholds, and points maps at the new seed outputs. See `reports_subprocess/Reports_and_maps_subprocess.txt`.
-- Eval (`eval_subprocess/`): alert hits can use `t_to_storm_min_h` truth mode; hourly metrics default to `prob_viable`.
-- Chunking: many workers accept `--chunk-rows`/`--parquet-rows`; enable them on large tables to stay memory-safe.
-
-
-
----
-
-
-
-\## Orchestration: `run\_pipeline.py` + YAML
-
-
-
-`run\_pipeline.py` is the only script you \*have\* to call directly.
-
-It reads a YAML config and calls the section managers in order.
-
-
-
-\### Section order
-
-
-
-In code, the default order is:
-
-
-
-```python
-
-SECTION\_ORDER = \[
-
-&nbsp;   "fetch",
-
-&nbsp;   "features",
-
-&nbsp;   "data\_stage",
-
-&nbsp;   "sweep",
-
-&nbsp;   "score",
-
-&nbsp;   "alerts\_logic",
-
-&nbsp;   "eval",
-
-&nbsp;   "runtime",
-
-&nbsp;   "seeds",
-
-&nbsp;   "report",
-
-]
+### Config normalization and validation
+
+- Configs are normalized on load (aliases, dashes to underscores, whitespace
+  stripping). A canonical config is written next to the input YAML.
+- `validate_pipeline()` checks required inputs/columns and dependency order.
+  Missing prerequisites fail fast with a clear error.
+- `--autofix-config` can auto-enable missing upstream steps; add overwrite
+  flags only when `--autofix-add-overwrite` is supplied.
+
+### Run folder naming
+
+Reports are organized into a per-run directory created under `run-root`
+(default `results/reports`) with the format:
 
 ```
+YYYYMMDD_run###
+```
 
+Example: `results/reports/20251224_run003/`
 
+## Reporting and maps
 
-Each section has:
+The report bundle step (recommended) produces:
 
+- `results/reports/<YYYYMMDD_run###>/<run_name>_report.txt`
+- `results/reports/<YYYYMMDD_run###>/<run_name>_report.md`
+- `results/reports/<YYYYMMDD_run###>/<run_name>_report.json`
+- `results/reports/<YYYYMMDD_run###>/<run_name>_tables/` (CSV/Parquet tables)
+- `results/reports/<YYYYMMDD_run###>/storm_pages/` (storm-by-storm pages)
 
+Key behaviors:
 
-\* `enabled: true/false`
+- `report_pack.py` writes tables into `<run_name>_tables/` under the run folder.
+- `reporting_v2.py` builds the MD/JSON report and storm pages.
+- Map outputs include all predicted objects, candidates, and matched objects.
 
-\* A `steps:` (or `jobs:`) list with:
+## Object matching and directionality
 
+Matching is now scored and de-duplicated per hour:
 
+- Score uses probability, distance penalty, compactness, and persistence.
+- Top-K candidates are kept per hour, then non-maximum suppression enforces
+  a minimum separation in km.
+- Direction is reported two ways:
+  - Motion direction from centroid displacement (preferred).
+  - Flow direction from mean u10/v10 within the object mask.
 
-&nbsp; \* `mode` (or `recipe`) that selects the manager sub-mode.
+Maps show all objects, candidates, and matches with arrows labeled by
+speed (km/h) and bearing.
 
-&nbsp; \* Additional key/value pairs forwarded as CLI flags.
+## Training and alerts pipeline
 
+Training chain (typical order):
 
+1. `data_stage` steps: add-ids -> state-transitions -> (optional panels)
+2. `train-base` (base model)
+3. `train-alert-specialist` (uses alerts + storm labels)
+4. `predict-alerts` (blend base + specialist)
+5. `track-objects` (object extraction)
 
-Extra keys are flattened to `--k v`, with nested keys becoming dotted flags:
+Alerts logic (viability pipeline) produces:
 
-`{"pick": {"metric": "F1"}} → --pick.metric F1`.
+- `prob_viable`
+- `alert_base`, `alert_final`
+- `row_id` is preserved through denoise for specialist training
 
+## Evaluation
 
+Eval tools are run via `eval_subprocess/eval_manager.py` and include:
 
-\### Example: minimal pipeline YAML (current structure)
+- `viability-leads` (lead-time skill vs `t_to_storm_min_h`)
+- `hourly-metrics` (alert coverage/cluster stats)
+- `hourly-rollup` (per-hour aggregates)
 
+`skip_if_exists` is supported in the above eval tools.
 
-
-This example matches the current scripts and file names that are in use:
-
-
+## Example: minimal pipeline YAML (current shape)
 
 ```yaml
-
-run\_name: fma\_run
-
+run_name: coral_sea_demo
 workdir: .
-
-
+reports_dir: results/reports
+table_format: parquet
+force_keep_quantile: 1.0
 
 defaults:
-
-&nbsp; normalize\_lon: "-180..180"
-
-
+  start: &start "2025-02-01"
+  end:   &end   "2025-05-01"
+  hours: &hours "0..23"
+  normalize_lon: &norm "-180..180"
+  area: &area "-5,125,-35,175"
 
 fetch:
-
-&nbsp; enabled: true
-
-&nbsp; steps:
-
-&nbsp;   - mode: era5-both
-
-&nbsp;     years: \[2025]
-
-&nbsp;     months: \[2, 3, 4, 5]
-
-&nbsp;     area: "-5,125,-35,175"
-
-&nbsp;     out\_dir: "data\_era5/extracted"
-
-&nbsp;   - mode: ibtracs
-
-&nbsp;     basin: "SHEM"
-
-&nbsp;     out\_csv: "data/tracks/tracks\_subset.csv"
-
-
+  enabled: false
+  steps:
+    - mode: ibtracs
+      start: *start
+      end: *end
+      area: *area
+      normalize-lon: *norm
+      out: data/tracks/tracks_subset.csv
 
 features:
-
-&nbsp; enabled: true
-
-&nbsp; steps:
-
-&nbsp;   - mode: build
-
-&nbsp;     nc\_glob: "data\_era5/extracted/\*\*/era5\_single\_\*\_\*.nc"
-
-&nbsp;     out: "data/features\_eoi.parquet"
-
-&nbsp;     normalize\_lon: "-180..180"
-
-&nbsp;     area: "-5,125,-35,175"
-
-&nbsp;     export\_uv: true
-
-&nbsp;     with\_vortdiv: true
-
-&nbsp;     require\_vars: \["u10", "v10", "msl", "t2m"]
-
-&nbsp;     dedup: "time\_lat\_lon"
-
-&nbsp;     emit\_grid\_index: true
-
-
-
-&nbsp;   - mode: bulk-shear
-
-&nbsp;     pl\_glob: "data\_era5/extracted/\*\*/era5\_pl\_\*\_uv.nc"
-
-&nbsp;     out: "data/features\_bulk\_shear.parquet"
-
-&nbsp;     low\_pair: \[1000, 925]
-
-&nbsp;     deep\_pair: \[1000, 500]
-
-&nbsp;     s3\_window: 3
-
-
-
-&nbsp;   - mode: join-features
-
-&nbsp;     left: "data/features\_eoi.parquet"
-
-&nbsp;     right: "data/features\_bulk\_shear.parquet"
-
-&nbsp;     on: \["time", "lat", "lon"]
-
-&nbsp;     out: "data/features\_merged.parquet"
-
-
-
-&nbsp;   - mode: patch
-
-&nbsp;     in: "data/features\_merged.parquet"
-
-&nbsp;     out: "data/features\_merged\_patched.parquet"
-
-&nbsp;     prefer\_shear: "shear\_06km"
-
-&nbsp;     s3\_window: 3
-
-
-
-&nbsp;   - mode: gka
-
-&nbsp;     infile: "data/features\_merged\_patched.parquet"
-
-&nbsp;     outfile: "data/grid\_labelled\_FMA\_gka.parquet"
-
-&nbsp;     overwrite: true
-
-
-
-&nbsp;   - mode: integrate-thermo
-
-&nbsp;     features: "data/grid\_labelled\_FMA\_gka.parquet"
-
-&nbsp;     thermo\_glob: "data\_era5/extracted/\*\*/era5\_single\_\*\_\*.nc"
-
-&nbsp;     normalize\_lon: "-180..180"
-
-&nbsp;     area: "-5,125,-35,175"
-
-&nbsp;     out: "data/grid\_labelled\_FMA\_gka\_realthermo.parquet"
-
-
-
-&nbsp;   - mode: spherical-feedback
-
-&nbsp;     labelled: "data/grid\_labelled\_FMA\_gka\_realthermo.parquet"
-
-&nbsp;     normalize\_lon: "-180..180"
-
-&nbsp;     area: "-5,125,-35,175"
-
-&nbsp;     neighbor\_step: 0.0
-
-&nbsp;     radius\_cells: 1
-
-&nbsp;     out: "data/spherical\_feedback.csv.gz"
-
-
-
-labels\_stage:
-
-&nbsp; # This is used by join\_labels\_grid via run\_pipeline.run\_join\_labels, if enabled
-
-&nbsp; features\_csv: "data/features\_eoi.parquet"
-
-&nbsp; labels\_csv:   "data/tracks/tracks\_subset.csv"
-
-&nbsp; out\_csv:      "data/grid\_labelled\_base.parquet"
-
-&nbsp; storm\_radius\_deg: 2.0
-
-&nbsp; storm\_time\_h: 6.0
-
-&nbsp; near\_radius\_deg: 8.0
-
-&nbsp; near\_time\_h: 24.0
-
-&nbsp; pregen\_radius\_deg: 8.0
-
-&nbsp; pregen\_hours: "1..240"
-
-&nbsp; pregen\_step: 1
-
-&nbsp; normalize\_lon: "-180..180"
-
-
-
-pipeline:
-
-&nbsp; run\_labels\_stage: false
-
-
-
-data\_stage:
-
-&nbsp; enabled: false
-
-&nbsp; steps: \[]      # stage\_data / build\_features\_and\_labels etc.
-
-
+  enabled: true
+  steps:
+    - mode: build
+      nc-glob: "data_era5/extracted/**/era5_single_*_*.nc"
+      out: data/grid_FMA_base.parquet
+      normalize-lon: *norm
+      area: *area
+      export-uv: true
+      with-vortdiv: true
+      emit-grid-index: true
+
+    - mode: bulk-shear
+      pl-glob: "data_era5/extracted/**/era5_pl_*_uv.nc"
+      out: data/grid_FMA_shear.parquet
+      low-pair: [1000, 925]
+      deep-pair: [1000, 500]
+
+    - mode: join-features
+      left: data/grid_FMA_base.parquet
+      right: data/grid_FMA_shear.parquet
+      on: [time, lat, lon]
+      out: data/grid_FMA_joined.parquet
+
+    - mode: patch
+      in: data/grid_FMA_joined.parquet
+      out: data/grid_FMA_patched.parquet
+
+    - mode: gka
+      infile: data/grid_FMA_patched.parquet
+      outfile: data/grid_FMA_gka.parquet
+
+    - mode: integrate-thermo
+      features: data/grid_FMA_gka.parquet
+      thermo-glob: "data_era5/extracted/**/era5_single_*_*.nc"
+      out: data/grid_FMA_gka_realthermo.parquet
+
+    - mode: spherical-feedback
+      labelled: data/grid_FMA_gka_realthermo.parquet
+      out: data/grid_FMA_sph.parquet
+
+training:
+  enabled: true
+  steps:
+    - mode: train-base
+      train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
+      label: storm
+      train-end: "2025-03-31"
+      val-end: "2025-04-30"
+      model-out: models/base_model.pkl
+      calibration-out: models/base_calibrator.pkl
+
+    - mode: train-alert-specialist
+      train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
+      alerts: results/alerts/alerts_coral_sea_demo_final.parquet
+      label: storm
+      model-out: models/alert_specialist.pkl
+
+    - mode: predict-alerts
+      features: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
+      base-model: models/base_model.pkl
+      base-calibrator: models/base_calibrator.pkl
+      specialist-model: models/alert_specialist.pkl
+      outfile: results/predictions_base_specialist.parquet
+
+    - mode: track-objects
+      infile: results/predictions_base_specialist.parquet
+      mask-col: P_final
+      threshold: 0.6
+      objects-out: results/objects/objects.parquet
+      join-out: results/objects/cell_objects.parquet
+
+alerts_logic:
+  enabled: true
+  steps:
+    - mode: viability-pipeline
+      run-name: coral_sea_demo
+      labelled: data/grid_train_gse_panel_targets.parquet
+      model: models/viability_model.pkl
+      thr: 0.37
+      keep-quantile: 1
+      base-out: results/alerts/alerts_coral_sea_demo_base.parquet
+      thr-out: results/alerts/alerts_coral_sea_demo_thr.parquet
+      out: results/alerts/alerts_coral_sea_demo_final.parquet
 
 sweep:
-
-&nbsp; enabled: false
-
-&nbsp; steps: \[]      # sweep\_manager modes
-
-
-
-score:
-
-&nbsp; enabled: false
-
-&nbsp; jobs: \[]       # grid\_score jobs
-
-
-
-alerts\_logic:
-
-&nbsp; enabled: false
-
-&nbsp; steps: \[]      # alerts\_logic\_manager modes
-
-
+  enabled: true
+  steps:
+    - mode: best-constrained
+      labelled: data/grid_train_gse_panel_targets.parquet
+      model: models/viability_model.pkl
+      metrics-json: models/viability_model_metrics.json
+      out: results/sweeps/viability_best_thresholds.csv
+      skip_if_exists: true
 
 eval:
+  enabled: true
+  steps:
+    - mode: viability-leads
+      run-name: coral_sea_demo
+      out: results/metrics/coral_sea_demo_viability_leads.csv
+      skip_if_exists: true
 
-&nbsp; enabled: false
+    - mode: hourly-metrics
+      run-name: coral_sea_demo
+      out: results/metrics/coral_sea_demo_hourly_metrics.csv
+      skip_if_exists: true
 
-&nbsp; steps: \[]      # eval\_manager modes
-
-
-
-runtime:
-
-&nbsp; enabled: false
-
-&nbsp; steps: \[]      # runtime\_manager checks
-
-
-
-seeds:
-
-&nbsp; enabled: false
-
-
+    - mode: hourly-rollup
+      run-name: coral_sea_demo
+      out: results/metrics/coral_sea_demo_hourly_rollup.parquet
+      skip_if_exists: true
 
 report:
-
-&nbsp; enabled: false
-
+  enabled: true
+  steps:
+    - mode: bundle
+      run-name: coral_sea_demo
+      run-root: results/reports
+      objects-in: results/alerts/alerts_coral_sea_demo_final.parquet
+      object-matches-out: results/matches/storm_object_matches.parquet
+      ibtracs: data/tracks/tracks_subset.csv
+      ibtracs-normalize-lon: *norm
 ```
 
+## Running the pipeline
 
-
-You can turn sections on/off by toggling `enabled` fields, and you can also restrict which sections run with `--sections` on the CLI.
-
-
-
----
-
-
-
-\## Running the pipeline
-
-
-
-Example: run the full default section order:
-
-
+Run all sections:
 
 ```bash
-
-python run\_pipeline.py --config configs/run\_fma.yaml
-
+python run_pipeline.py --config config/pipeline.yaml
 ```
 
-
-
-Run only `fetch` and `features`:
-
-
+Run only a subset:
 
 ```bash
-
-python run\_pipeline.py --config configs/run\_fma.yaml --sections=fetch,features
-
+python run_pipeline.py --config config/pipeline.yaml --sections=features,data_stage,training
 ```
 
-
-
-Each section logs the exact command lines it invokes, so you can copy/paste to debug or run steps manually.
-
-
-
----
-
-
-
-\## Key managers and their modes
-
-
-
-\### `fetch\_subprocess/fetch\_manager.py`
-
-
-
-Front-door for all fetch logic. You normally won’t call it directly when using `run\_pipeline.py`, but you can.
-
-
-
-Modes include (exact set may vary with your current version):
-
-
-
-\* `era5` / `era5-pl` / `era5-both` / `era5-shear`
-
-\* `ibtracs`
-
-\* `intensity`
-
-
-
-All extra YAML key/vals in the `fetch.steps` entries are passed as CLI flags.
-
-
-
----
-
-
-
-\### `features\_subprocess/features\_manager.py`
-
-
-
-Thin delegator; it only chooses the script and passes through all other arguments.
-
-
-
-Current routing:
-
-
-
-\* `build`              → `build\_features\_grid.py`
-
-\* `patch`              → `features\_patch.py`
-
-\* `join`               → `join\_labels\_grid.py`
-
-\* `gka`                → `compute\_gka\_features.py`
-
-\* `integrate-thermo`   → `integrate\_era5\_thermo.py`
-
-\* `spherical-feedback` → `compute\_spherical\_feedback.py`
-
-\* `spherical`          → `compute\_spherical\_feedback.py` (alias)
-
-\* `bulk-shear`         → `features\_bulk\_shear.py`
-
-\* `join-features`      → `features\_join\_features.py`
-
-
-
-Examples:
-
-
+Generate an autofix config:
 
 ```bash
-
-\# Build base gridded ERA5 features
-
-python features\_subprocess/features\_manager.py build \\
-
-&nbsp; --nc-glob "data\_era5/extracted/\*\*/era5\_single\_\*\_\*.nc" \\
-
-&nbsp; --out data/features\_eoi.parquet \\
-
-&nbsp; --normalize-lon "-180..180" \\
-
-&nbsp; --area "-5,125,-35,175" \\
-
-&nbsp; --export-uv \\
-
-&nbsp; --with-vortdiv \\
-
-&nbsp; --require-vars u10,v10,msl,t2m \\
-
-&nbsp; --dedup time\_lat\_lon \\
-
-&nbsp; --emit-grid-index
-
-
-
-\# Bulk shear from pressure levels
-
-python features\_subprocess/features\_manager.py bulk-shear \\
-
-&nbsp; --pl-glob "data\_era5/extracted/\*\*/era5\_pl\_\*\_uv.nc" \\
-
-&nbsp; --out data/features\_bulk\_shear.parquet \\
-
-&nbsp; --low-pair 1000,925 \\
-
-&nbsp; --deep-pair 1000,500 \\
-
-&nbsp; --s3-window 3
-
-
-
-\# Join base features + shear
-
-python features\_subprocess/features\_manager.py join-features \\
-
-&nbsp; --left data/features\_eoi.parquet \\
-
-&nbsp; --right data/features\_bulk\_shear.parquet \\
-
-&nbsp; --on time,lat,lon \\
-
-&nbsp; --out data/features\_merged.parquet
-
-
-
-\# Patch in rolling, derivatives, S3, etc.
-
-python features\_subprocess/features\_manager.py patch \\
-
-&nbsp; --in data/features\_merged.parquet \\
-
-&nbsp; --out data/features\_merged\_patched.parquet \\
-
-&nbsp; --prefer-shear shear\_06km \\
-
-&nbsp; --s3-window 3
-
-
-
-\# Add GKA features
-
-python features\_subprocess/features\_manager.py gka \\
-
-&nbsp; --infile data/features\_merged\_patched.parquet \\
-
-&nbsp; --outfile data/grid\_labelled\_FMA\_gka.parquet \\
-
-&nbsp; --overwrite
-
-
-
-\# Integrate thermo
-
-python features\_subprocess/features\_manager.py integrate-thermo \\
-
-&nbsp; --features data/grid\_labelled\_FMA\_gka.parquet \\
-
-&nbsp; --thermo-glob "data\_era5/extracted/\*\*/era5\_single\_\*\_\*.nc" \\
-
-&nbsp; --out data/grid\_labelled\_FMA\_gka\_realthermo.parquet \\
-
-&nbsp; --normalize-lon "-180..180" \\
-
-&nbsp; --area "-5,125,-35,175"
-
-
-
-\# Spherical feedback / SFI
-
-python features\_subprocess/features\_manager.py spherical-feedback \\
-
-&nbsp; --labelled data/grid\_labelled\_FMA\_gka\_realthermo.parquet \\
-
-&nbsp; --out data/spherical\_feedback.csv.gz \\
-
-&nbsp; --neighbor-step 0.0 \\
-
-&nbsp; --radius-cells 1 \\
-
-&nbsp; --normalize-lon "-180..180" \\
-
-&nbsp; --area "-5,125,-35,175"
-
+python run_pipeline.py --config config/pipeline.yaml --autofix-config
 ```
 
-
-
----
-
-
-
-\### `data\_manager.py`
-
-
-
-Thin wrapper for the “data” stage scripts living in `data\_subprocess/`.
-
-
-
-Subcommands:
-
-
-
-\* `stage-data`            → `stage\_data.py`
-
-\* `build-features-labels` → `build\_features\_and\_labels.py`
-
-\* `train-calibrate-eval`  → `train\_calibrate\_eval.py`
-
-\* `thresholds-and-alerts` → `thresholds\_and\_alerts.py`
-
-\* `diagnostics-packager`  → `diagnostics\_packager.py`
-
-
-
-Usage:
-
-
-
-```bash
-
-python data\_manager.py stage-data --config configs/my\_data\_stage.yaml
-
-python data\_manager.py train-calibrate-eval --config configs/my\_training.yaml
-
-```
-
-
-
-All arguments after the subcommand are passed straight to the underlying script.
-
-
-
----
-
-
-
-\## Utilities
-
-
-
-\### Quick GKA summary
-
-
-
-`utils/quick\_gka\_summary.py` is built for large GKA parquet tables (~70M rows, ~10 GB).
-
-
-
-Example:
-
-
-
-```bash
-
-python utils/quick\_gka\_summary.py data/grid\_labelled\_FMA\_gka.parquet
-
-```
-
-
-
-Outputs:
-
-
-
-\* File stats: rows, row groups, size, basic column ranges.
-
-\* Quantiles (e.g. 5/50/95%) for the `gka\_` feature family.
-
-\* Basic null counts.
-
-
-
-This is designed to work incrementally via `pyarrow.parquet.ParquetFile` and to avoid reading the whole table into memory.
-
-
-
----
-
-
-
-\## Memory \& performance notes
-
-
-
-Current data volumes discussed in this pipeline:
-
-
-
-\* Grid for FMA (Feb–May) at 0.25° resolution:
-
-
-
-&nbsp; \* ≈ \*\*70,044,480 rows\*\*
-
-&nbsp; \* GKA table around \*\*10.2 GB\*\* as Parquet (`grid\_labelled\_FMA\_gka.parquet`).
-
-
-
-Some guidance:
-
-
-
-\* Prefer \*\*Parquet\*\* over CSV for large intermediate tables.
-
-\* Scripts like `features\_patch.py`, `compute\_gka\_features.py`, and `compute\_spherical\_feedback.py` are written to:
-
-
-
-&nbsp; \* Downcast floats to `float32` where safe.
-
-&nbsp; \* Use per-time or chunked processing for expensive neighbor operations.
-
-\* For anything that still runs out of memory:
-
-
-
-&nbsp; \* Reduce temporal span (fewer months) for explorations.
-
-&nbsp; \* Restrict spatial area via `--area` before going back to larger regions.
-
-&nbsp; \* Consider turning off non-essential diagnostics in YAML for initial smoke tests.
-
-
-
----
-
-
-
-\## Troubleshooting (current known patterns)
-
-
-
-\* \*\*KeyError(\[... not in index]) in thermo integration\*\*
-
-&nbsp; Addressed by the current `integrate\_era5\_thermo.py`, which uses a stable `\_\_idx` column rather than global integer index lists.
-
-
-
-\* \*\*MemoryError in GKA parity / SFI neighbor logic\*\*
-
-&nbsp; Current versions:
-
-
-
-&nbsp; \* Use chunking (CSV streaming) or per-hour grouping.
-
-&nbsp; \* Avoid storing huge intermediate matrices.
-
-&nbsp; \* Cast to `float32` where possible.
-
-
-
-\* \*\*“No rows after normalization/AOI filter” in spherical feedback\*\*
-
-&nbsp; Typically means:
-
-
-
-&nbsp; \* Input file has been filtered to a different lon convention than the one you’re passing.
-
-&nbsp; \* `--normalize-lon` + `--area` combination excludes everything.
-
-&nbsp;   Fix by ensuring:
-
-&nbsp; \* All previous stages use the same lon mode (e.g. `-180..180`).
-
-&nbsp; \* AOI bounds match that lon mode.
-
-
-
----
-
-
-
-\## Extending the pipeline
-
-
-
-The current structure is modular:
-
-
-
-\* Add new feature steps as a script under `features\_subprocess/` and wire it into `features\_manager.ROUTING`.
-
-\* Add new “data stage” steps under `data\_subprocess/` and expose them via `data\_manager.py`.
-
-\* New metrics or evaluation logic can be plugged into:
-
-
-
-&nbsp; \* `score\_subprocess/grid\_score.py`
-
-&nbsp; \* `eval\_subprocess/eval\_manager.py`
-
-\* New alert logic recipes can be added via `alerts\_logic\_subprocess/alerts\_logic\_manager.py`.
-
-
-
-Each new piece can then be activated from YAML with a new `mode` in the appropriate section, without changing `run\_pipeline.py`.
-
-
-
----
-
-
-
-```
-
-```
-
-
+## Performance notes
+
+- Prefer Parquet for large tables.
+- Many workers accept `--chunk-rows` and `--parquet-rows` to stay memory-safe.
+- AOI cropping and shorter time spans are the fastest way to reduce load.
+
+## Troubleshooting
+
+- Single-class metrics in training or eval usually mean the validation window
+  has no positives. Adjust `train-end`/`val-end` or use a random split.
+- `alerts_used=0` in specialist training usually means the alerts file lacks
+  `row_id`. Re-run the alerts pipeline so denoise outputs preserve `row_id`.
+- If AOI crop removes all rows, confirm `normalize-lon` and AOI bounds use the
+  same longitude frame.

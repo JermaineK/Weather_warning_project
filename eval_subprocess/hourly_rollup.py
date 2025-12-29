@@ -59,6 +59,7 @@ def main():
                     help="Comma-separated risk columns to aggregate (default: auto-detect 'risk*').")
     ap.add_argument("--out", required=False, default=None, help="Output CSV(.gz)/Parquet")
     ap.add_argument("--run-name", default=None, help="Optional run name to auto-fill alerts/out paths.")
+    ap.add_argument("--skip-if-exists", action="store_true", help="Skip work if output already exists.")
     # Chunk hints for compatibility
     ap.add_argument("--chunk-rows", type=int, default=None, help="Accepted for compatibility; not used.")
     ap.add_argument("--chunksize", type=int, default=None, help="Alias for --chunk-rows.")
@@ -91,6 +92,9 @@ def main():
             f"results/metrics/{args.run_name}_hourly_rollup.parquet"
             if args.run_name else "results/metrics/hourly_rollup.parquet"
         )
+    if args.skip_if_exists and Path(args.out).exists():
+        print(f"[skip] output already exists: {args.out}")
+        return
 
     # Load minimal columns first; expand later for risks/flag
     df = read_any(args.alerts, parse_dates=["time"])

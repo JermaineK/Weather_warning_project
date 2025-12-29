@@ -23,12 +23,20 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 from typing import Iterable, Sequence
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
+
+HERE = Path(__file__).resolve()
+REPO_ROOT = HERE.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils import io_common
 
 pd.options.mode.copy_on_write = True
 
@@ -66,6 +74,20 @@ def _load_panel(path: str, need_cols: Sequence[str]) -> pd.DataFrame:
     return pd.read_csv(path, low_memory=False, usecols=lambda c: c in set(need_cols))
 
 
+def _coerce_binary_series(series: pd.Series, label: str, context: str) -> np.ndarray:
+    vals = pd.to_numeric(series, errors="coerce").fillna(0)
+    bad = ~vals.isin([0, 1])
+    if bool(bad.any()):
+        bad_vals = pd.unique(vals[bad])[:5]
+        sample = ", ".join(str(v) for v in bad_vals)
+        print(
+            f"[warn] [{context}] label '{label}' has non-binary values (e.g. {sample}); "
+            "binarizing as >0.",
+            file=sys.stderr,
+        )
+    return (vals > 0).astype(int).to_numpy()
+
+
 def _parse_leads(raw: Iterable[str]) -> list[float]:
     out: list[float] = []
     for tok in raw:
@@ -98,18 +120,57 @@ def _lead_mask(dt: np.ndarray, lead_h: float, lead_lower: float) -> np.ndarray:
 def _safe_metrics(y: np.ndarray, p: np.ndarray) -> dict[str, float]:
     mets: dict[str, float] = {}
     try:
-        mets["auc"] = roc_auc_score(y, p)
+        y = np.asarray(y, dtype=int)
+        pos = int(y.sum())
+        neg = int(len(y) - pos)
+        if pos == 0 or neg == 0:
+            mets["auc"] = float("nan")
+            mets["prauc"] = float("nan")
+        else:
+            mets["auc"] = roc_auc_score(y, p)
+            mets["prauc"] = average_precision_score(y, p)
     except Exception:
         mets["auc"] = float("nan")
-    try:
-        mets["prauc"] = average_precision_score(y, p)
-    except Exception:
         mets["prauc"] = float("nan")
     try:
         mets["brier"] = brier_score_loss(y, p)
     except Exception:
         mets["brier"] = float("nan")
     return mets
+
+
+def _lead_summary(vals: np.ndarray) -> tuple[int, float, float]:
+    finite = np.isfinite(vals)
+    count = int(finite.sum())
+    if count == 0:
+        return 0, float("nan"), float("nan")
+    return count, float(np.nanmin(vals)), float(np.nanmax(vals))
+
+
+def _assert_binary(
+    y: np.ndarray,
+    label: str,
+    *,
+    allow_single: bool,
+    lead_info: tuple[int, float, float] | None = None,
+    panel: str | None = None,
+) -> None:
+    n = int(len(y))
+    if n == 0:
+        raise SystemExit(f"[viability-eval] empty target for {label}.")
+    pos = int(np.sum(y == 1))
+    neg = n - pos
+    if pos == 0 or neg == 0:
+        msg = f"[viability-eval] single-class target for {label}: pos={pos} neg={neg} n={n}"
+        if lead_info is not None:
+            non_null, lead_min, lead_max = lead_info
+            msg += f" | lead_non_null={non_null} lead_min={lead_min} lead_max={lead_max}"
+        if panel:
+            msg += f" | panel={panel}"
+        if allow_single:
+            print(f"[warn] {msg}", file=sys.stderr)
+        else:
+            raise SystemExit(msg)
 
 
 def parse_args():
@@ -175,6 +236,16 @@ def parse_args():
         default=None,
         help="Output CSV for metrics (defaults to run-stamped path when run-name is set).",
     )
+    ap.add_argument(
+        "--skip-if-exists",
+        action="store_true",
+        help="Skip work if output already exists.",
+    )
+    ap.add_argument(
+        "--allow-single-class",
+        action="store_true",
+        help="Allow single-class targets (will emit warnings instead of failing).",
+    )
     return ap.parse_args()
 
 
@@ -208,6 +279,9 @@ def main():
         out_path = f"results/metrics/{args.run_name}_viability_leads.csv"
     if not out_path:
         out_path = "results/metrics/viability_leads.csv"
+    if args.skip_if_exists and Path(out_path).exists():
+        print(f"[skip] output already exists: {out_path}")
+        return
 
     need_cols = set(features) | {target, lead_col}
     df = _load_panel(args.panel, need_cols)
@@ -218,7 +292,13 @@ def main():
 
     # Convert lead/target to numeric
     lead_vals = pd.to_numeric(df[lead_col], errors="coerce").to_numpy(dtype=float)
-    y_coincident = pd.to_numeric(df[target], errors="coerce").fillna(0).astype(int).to_numpy()
+    y_coincident = _coerce_binary_series(df[target], target, "viability-eval")
+    lead_info = _lead_summary(lead_vals)
+    if lead_info[0] == 0:
+        raise SystemExit(
+            f"[viability-eval] lead column '{lead_col}' has no finite values after coercion "
+            f"(panel={args.panel})."
+        )
 
     X = _build_matrix(df, features)
     probs = model.predict_proba(X)[:, 1]
@@ -226,6 +306,13 @@ def main():
     rows = []
 
     # Coincident metrics (info only, lead_h=0 marker)
+    _assert_binary(
+        y_coincident,
+        f"coincident target '{target}'",
+        allow_single=args.allow_single_class,
+        lead_info=lead_info,
+        panel=args.panel,
+    )
     coinc = _safe_metrics(y_coincident, probs)
     rows.append(
         {
@@ -248,6 +335,13 @@ def main():
     for h in lead_hours:
         mask = _lead_mask(lead_vals, lead_h=float(h), lead_lower=float(args.lead_lower))
         y_lead = mask.astype(int)
+        _assert_binary(
+            y_lead,
+            f"lead_h={float(h)}h (lead_col={lead_col})",
+            allow_single=args.allow_single_class,
+            lead_info=lead_info,
+            panel=args.panel,
+        )
         mets = _safe_metrics(y_lead, probs)
         rows.append(
             {
@@ -267,8 +361,7 @@ def main():
         )
 
     out_df = pd.DataFrame(rows)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_csv(out_path, index=False)
+    io_common.write_any(out_path, out_df)
 
     print(
         f"[viability-eval] rows={len(df):,} coincident_pos={y_coincident.sum():,} "

@@ -17,7 +17,7 @@ def _norm_lon(x, mode):
 def _parse_area(aoi):
     if not aoi:
         return None
-    latN, lonW, latS, lonE = [float(t) for t in aoi.split(",")]
+    latN, lonW, latS, lonE = [float(t.strip()) for t in aoi.split(",")]
     return latN, lonW, latS, lonE
 
 def _load_cartopy():
@@ -73,6 +73,7 @@ def main():
     ap.add_argument("--storm-id-col", default=None, help="ID column in tracks (e.g., storm_id or name).")
     ap.add_argument("--title", default=None, help="Figure title")
     ap.add_argument("--dpi", type=int, default=180)
+    ap.add_argument("--max-points-per-hour", type=int, default=2000, help="Cap points per hour for scatter maps.")
     args = ap.parse_args()
 
     # Load data
@@ -93,9 +94,20 @@ def main():
     if args.min_prob is not None and args.value_col and args.value_col in df.columns:
         df = df.loc[pd.to_numeric(df[args.value_col], errors="coerce") >= float(args.min_prob)]
     if args.top_quantile is not None and args.value_col and args.value_col in df.columns:
+        df = df.sample(frac=1.0, random_state=42)
         vals = pd.to_numeric(df[args.value_col], errors="coerce")
-        cutoff = vals.quantile(float(args.top_quantile))
-        df = df.loc[vals >= cutoff]
+        if "time" in df.columns:
+            t = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
+            keep_idx = []
+            for _, sub in df.groupby(t, sort=False):
+                svals = pd.to_numeric(sub[args.value_col], errors="coerce")
+                if svals.notna().any():
+                    cutoff = svals.quantile(float(args.top_quantile))
+                    keep_idx.extend(sub.index[svals >= cutoff].tolist())
+            df = df.loc[keep_idx]
+        else:
+            cutoff = vals.quantile(float(args.top_quantile))
+            df = df.loc[vals >= cutoff]
     # Optional filter: restrict to storms window/bbox
     tracks_df = None
     if args.tracks:
@@ -104,6 +116,20 @@ def main():
         except Exception as e:
             print(f"[map] warning: failed to load tracks {args.tracks}: {e}")
     df = df.dropna(subset=["lat","lon"]).reset_index(drop=True)
+    if args.max_points_per_hour:
+        tcol = None
+        if args.time_col and args.time_col in df.columns:
+            tcol = args.time_col
+        elif "time" in df.columns:
+            tcol = "time"
+        if tcol:
+            tvals = pd.to_datetime(df[tcol], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
+            keep_idx = []
+            for _, sub in df.groupby(tvals, sort=False):
+                if len(sub) > args.max_points_per_hour:
+                    sub = sub.sample(args.max_points_per_hour, random_state=42)
+                keep_idx.extend(sub.index.tolist())
+            df = df.loc[keep_idx].reset_index(drop=True)
     if len(df) > 20000:
         df = df.sample(20000, random_state=42)
 

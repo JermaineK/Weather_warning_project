@@ -228,6 +228,16 @@ If you are an LLM-based agent (like a code assistant), you should:
 
 If in doubt: **prefer correctness over cleverness**. It's better to be slightly slow and right than blazing fast and wrong.
 
+## 8. Pipeline integrity rules (ordering, contracts, fail-fast)
+
+- Treat each pipeline mode as contract-bound: declare inputs (paths + required columns), outputs (paths + expected columns), and dependencies; make parameter-sensitive (e.g., export_uv toggles u10/v10 expectations).
+- Enforce dependency order: if a downstream step is enabled without its prerequisites, fail with a message naming the missing step(s) instead of running out-of-order.
+- Preflight before execution: check glob/file existence and required columns using schema-only reads (pyarrow for parquet, CSV headers only); no alias relaxation unless the contract explicitly permits it.
+- Postflight after success: assert outputs exist, have rows (>0 via metadata/light reads), and contain expected columns; skip-if-exists still validates the existing file before trusting it.
+- Missing required vars/columns must raise a clear SystemExit pointing to the upstream step that should have produced them; do not downgrade requirements to optional unless the YAML explicitly marks them optional.
+- Hunt and remove silent drops: no `errors="ignore"` schema masking, no catch-and-continue that hides missing inputs, no permissive merges when exact alignment is required.
+- Provide a plan printout/topological order before running, and keep `pipeline_doctor.py` usable as a preflight-only “doctor” command so the pipeline can run once end-to-end without manual intervention.
+
 
 ---
 

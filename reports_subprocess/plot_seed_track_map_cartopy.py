@@ -70,8 +70,20 @@ def main():
         if args.min_prob is not None:
             df = df.loc[vals >= float(args.min_prob)]
         if args.top_quantile is not None:
-            cutoff = vals.quantile(float(args.top_quantile))
-            df = df.loc[vals >= cutoff]
+            df = df.sample(frac=1.0, random_state=42)
+            vals = pd.to_numeric(df[args.overlay_prob], errors="coerce")
+            if "time" in df.columns:
+                t = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
+                keep_idx = []
+                for _, sub in df.groupby(t, sort=False):
+                    svals = pd.to_numeric(sub[args.overlay_prob], errors="coerce")
+                    if svals.notna().any():
+                        cutoff = svals.quantile(float(args.top_quantile))
+                        keep_idx.extend(sub.index[svals >= cutoff].tolist())
+                df = df.loc[keep_idx]
+            else:
+                cutoff = vals.quantile(float(args.top_quantile))
+                df = df.loc[vals >= cutoff]
 
     df = df.dropna(subset=[lat_c, lon_c]).reset_index(drop=True)
     if len(df) == 0:

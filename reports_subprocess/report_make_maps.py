@@ -48,6 +48,7 @@ def plot_points(
     min_prob: float | None = None,
     flag_col: str | None = None,
     top_quantile: float | None = None,
+    max_points_per_hour: int | None = None,
 ):
     """
     Simple lat/lon scatter plot.
@@ -82,9 +83,30 @@ def plot_points(
     if min_prob is not None and value_col and value_col in d.columns:
         d = d.loc[pd.to_numeric(d[value_col], errors="coerce") >= float(min_prob)]
     if top_quantile is not None and value_col and value_col in d.columns:
+        # Shuffle once to break sorted-order bias before per-time quantile filtering.
+        d = d.sample(frac=1.0, random_state=42)
         vals = pd.to_numeric(d[value_col], errors="coerce")
-        cutoff = vals.quantile(float(top_quantile))
-        d = d.loc[vals >= cutoff]
+        if "time" in d.columns:
+            t = pd.to_datetime(d["time"], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
+            keep_idx = []
+            for _, sub in d.groupby(t, sort=False):
+                svals = pd.to_numeric(sub[value_col], errors="coerce")
+                if svals.notna().any():
+                    cutoff = svals.quantile(float(top_quantile))
+                    keep_idx.extend(sub.index[svals >= cutoff].tolist())
+            d = d.loc[keep_idx]
+        else:
+            cutoff = vals.quantile(float(top_quantile))
+            d = d.loc[vals >= cutoff]
+
+    if max_points_per_hour and "time" in d.columns:
+        t = pd.to_datetime(d["time"], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
+        keep_idx = []
+        for _, sub in d.groupby(t, sort=False):
+            if len(sub) > max_points_per_hour:
+                sub = sub.sample(max_points_per_hour, random_state=42)
+            keep_idx.extend(sub.index.tolist())
+        d = d.loc[keep_idx]
 
     # Sample to avoid huge PNGs
     if len(d) > 10_000:
@@ -132,12 +154,62 @@ def plot_points(
     print(f"[maps] wrote {out_png}")
 
 
+def plot_heatmap(
+    df: pd.DataFrame,
+    out_png: Path,
+    title: str,
+    value_col: str | None = None,
+    gridsize: int = 80,
+):
+    plt = try_imports()
+    if plt is None:
+        print(f"[maps] matplotlib not available; skipping {out_png.name}")
+        return
+    import numpy as np
+    if df.empty:
+        print(f"[maps] no rows to plot for {out_png.name}; skipping.")
+        return
+    if "lat" not in df.columns or "lon" not in df.columns:
+        print(f"[maps] missing lat/lon in dataframe; skipping {out_png.name}")
+        return
+    d = df.copy()
+    d["lat"] = pd.to_numeric(d["lat"], errors="coerce")
+    d["lon"] = pd.to_numeric(d["lon"], errors="coerce")
+    d = d.dropna(subset=["lat", "lon"])
+    if d.empty:
+        print(f"[maps] no finite lat/lon for {out_png.name}; skipping.")
+        return
+    cvals = None
+    if value_col and value_col in d.columns:
+        cvals = pd.to_numeric(d[value_col], errors="coerce")
+        if not cvals.notna().any():
+            cvals = None
+    fig = plt.figure(figsize=(10, 6))
+    ax = fig.add_subplot(111)
+    if cvals is None:
+        hb = ax.hexbin(d["lon"], d["lat"], gridsize=gridsize, cmap="magma", mincnt=1)
+        cb = fig.colorbar(hb, ax=ax)
+        cb.set_label("count")
+    else:
+        hb = ax.hexbin(d["lon"], d["lat"], C=cvals, gridsize=gridsize, reduce_C_function=np.nanmean, cmap="magma", mincnt=1)
+        cb = fig.colorbar(hb, ax=ax)
+        cb.set_label(value_col)
+    ax.set_title(title)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[maps] wrote {out_png}")
+
+
 def _infer_union_path(run_name: str | None, explicit: str | None) -> Path:
     if explicit:
         return Path(explicit)
     if run_name:
         return Path("results/seedmaps") / f"{run_name}_union_byhour.csv"
-    return Path("results/seedmaps/union_byhour.csv")
+    raise SystemExit("[maps] provide --run-name or --union-path (no global defaults).")
 
 
 def _infer_patches_path(run_name: str | None, explicit: str | None) -> Path:
@@ -145,7 +217,7 @@ def _infer_patches_path(run_name: str | None, explicit: str | None) -> Path:
         return Path(explicit)
     if run_name:
         return Path("results/seedmaps") / f"{run_name}_seed_patches.csv"
-    return Path("results/seedmaps/seed_patches.csv")
+    raise SystemExit("[maps] provide --run-name or --patches-path (no global defaults).")
 
 
 def _infer_out_dir(run_name: str | None, explicit: str | None) -> Path:
@@ -196,11 +268,19 @@ def main():
             "else results/figs."
         ),
     )
+    ap.add_argument("--prob-path", default=None, help="Optional probabilistic field (CSV/Parquet) for heatmap.")
+    ap.add_argument("--objects-path", default=None, help="Optional objects_by_hour table for centroid map.")
+    ap.add_argument("--objects-score-col", default=None, help="Optional score column for object filtering.")
+    ap.add_argument("--objects-min-score", type=float, default=None, help="Minimum object score to plot.")
+    ap.add_argument("--objects-top-quantile", type=float, default=None, help="Per-hour score quantile to plot.")
+    ap.add_argument("--max-points-per-hour", type=int, default=2000, help="Cap points per hour for threshold mask.")
+    ap.add_argument("--heatmap-gridsize", type=int, default=80, help="Hexbin grid size for heatmap.")
     ap.add_argument(
         "--union-value-col",
         default="prob_max",
         help="Optional numeric column in union file to colour by (default: prob_max).",
     )
+    ap.add_argument("--prob-value-col", default=None, help="Optional numeric column for probability heatmap.")
     ap.add_argument(
         "--color-by-time-band",
         action="store_true",
@@ -216,20 +296,40 @@ def main():
 
     run_label = f" — {args.run_name}" if args.run_name else ""
 
-    # Union map
+    # Probability heatmap (continuous field)
+    try:
+        prob_path = Path(args.prob_path) if args.prob_path else _infer_union_path(args.run_name, args.union_path)
+        p = _read_any(prob_path)
+        if {"lat", "lon"}.issubset(p.columns):
+            plot_heatmap(
+                p,
+                out_dir / "probability_heatmap.png",
+                f"Probability heatmap{run_label}",
+                value_col=args.prob_value_col or args.union_value_col,
+                gridsize=int(args.heatmap_gridsize),
+            )
+        else:
+            print(f"[maps] probability file missing lat/lon: {prob_path}")
+    except FileNotFoundError:
+        print(f"[maps] probability file not found: {prob_path}")
+    except Exception as e:
+        print(f"[maps] error reading probability file {prob_path}: {e}")
+
+    # Threshold mask (thinned)
     try:
         upath = _infer_union_path(args.run_name, args.union_path)
         u = _read_any(upath)
         if {"lat", "lon"}.issubset(u.columns):
             plot_points(
                 u,
-                out_dir / "union_points.png",
-                f"Seed Union (by hour){run_label}",
+                out_dir / "threshold_mask.png",
+                f"Threshold mask (thinned){run_label}",
                 value_col=args.union_value_col,
                 time_band=args.color_by_time_band,
                 min_prob=args.min_prob,
                 flag_col=args.flag_col,
                 top_quantile=args.top_quantile,
+                max_points_per_hour=args.max_points_per_hour,
             )
         else:
             print(f"[maps] union file missing lat/lon: {upath}")
@@ -238,7 +338,35 @@ def main():
     except Exception as e:
         print(f"[maps] error reading union file {upath}: {e}")
 
-    # Patch centroids
+    # Objects (centroids only)
+    if args.objects_path:
+        try:
+            opath = Path(args.objects_path)
+            o = _read_any(opath)
+            if {"obj_centroid_lat", "obj_centroid_lon"}.issubset(o.columns):
+                o = o.rename(columns={"obj_centroid_lat": "lat", "obj_centroid_lon": "lon"})
+                score_col = args.objects_score_col
+                if score_col not in o.columns:
+                    for cand in ["obj_score_topk_mean", "obj_score_max", "obj_score_mean"]:
+                        if cand in o.columns:
+                            score_col = cand
+                            break
+                plot_points(
+                    o,
+                    out_dir / "objects_centroids.png",
+                    f"Objects (centroids){run_label}",
+                    value_col=score_col,
+                    min_prob=args.objects_min_score,
+                    top_quantile=args.objects_top_quantile,
+                )
+            else:
+                print(f"[maps] objects file missing obj_centroid_lat/lon: {opath}")
+        except FileNotFoundError:
+            print(f"[maps] objects file not found: {args.objects_path}")
+        except Exception as e:
+            print(f"[maps] error reading objects file {args.objects_path}: {e}")
+
+    # Patch centroids (QA)
     try:
         ppath = _infer_patches_path(args.run_name, args.patches_path)
         p = _read_any(ppath)

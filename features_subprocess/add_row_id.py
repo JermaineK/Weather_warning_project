@@ -41,6 +41,11 @@ def parse_args() -> argparse.Namespace:
         help="Parquet batch size for streaming.",
     )
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing outfile.")
+    ap.add_argument(
+        "--skip-if-exists",
+        action="store_true",
+        help="Skip work if outfile already exists.",
+    )
     return ap.parse_args()
 
 
@@ -57,9 +62,13 @@ def main() -> None:
 
     if not src.exists():
         raise SystemExit(f"Input file not found: {src}")
-    if out.exists() and not args.overwrite:
-        print(f"[add-row-id] skip (exists, use --overwrite): {out}")
-        return
+    if out.exists():
+        if args.skip_if_exists:
+            print(f"[add-row-id] skip (exists): {out}")
+            return
+        if not args.overwrite:
+            print(f"[add-row-id] skip (exists, use --overwrite or --skip-if-exists): {out}")
+            return
 
     if pq is None or pa is None:
         raise SystemExit("pyarrow is required for Parquet I/O; install pyarrow.")

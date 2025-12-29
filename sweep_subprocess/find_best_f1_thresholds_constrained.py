@@ -44,6 +44,7 @@ python find_best_f1_thresholds_constrained.py \
 from __future__ import annotations
 
 import argparse
+import sys
 import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -510,6 +511,11 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--out", required=True, help="CSV to save lead->thresholds")
     ap.add_argument(
+        "--skip-if-exists",
+        action="store_true",
+        help="Skip work if output already exists.",
+    )
+    ap.add_argument(
         "--save-table",
         default=None,
         help="Optional CSV with per-threshold metrics (last lead)",
@@ -558,7 +564,30 @@ def parse_args() -> argparse.Namespace:
         default=1000,
         help="Threshold quantile grid size (default 1000).",
     )
-    return ap.parse_args()
+    argv = _preprocess_norm(sys.argv[1:])
+    return ap.parse_args(argv)
+
+
+def _preprocess_norm(argv: List[str]) -> List[str]:
+    """
+    Ensure --normalize-lon always receives a value; default to -180..180 when missing.
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--normalize_lon":
+            tok = "--normalize-lon"
+        if tok == "--normalize-lon":
+            if i + 1 >= len(argv) or str(argv[i + 1]).startswith("--"):
+                out.append("--normalize-lon")
+                out.append("-180..180")
+                print("[warn] --normalize-lon missing value; defaulting to -180..180", file=sys.stderr)
+                i += 1
+                continue
+        out.append(tok)
+        i += 1
+    return out
 
 
 def _parse_leads(raw) -> list[int]:
@@ -574,6 +603,11 @@ def _parse_leads(raw) -> list[int]:
 def main():
     args = parse_args()
     warnings.filterwarnings("ignore", category=FutureWarning)
+
+    out_path = Path(args.out)
+    if args.skip_if_exists and out_path.exists():
+        print(f"[skip] output already exists: {out_path}")
+        return
 
     leads = _parse_leads(args.leads)
 

@@ -166,11 +166,38 @@ def structure_per_hour(df_hour: pd.DataFrame, radius_km: float = 100.0) -> pd.Da
     out["nbr_100km"] = nn
     return out
 
+
+def _structure_counts(latv: np.ndarray, lonv: np.ndarray, radius_km: float) -> np.ndarray:
+    """
+    Return neighbor counts for a single hour without building intermediate DataFrames.
+    This mirrors structure_per_hour but is memory-lean for large hour counts.
+    """
+    n = len(latv)
+    if n == 0:
+        return np.zeros(0, dtype=float)
+    if radius_km <= 0:
+        return np.zeros(n, dtype=float)
+
+    if _HAVE_BALLTREE:
+        coords = np.c_[np.radians(latv), np.radians(lonv)]
+        tree = BallTree(coords, metric="haversine")
+        rad = radius_km / 6371.0
+        nn = tree.query_radius(coords, r=rad, count_only=True) - 1
+        return nn.astype(float)
+
+    nn = np.zeros(n, dtype=float)
+    for i in range(n):
+        d = hav_km(latv[i], lonv[i], latv, lonv)
+        nn[i] = np.sum((d <= radius_km) & (d > 0))
+    return nn
+
 # ------------------ proto-track linker ------------------
 
-def link_tracks(seeds: pd.DataFrame,
-                link_radius_km: float = 75.0,
-                max_gap_hours: int = 1) -> pd.DataFrame:
+def link_tracks_slow(
+    seeds: pd.DataFrame,
+    link_radius_km: float = 75.0,
+    max_gap_hours: int = 1,
+) -> pd.DataFrame:
     """
     Greedy forward-only linker with (gap, distance) tie-breaker.
     Adds: track_id, step_idx, gap_count.
@@ -200,7 +227,7 @@ def link_tracks(seeds: pd.DataFrame,
             while True:
                 best = None
                 # search next hours up to max_gap_hours
-                for gap in range(1, max_gap_hours+2):  # 1..max_gap+1 hours ahead
+                for gap in range(1, max_gap_hours + 2):  # 1..max_gap+1 hours ahead
                     htry = hcur + pd.Timedelta(hours=gap)
                     cand = by_hour.get(htry)
                     if cand is None or cand.empty:
@@ -236,6 +263,127 @@ def link_tracks(seeds: pd.DataFrame,
                 hcur = best["time"]
                 step += 1
     return df
+
+
+def link_tracks_fast(
+    seeds: pd.DataFrame,
+    link_radius_km: float = 75.0,
+    max_gap_hours: int = 1,
+    log_every: int = 500,
+) -> pd.DataFrame:
+    """
+    Faster greedy linker using per-hour BallTree queries to avoid O(n^2) scans.
+    Preserves one-to-one matching and gap allowances up to max_gap_hours+1.
+    """
+    df = seeds.sort_values("time").reset_index(drop=True).copy()
+    df["track_id"] = -1
+    df["step_idx"] = -1
+    df["gap_count"] = 0
+
+    by_hour = df.groupby("time", sort=True).indices
+    hours = sorted(by_hour.keys())
+    next_tid = 1
+    active: Dict[int, Dict[str, object]] = {}
+    allowed_gap = max_gap_hours + 1
+
+    for h_idx, h in enumerate(hours, start=1):
+        idxs = np.asarray(by_hour[h], dtype=np.int64)
+        if idxs.size == 0:
+            continue
+
+        # prune stale tracks
+        stale = []
+        for tid, st in active.items():
+            gap_h = (pd.Timestamp(h) - pd.Timestamp(st["time"])).total_seconds() / 3600.0
+            if gap_h > allowed_gap:
+                stale.append(tid)
+        for tid in stale:
+            active.pop(tid, None)
+
+        cur_lat = df.loc[idxs, "lat"].to_numpy(dtype=float)
+        cur_lon = df.loc[idxs, "lon"].to_numpy(dtype=float)
+        assigned_curr: set[int] = set()
+        matched_tracks: set[int] = set()
+
+        if active and _HAVE_BALLTREE:
+            coords = np.c_[np.radians(cur_lat), np.radians(cur_lon)]
+            tree = BallTree(coords, metric="haversine")
+
+            active_items = list(active.items())
+            active_tids = np.array([tid for tid, _ in active_items], dtype=np.int64)
+            active_lat = np.array([st["lat"] for _, st in active_items], dtype=float)
+            active_lon = np.array([st["lon"] for _, st in active_items], dtype=float)
+            active_step = np.array([st["step_idx"] for _, st in active_items], dtype=np.int64)
+            active_gap = np.array(
+                [
+                    (pd.Timestamp(h) - pd.Timestamp(st["time"])).total_seconds() / 3600.0
+                    for _, st in active_items
+                ],
+                dtype=float,
+            )
+
+            dist, ind = tree.query(np.c_[np.radians(active_lat), np.radians(active_lon)], k=1)
+            d_km = dist[:, 0] * 6371.0
+
+            candidates = []
+            for a_idx, dk in enumerate(d_km):
+                if dk <= link_radius_km:
+                    candidates.append((dk, a_idx, int(ind[a_idx][0])))
+            candidates.sort(key=lambda x: x[0])
+
+            for dk, a_idx, cur_local in candidates:
+                tid = int(active_tids[a_idx])
+                if tid in matched_tracks or cur_local in assigned_curr:
+                    continue
+                cur_global = int(idxs[cur_local])
+                df.at[cur_global, "track_id"] = tid
+                df.at[cur_global, "step_idx"] = int(active_step[a_idx]) + 1
+                gap_h = int(round(active_gap[a_idx]))
+                df.at[cur_global, "gap_count"] = max(gap_h - 1, 0)
+                active[tid] = {
+                    "time": h,
+                    "lat": float(cur_lat[cur_local]),
+                    "lon": float(cur_lon[cur_local]),
+                    "step_idx": int(active_step[a_idx]) + 1,
+                }
+                matched_tracks.add(tid)
+                assigned_curr.add(cur_local)
+        elif active and not _HAVE_BALLTREE:
+            print("[warn] fast linker requires sklearn BallTree; falling back to slow linker.")
+            return link_tracks_slow(seeds, link_radius_km=link_radius_km, max_gap_hours=max_gap_hours)
+
+        # start new tracks for unassigned current seeds
+        for local_idx, cur_global in enumerate(idxs):
+            if local_idx in assigned_curr:
+                continue
+            tid = next_tid
+            next_tid += 1
+            df.at[cur_global, "track_id"] = tid
+            df.at[cur_global, "step_idx"] = 0
+            df.at[cur_global, "gap_count"] = 0
+            active[tid] = {
+                "time": h,
+                "lat": float(cur_lat[local_idx]),
+                "lon": float(cur_lon[local_idx]),
+                "step_idx": 0,
+            }
+
+        if log_every and (h_idx % log_every == 0):
+            print(f"[info] linking pass: {h_idx} hours processed active_tracks={len(active):,}", flush=True)
+
+    return df
+
+
+def link_tracks(seeds: pd.DataFrame,
+                link_radius_km: float = 75.0,
+                max_gap_hours: int = 1) -> pd.DataFrame:
+    """
+    Choose a linker based on data size and availability.
+    """
+    if len(seeds) >= 1_000_000 and _HAVE_BALLTREE:
+        print(f"[info] using fast linker for {len(seeds):,} seed rows (gap<= {max_gap_hours}h).", flush=True)
+        return link_tracks_fast(seeds, link_radius_km=link_radius_km, max_gap_hours=max_gap_hours)
+    return link_tracks_slow(seeds, link_radius_km=link_radius_km, max_gap_hours=max_gap_hours)
 
 # ------------------ IBTrACS loading + KD-tree matching ------------------
 
@@ -442,12 +590,18 @@ def main():
         s = crop_area(s, aoi)
 
     # per-hour simple structure
-    structured = []
-    for idx, (ts, g) in enumerate(s.groupby("time"), start=1):
-        structured.append(structure_per_hour(g, radius_km=args.structure_radius_km))
-        if idx % 500 == 0:
-            print(f"[info] structure pass: {idx} hours processed", flush=True)
-    s = pd.concat(structured, ignore_index=True)
+    if args.structure_radius_km <= 0:
+        s["nbr_100km"] = 0.0
+    else:
+        nbr = np.zeros(len(s), dtype=np.float32)
+        groups = s.groupby("time", sort=True).indices
+        for idx, (ts, idxs) in enumerate(groups.items(), start=1):
+            latv = s.loc[idxs, "lat"].to_numpy()
+            lonv = s.loc[idxs, "lon"].to_numpy()
+            nbr[idxs] = _structure_counts(latv, lonv, args.structure_radius_km)
+            if idx % 500 == 0:
+                print(f"[info] structure pass: {idx} hours processed", flush=True)
+        s["nbr_100km"] = nbr
 
     # ---- optional: join CAPE/CIN/T2M
     if args.features:

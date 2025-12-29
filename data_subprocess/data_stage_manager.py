@@ -58,7 +58,9 @@ SCRIPT_MAP: Dict[str, str] = {
     "storm-timeseries":  "build_storm_timeseries_by_id.py",
     "join-labels-grid":  "join_labels_grid.py",
     "lookup-panel":      "build_lookup_panel.py",
-    "symmetry":          "../features_subprocess/compute_symmetry_features.py",
+    # pass-throughs to feature-stage tools for convenience
+    "add-ids":           "../features_subprocess/add_row_id.py",
+    "state-transitions": "../features_subprocess/compute_state_transitions.py",
 }
 
 ALIASES: Dict[str, str] = {
@@ -108,12 +110,18 @@ ALIASES: Dict[str, str] = {
     "join-labels":       "join-labels-grid",
     "labels":            "join-labels-grid",
     "join_labels_grid":  "join-labels-grid",
+    # add row ids
+    "add_ids":           "add-ids",
+    "addids":            "add-ids",
+    "ids":               "add-ids",
     # lookup panel
     "lookup":            "lookup-panel",
     "lookup_panel":      "lookup-panel",
 
-    # diagnostics
-    "symmetry":          "symmetry",
+    # convenience alias to run state transitions from data_stage manager
+    "state-transitions": "state-transitions",
+    "state_transitions": "state-transitions",
+    "transitions":       "state-transitions",
 }
 
 

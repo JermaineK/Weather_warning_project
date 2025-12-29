@@ -238,8 +238,8 @@ def main():
 
     # level values -> hPa
     levels_hpa = _levels_hpa(ds, lvl_name)
-    low_a, low_b   = [float(x) for x in str(args.low_pair).split(",")]
-    deep_a, deep_b = [float(x) for x in str(args.deep_pair).split(",")]
+    low_a, low_b   = [float(x.strip()) for x in str(args.low_pair).split(",")]
+    deep_a, deep_b = [float(x.strip()) for x in str(args.deep_pair).split(",")]
 
     low_i0, low_i1     = _nearest_levels_indices(levels_hpa, low_a,  low_b)
     deep_i0, deep_i1   = _nearest_levels_indices(levels_hpa, deep_a, deep_b)
@@ -260,7 +260,7 @@ def main():
     # optional area crop
     if args.area:
         try:
-            N, W, S, E = [float(x) for x in str(args.area).split(",")]
+            N, W, S, E = [float(x.strip()) for x in str(args.area).split(",")]
             out = out.loc[(out["lat"] >= S) & (out["lat"] <= N) & (out["lon"] >= W) & (out["lon"] <= E)]
         except Exception:
             pass

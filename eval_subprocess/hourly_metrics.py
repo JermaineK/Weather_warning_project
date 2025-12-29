@@ -170,6 +170,7 @@ def main():
     ap.add_argument("--tag", default=None, help="Short tag to include in output (e.g. 'thr' or 'den').")
     ap.add_argument("--out", required=False, default=None, help="Output CSV path for hourly KPIs.")
     ap.add_argument("--run-name", default=None, help="Optional run name to auto-fill tag/paths (alerts_<run>_*).")
+    ap.add_argument("--skip-if-exists", action="store_true", help="Skip work if output already exists.")
     # Chunk hints (accepted for compatibility; not used)
     ap.add_argument("--chunk-rows", type=int, default=None, help="Accepted for compatibility; not used.")
     ap.add_argument("--chunksize", type=int, default=None, help="Alias for --chunk-rows.")
@@ -206,6 +207,9 @@ def main():
             f"results/metrics/{args.run_name}_hourly_metrics.csv"
             if args.run_name else "results/metrics/hourly_metrics.csv"
         )
+    if args.skip_if_exists and Path(args.out).exists():
+        print(f"[skip] output already exists: {args.out}")
+        return
 
     paths = expand_alert_patterns(args.alerts)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)

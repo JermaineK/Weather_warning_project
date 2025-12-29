@@ -214,9 +214,11 @@ def main():
     elif score_col == "prob" and "prob" in df.columns:
         out["prob"] = pd.to_numeric(df["prob"], errors="coerce")
 
-    # Always keep t_to_storm if present
+    # Always keep t_to_storm and row_id if present
     if "t_to_storm" in df.columns:
         out["t_to_storm"] = pd.to_numeric(df["t_to_storm"], errors="coerce")
+    if "row_id" in df.columns and "row_id" not in out.columns:
+        out["row_id"] = pd.to_numeric(df["row_id"], errors="coerce")
 
     # Extra columns passthrough (if present)
     extra_cols = [c.strip() for c in args.extra_cols.split(",") if c.strip()]

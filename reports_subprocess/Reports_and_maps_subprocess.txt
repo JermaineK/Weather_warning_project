@@ -89,7 +89,9 @@ Inputs:
 
 Outputs:
 
-union_points.png
+probability_heatmap.png
+threshold_mask.png
+objects_centroids.png (if objects provided)
 patch_centroids.png
 
 Lightweight and fast. Good for headless runs or sanity checking.

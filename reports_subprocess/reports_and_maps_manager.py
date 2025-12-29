@@ -34,50 +34,60 @@ python reports_and_maps_manager.py \
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
+import json
 import subprocess
 import sys
-from datetime import datetime, UTC
+from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+HERE = Path(__file__).resolve()
+REPO_ROOT = HERE.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils.run_naming import make_run_dir
+from utils import config_normalize
+from pipeline_contracts import order_steps, preflight_step, postflight_step
+
+HERE = HERE.parent
 
 
-HERE = Path(__file__).resolve().parent
-
-
-# --------------------- run-folder helpers ---------------------
-
-
-def make_run_dir(root: Path, date_str: str | None) -> Path:
+def _rewrite_flag_values(argv: List[str], flags: set[str]) -> List[str]:
     """
-    Create a new run directory under `root` with pattern:
-      YYYYMMDD_runNNN
-
-    Returns the newly created directory.
+    Rewrite `--flag value` to `--flag=value` so values like '-180..180' are
+    not parsed as new options by argparse.
     """
-    if date_str is None:
-        date_str = datetime.now(UTC).strftime("%Y%m%d")
-
-    root.mkdir(parents=True, exist_ok=True)
-
-    prefix = f"{date_str}_run"
-    existing_nums: List[int] = []
-    for child in root.iterdir():
-        if not child.is_dir():
+    out: List[str] = []
+    skip = False
+    for i, tok in enumerate(argv):
+        if skip:
+            skip = False
             continue
-        name = child.name
-        if not name.startswith(prefix):
+        if tok in flags and i + 1 < len(argv):
+            nxt = str(argv[i + 1])
+            if not nxt.startswith("--"):
+                out.append(f"{tok}={nxt.strip()}")
+                skip = True
+                continue
+        if any(tok.startswith(f"{f}=") for f in flags):
+            lhs, rhs = tok.split("=", 1)
+            out.append(f"{lhs}={rhs.strip()}")
             continue
-        suffix = name[len(prefix) :]
-        try:
-            n = int(suffix)
-        except ValueError:
-            continue
-        existing_nums.append(n)
+        out.append(tok)
+    return out
 
-    next_n = max(existing_nums) + 1 if existing_nums else 1
-    run_dir = root / f"{prefix}{next_n:03d}"
-    run_dir.mkdir(parents=False, exist_ok=False)
-    return run_dir
+
+REWRITE_FLAGS = {
+    "--ibtracs-normalize-lon",
+    "--slowtick-normalize-lon",
+    "--normalize-lon",
+    "--ibtracs-area",
+    "--slowtick-area",
+    "--area",
+}
 
 
 def build_cmd(script: Path, args: List[str]) -> List[str]:
@@ -88,6 +98,7 @@ def run_step(tag: str, script: Path, args: List[str]) -> Tuple[bool, int]:
     """
     Run a single subprocess step; return (ok, returncode).
     """
+    args = _rewrite_flag_values(args, REWRITE_FLAGS)
     cmd = build_cmd(script, args)
     print(f"\n[manager] STEP {tag}:")
     print("  $ " + " ".join(str(x) for x in cmd))
@@ -109,6 +120,452 @@ def _parse_leads(spec: str) -> List[int]:
     return leads
 
 
+def _read_yaml_or_json(path: Optional[Path]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    if not path.exists():
+        return {}
+    raw = path.read_text(encoding="utf-8")
+    try:
+        import yaml  # type: ignore
+
+        return yaml.safe_load(raw) or {}
+    except Exception:
+        try:
+            return json.loads(raw) if raw.strip() else {}
+        except Exception:
+            return {}
+
+
+def _count_csv_rows(path: Path) -> int:
+    opener = gzip.open if str(path).lower().endswith(".gz") else open
+    try:
+        row_idx = -1
+        with opener(path, "rt", encoding="utf-8", errors="ignore") as fh:
+            for row_idx, _ in enumerate(fh):
+                pass
+        return max(0, row_idx)
+    except Exception:
+        return 0
+
+
+def _parquet_row_counts(path: Path) -> tuple[int | None, int | None]:
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+    except Exception:
+        return None, None
+    try:
+        pf = pq.ParquetFile(path)
+    except Exception:
+        return None, None
+    meta = pf.metadata
+    meta_rows = int(meta.num_rows) if meta is not None else None
+    counted = None
+    if meta is not None:
+        try:
+            counted = int(sum(meta.row_group(i).num_rows for i in range(meta.num_row_groups)))
+        except Exception:
+            counted = None
+    if not meta_rows:
+        try:
+            counted = sum(len(b) for b in pf.iter_batches(batch_size=200_000, columns=[]))
+        except Exception:
+            counted = counted if counted is not None else 0
+    if counted is None:
+        counted = meta_rows if meta_rows is not None else 0
+    return meta_rows, counted
+
+
+def _row_counts(path: Path) -> tuple[int | None, int | None]:
+    suffixes = "".join(path.suffixes[-2:]).lower()
+    ext = suffixes if suffixes in {".csv.gz", ".parquet"} else path.suffix.lower()
+    if ext == ".parquet":
+        return _parquet_row_counts(path)
+    if ext in {".csv", ".csv.gz"}:
+        return None, _count_csv_rows(path)
+    try:
+        return None, 1 if path.exists() and path.stat().st_size > 0 else 0
+    except Exception:
+        return None, 0
+
+
+def _row_count(path: Path) -> int:
+    _, counted = _row_counts(path)
+    return int(counted or 0)
+
+
+def _sha256_file(path: Path) -> Optional[str]:
+    if not path.exists() or not path.is_file():
+        return None
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _file_signature(path: Path) -> Dict[str, Any]:
+    sig: Dict[str, Any] = {"path": str(path), "exists": bool(path.exists())}
+    if not path.exists():
+        return sig
+    try:
+        sig["size_mb"] = round(path.stat().st_size / 1e6, 2)
+        sig["mtime"] = datetime.utcfromtimestamp(path.stat().st_mtime).isoformat() + "Z"
+    except Exception:
+        pass
+    rows_meta, rows_counted = _row_counts(path)
+    if rows_meta is not None:
+        sig["rows_metadata"] = int(rows_meta)
+    if rows_counted is not None:
+        sig["rows_counted"] = int(rows_counted)
+    sig["sha256"] = _sha256_file(path)
+    return sig
+
+
+def _git_commit(repo_root: Path) -> Optional[str]:
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip() or None
+    except Exception:
+        return None
+    return None
+
+
+def _config_sha256(path: Optional[Path]) -> Optional[str]:
+    if not path or not path.exists():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_provenance(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _provenance_matches(run_dir: Path, config_sha: Optional[str], out_path: Optional[Path]) -> bool:
+    if not config_sha or not out_path:
+        if not config_sha:
+            return False
+        prov = _load_provenance(run_dir / "provenance.json")
+        return prov.get("config_sha256") == config_sha
+    prov = _load_provenance(run_dir / "provenance.json")
+    if prov.get("config_sha256") != config_sha:
+        return False
+    for art in prov.get("artifacts", []):
+        if art.get("path") == str(out_path):
+            return True
+    return False
+
+
+def _collect_files(paths: Iterable[Path]) -> List[Path]:
+    out: List[Path] = []
+    seen = set()
+    for p in paths:
+        if not p:
+            continue
+        try:
+            key = str(p.resolve())
+        except Exception:
+            key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.exists() and p.is_file():
+            out.append(p)
+    return out
+
+
+def _collect_alert_files(alerts_dir: Path, run_name: str) -> List[Path]:
+    if not alerts_dir.exists():
+        return []
+    patterns = [
+        f"alerts_{run_name}_*.csv",
+        f"alerts_{run_name}_*.csv.gz",
+        f"alerts_{run_name}_*.parquet",
+    ]
+    files: List[Path] = []
+    for pat in patterns:
+        files.extend(alerts_dir.glob(pat))
+    return [p for p in files if p.is_file()]
+
+
+def _collect_metrics_files(run_name: str) -> List[Path]:
+    files: List[Path] = []
+    for base in [Path("results/metrics"), Path("results/eval"), Path("results/per_hour")]:
+        if not base.exists():
+            continue
+        files.extend([p for p in base.glob(f"*{run_name}*") if p.is_file()])
+    return files
+
+
+def _write_provenance(
+    run_dir: Path,
+    run_name: str,
+    config_sha: Optional[str],
+    source_inputs: List[Dict[str, Any]],
+    artifacts: List[Path],
+    git_commit: Optional[str],
+) -> Path:
+    rows = []
+    for p in _collect_files(artifacts):
+        rows.append(
+            {
+                **_file_signature(p),
+                "run_id": run_name,
+                "git_commit": git_commit,
+                "config_sha256": config_sha,
+                "source_inputs": source_inputs,
+            }
+        )
+    payload = {
+        "run_id": run_name,
+        "git_commit": git_commit,
+        "config_sha256": config_sha,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "source_inputs": source_inputs,
+        "artifacts": rows,
+    }
+    out_path = run_dir / "provenance.json"
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    return out_path
+
+
+def _flatten_kv(prefix: str, obj: Any) -> List[str]:
+    """
+    Turn nested dicts into CLI flags. Mirrors run_pipeline for parity.
+    """
+    out: List[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if v is None:
+                continue
+            key = f"{prefix}.{k}" if prefix else str(k)
+            out.extend(_flatten_kv(key, v))
+        return out
+    if isinstance(obj, bool):
+        if obj:
+            out.append(f"--{prefix.replace('_','-')}")
+        return out
+    if isinstance(obj, (list, tuple)):
+        if not obj:
+            return out
+        joined = ",".join(map(str, obj))
+        out += [f"--{prefix.replace('_','-')}", joined]
+        return out
+    key_leaf = prefix.split(".")[-1]
+    if isinstance(obj, str):
+        val = obj.strip()
+        if val == "":
+            return out
+        if key_leaf in {"normalize_lon", "normalize-lon", "area"}:
+            flag = f"--{prefix.replace('_','-')}"
+            out.append(f"{flag}={val}")
+            return out
+        out += [f"--{prefix.replace('_','-')}", val]
+        return out
+    out += [f"--{prefix.replace('_','-')}", str(obj)]
+    return out
+
+
+def _write_blocked(path: Path, blocked: List[Dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"blocked": blocked}
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _step_label(section: str, mode: str) -> str:
+    return f"{section}.{mode}"
+
+
+def _preflight_inputs(
+    section: str,
+    steps: List[Dict[str, Any]],
+    enabled_ids: set[str],
+    min_rows: int,
+) -> List[Dict[str, str]]:
+    blocked: List[Dict[str, str]] = []
+    for step in steps:
+        mode = str(step.get("mode", "")).strip() or "unknown"
+        label = _step_label(section, mode)
+        pref = preflight_step(section, step)
+        for issue in pref.input_issues:
+            produced = list(issue.spec.produced_by or ())
+            upstream_enabled = any(p in enabled_ids for p in produced)
+            if upstream_enabled and issue.reason in {"missing_file", "missing_glob", "empty_file", "empty_glob"}:
+                continue
+            if upstream_enabled and issue.reason == "missing_columns":
+                continue
+            blocked.append(
+                {
+                    "step": label,
+                    "reason": issue.reason,
+                    "detail": issue.detail,
+                    "path": str(issue.path) if issue.path else "",
+                    "produced_by": ",".join(produced),
+                }
+            )
+
+        # Row-count guard for required file inputs that are not produced by enabled upstream steps.
+        for spec in pref.contract.inputs:
+            if spec.kind != "file" or not spec.required:
+                continue
+            path, _ = spec.resolve(step)
+            if not path or not path.exists():
+                continue
+            if spec.produced_by and any(p in enabled_ids for p in spec.produced_by):
+                continue
+            rows = _row_count(path)
+            if rows < max(1, int(min_rows)):
+                blocked.append(
+                    {
+                        "step": label,
+                        "reason": "min_rows",
+                        "detail": f"rows={rows} < min_rows={min_rows}",
+                        "path": str(path),
+                        "produced_by": ",".join(spec.produced_by or ()),
+                    }
+                )
+    return blocked
+
+
+def _check_required_file(path: str | Path, label: str, min_rows: int) -> List[Dict[str, str]]:
+    p = Path(path)
+    if not p.exists():
+        return [
+            {
+                "step": label,
+                "reason": "missing_file",
+                "detail": "required input missing",
+                "path": str(p),
+                "produced_by": "",
+            }
+        ]
+    rows = _row_count(p)
+    if rows < max(1, int(min_rows)):
+        return [
+            {
+                "step": label,
+                "reason": "min_rows",
+                "detail": f"rows={rows} < min_rows={min_rows}",
+                "path": str(p),
+                "produced_by": "",
+            }
+        ]
+    return []
+
+
+def _run_eval_from_config(
+    cfg: Dict[str, Any],
+    eval_mgr: Path,
+    run_name: str,
+    min_rows: int,
+    blocked: List[Dict[str, str]],
+    run_dir: Path,
+    config_sha: Optional[str],
+) -> None:
+    sec = cfg.get("eval", {}) if isinstance(cfg.get("eval"), dict) else {}
+    if not sec.get("enabled"):
+        return
+    raw_steps = [s for s in sec.get("steps", []) if isinstance(s, dict)]
+    if not raw_steps:
+        return
+
+    # Normalize + order
+    raw_steps, _ = config_normalize.normalize_config(raw_steps)
+    try:
+        steps = order_steps("eval", raw_steps)
+    except SystemExit as exc:
+        blocked.append(
+            {
+                "step": "eval",
+                "reason": "dependency",
+                "detail": str(exc),
+                "path": "",
+                "produced_by": "",
+            }
+        )
+        steps = raw_steps
+
+    for step in steps:
+        if step.get("enabled") is False:
+            continue
+        mode = str(step.get("mode", "hourly-rollup"))
+        label = _step_label("eval", mode)
+
+        pref = preflight_step("eval", step)
+        if pref.errors:
+            for err in pref.errors:
+                blocked.append(
+                    {
+                        "step": label,
+                        "reason": "preflight",
+                        "detail": err,
+                        "path": "",
+                        "produced_by": "",
+                    }
+                )
+            continue
+
+        # Skip if output already exists and passes validation (only when provenance matches).
+        if _provenance_matches(run_dir, config_sha, None):
+            try:
+                postflight_step("eval", step, pref.expected_output_columns)
+                print(f"[eval] skip (exists, schema ok): {mode}")
+                continue
+            except SystemExit:
+                pass
+
+        # Run eval step
+        args = _flatten_kv(
+            "",
+            {k: v for k, v in step.items() if k not in ("mode", "enabled", "skip_if_exists")},
+        )
+        if run_name and "--run-name" not in args and "--run_name" not in args:
+            args = ["--run-name", run_name, *args]
+        ok, code = run_step(f"eval.{mode}", eval_mgr, [mode, *args])
+        if not ok:
+            blocked.append(
+                {
+                    "step": label,
+                    "reason": "exec_failed",
+                    "detail": f"eval step failed with code {code}",
+                    "path": "",
+                    "produced_by": "",
+                }
+            )
+            continue
+        try:
+            postflight_step("eval", step, pref.expected_output_columns)
+        except SystemExit as exc:
+            blocked.append(
+                {
+                    "step": label,
+                    "reason": "postflight",
+                    "detail": str(exc),
+                    "path": "",
+                    "produced_by": "",
+                }
+            )
+
+
 # --------------------- main orchestration ---------------------
 
 
@@ -119,6 +576,7 @@ def main() -> int:
     if argv and not argv[0].startswith("--"):
         mode_first = argv[0]
         argv = argv[1:]
+    argv = _rewrite_flag_values(argv, REWRITE_FLAGS)
 
     # Convenience dispatch for summary-only calls so pipeline can do:
     #   reports_and_maps_manager.py summary --out-md ...
@@ -158,6 +616,17 @@ def main() -> int:
                 print(f"[manager] copied summary to {out_md}")
             except Exception as e:
                 print(f"[manager] warning: could not copy summary to {out_md}: {e}")
+        return code
+    if mode_first in {"objects-by-hour", "object-matches", "object-maps", "report-pack", "reporting-v2"}:
+        mode_map = {
+            "objects-by-hour": HERE / "objects_by_hour.py",
+            "object-matches": HERE / "match_objects_to_tracks.py",
+            "object-maps": HERE / "plot_object_matches.py",
+            "report-pack": HERE / "report_pack.py",
+            "reporting-v2": HERE / "reporting_v2.py",
+        }
+        script = mode_map[mode_first]
+        ok, code = run_step(mode_first, script, argv)
         return code
 
     ap = argparse.ArgumentParser(
@@ -268,17 +737,48 @@ def main() -> int:
         action="store_true",
         help="Skip final sanity checks step.",
     )
+    ap.add_argument(
+        "--skip-objects",
+        action="store_true",
+        help="Skip object extraction (objects_by_hour).",
+    )
+    ap.add_argument(
+        "--skip-object-matches",
+        action="store_true",
+        help="Skip object-to-track matching.",
+    )
+    ap.add_argument(
+        "--skip-object-maps",
+        action="store_true",
+        help="Skip object-based per-storm maps.",
+    )
+    ap.add_argument(
+        "--skip-report-pack",
+        action="store_true",
+        help="Skip report-pack tables (health/feature stats/associations).",
+    )
+    ap.add_argument(
+        "--skip-reporting-v2",
+        action="store_true",
+        help="Skip reporting_v2 (Markdown/JSON report + storm pages).",
+    )
 
     # Slow-tick diagnostics (optional)
     ap.add_argument(
         "--run-slowtick",
         action="store_true",
-        help="Run slowtick_diagnostics.py on alerts (optional diagnostic stage).",
+        default=True,
+        help="Run slowtick_diagnostics.py on alerts (diagnostic only; default on).",
+    )
+    ap.add_argument(
+        "--skip-slowtick",
+        action="store_true",
+        help="Skip slowtick diagnostics (overrides --run-slowtick).",
     )
     ap.add_argument(
         "--slowtick-alerts-dir",
-        default="results/alerts_throttled",
-        help="Alerts directory for slow-tick diagnostics.",
+        default=None,
+        help="Alerts directory for slow-tick diagnostics (defaults to --alerts-dir).",
     )
     ap.add_argument(
         "--slowtick-run-name",
@@ -355,6 +855,44 @@ def main() -> int:
         action="store_true",
         help="Verbose file/range debug for diagnostics.",
     )
+    # Object-based reporting inputs/outputs
+    ap.add_argument("--objects-in", default=None, help="Alerts/predictions table for object extraction.")
+    ap.add_argument("--objects-out", default="results/objects/objects_by_hour.parquet", help="Object-by-hour output table.")
+    ap.add_argument("--cells-out", default=None, help="Optional per-cell table with object_id.")
+    ap.add_argument("--objects-mask-col", default="alert_final", help="Flag column for object candidates.")
+    ap.add_argument("--objects-score-col", default="prob_viable", help="Score column for object candidates.")
+    ap.add_argument("--objects-threshold", type=float, default=None, help="Score threshold for object candidates.")
+    ap.add_argument("--objects-top-k", type=int, default=20, help="Top-K candidates per storm-hour (after de-dup).")
+    ap.add_argument("--objects-min-sep-km", type=float, default=75.0, help="Minimum separation for candidate de-dup.")
+    ap.add_argument("--objects-adaptive-quantile", type=float, default=0.995, help="Per-hour score quantile for gating.")
+    ap.add_argument("--objects-adaptive-base-threshold", type=float, default=None, help="Base score threshold for gating.")
+    ap.add_argument("--objects-min-area-cells", type=int, default=5, help="Minimum object area (cells) before filtering.")
+    ap.add_argument("--objects-persist-hours-small", type=int, default=3, help="Keep small objects only if they persist this many hours.")
+    ap.add_argument("--objects-persist-link-km", type=float, default=75.0, help="Link radius for persistence tracking (km).")
+    ap.add_argument(
+        "--objects-morphology",
+        choices=["none", "majority"],
+        default="none",
+        help="Optional morphology smoothing on candidate mask.",
+    )
+    ap.add_argument("--objects-morph-k", type=int, default=3, help="Neighbor threshold for majority smoothing.")
+    ap.add_argument("--objects-rejects-out", default=None, help="Optional per-hour rejected objects summary output.")
+    ap.add_argument("--objects-match-top-n", type=int, default=1, help="Top-N matches to highlight per storm-hour.")
+    ap.add_argument("--object-matches-out", default="results/matches/storm_object_matches.parquet", help="Output matches table.")
+    ap.add_argument("--objects-with-motion-out", default=None, help="Optional objects table with motion columns.")
+    ap.add_argument("--tracks-with-motion-out", default=None, help="Optional tracks table with motion columns.")
+    ap.add_argument("--object-maps-dir", default=None, help="Output dir for per-storm object maps.")
+    ap.add_argument("--object-maps-per-hour", action="store_true", help="Emit one map per hour in the window.")
+    ap.add_argument("--object-maps-arrows", action="store_true", help="Overlay motion direction arrows.")
+    ap.add_argument("--object-maps-flow-arrows", action="store_true", help="Overlay flow-direction arrows.")
+    ap.add_argument("--object-hours-before", type=float, default=72.0, help="Hours before genesis for maps.")
+    ap.add_argument("--object-hours-after", type=float, default=24.0, help="Hours after genesis for maps.")
+    ap.add_argument("--report-pack-config", default=None, help="Optional pipeline YAML for run_health checks.")
+    ap.add_argument("--report-pack-out-dir", default=None, help="Output dir for report-pack tables.")
+    ap.add_argument("--pipeline-config", default=None, help="Optional pipeline YAML for preflight/eval steps.")
+    ap.add_argument("--skip-preflight", action="store_true", help="Skip report preflight checks.")
+    ap.add_argument("--preflight-min-rows", type=int, default=1, help="Minimum rows required for report inputs.")
+    ap.add_argument("--skip-eval", action="store_true", help="Skip eval steps from the pipeline config.")
     ap.add_argument(
         "--strict",
         action="store_true",
@@ -374,6 +912,12 @@ def main() -> int:
 
     print(f"[manager] Run folder: {run_dir}")
 
+    def require_file(path: str | Path, label: str) -> Path:
+        p = Path(path)
+        if not p.exists() or (p.is_file() and p.stat().st_size == 0):
+            raise SystemExit(f"[manager] missing required {label}: {p}")
+        return p
+
     def or_default(path_arg: str | None, pattern: str | None, fallback: str | None = None) -> str:
         if path_arg:
             return path_arg
@@ -391,8 +935,204 @@ def main() -> int:
     ibtracs_default = "data/tracks/tracks_subset.csv"
     ibtracs_path = args.ibtracs or (ibtracs_default if Path(ibtracs_default).exists() else None)
 
+    objects_in = args.objects_in
+    if not objects_in:
+        cand = [
+            f"results/alerts/alerts_{args.run_name}_final.parquet",
+            f"results/alerts/alerts_{args.run_name}_final.csv.gz",
+            "results/predictions_base_specialist.parquet",
+        ]
+        for c in cand:
+            if Path(c).exists():
+                objects_in = c
+                break
+        if not objects_in:
+            objects_in = cand[0]
+    object_maps_dir = Path(args.object_maps_dir) if args.object_maps_dir else (maps_dir / "objects")
+    objects_rejects_out = args.objects_rejects_out
+    if objects_rejects_out is None:
+        objects_rejects_out = str(Path(args.objects_out).with_name("objects_rejects_by_hour.parquet"))
+    safe_run = args.run_name.strip().replace(" ", "_")
+    report_pack_out = Path(args.report_pack_out_dir) if args.report_pack_out_dir else (run_dir / f"{safe_run}_tables")
+    report_pack_config = args.report_pack_config
+    if report_pack_config is None:
+        cfg_candidate = Path("config/pipeline.yaml")
+        if cfg_candidate.exists():
+            report_pack_config = str(cfg_candidate)
+
+    pipeline_cfg_path = Path(args.pipeline_config) if args.pipeline_config else None
+    if pipeline_cfg_path is None and report_pack_config:
+        pipeline_cfg_path = Path(report_pack_config)
+    cfg_obj = _read_yaml_or_json(pipeline_cfg_path) if pipeline_cfg_path else {}
+    if cfg_obj:
+        cfg_obj, _ = config_normalize.normalize_config(cfg_obj)
+    config_sha = _config_sha256(pipeline_cfg_path)
+
+    blocked: List[Dict[str, str]] = []
+    if cfg_obj and not args.skip_eval:
+        eval_mgr = REPO_ROOT / "eval_subprocess" / "eval_manager.py"
+        if eval_mgr.exists():
+            _run_eval_from_config(
+                cfg_obj,
+                eval_mgr,
+                args.run_name,
+                args.preflight_min_rows,
+                blocked,
+                run_dir,
+                config_sha,
+            )
+
+    # Agent: preflight report inputs so missing dependencies surface as BLOCKED.
+    if not args.skip_preflight:
+        report_steps: List[Dict[str, Any]] = []
+        if not args.skip_objects:
+            report_steps.append({"mode": "objects-by-hour", "infile": objects_in})
+        if not args.skip_object_matches:
+            report_steps.append({"mode": "object-matches", "objects": args.objects_out, "tracks": ibtracs_path})
+        if not args.skip_object_maps:
+            report_steps.append({"mode": "object-maps", "matches": args.object_matches_out, "tracks": ibtracs_path, "out_dir": str(object_maps_dir)})
+        if not args.skip_report_pack:
+            report_steps.append({"mode": "report-pack", "config": report_pack_config, "objects": args.objects_out, "matches": args.object_matches_out, "out_dir": str(report_pack_out)})
+        if not args.skip_reporting_v2:
+            report_steps.append({"mode": "reporting-v2", "tables_dir": str(report_pack_out), "matches": args.object_matches_out, "tracks": ibtracs_path, "out_dir": str(run_dir)})
+
+        ordered_steps = report_steps
+        try:
+            ordered_steps = order_steps("report", report_steps)
+        except SystemExit as exc:
+            blocked.append(
+                {
+                    "step": "report",
+                    "reason": "dependency",
+                    "detail": str(exc),
+                    "path": "",
+                    "produced_by": "",
+                }
+            )
+        enabled_ids = {f"report.{s.get('mode')}" for s in ordered_steps if s.get("mode")}
+        blocked.extend(_preflight_inputs("report", ordered_steps, enabled_ids, args.preflight_min_rows))
+
+        if not args.skip_quick_maps:
+            blocked.extend(_check_required_file(union_csv, "report.quick-maps (union-csv)", args.preflight_min_rows))
+            blocked.extend(_check_required_file(patches_csv, "report.quick-maps (patches-csv)", args.preflight_min_rows))
+        if not args.skip_cartopy_seed_map:
+            blocked.extend(_check_required_file(union_csv, "report.seed-map (union-csv)", args.preflight_min_rows))
+        if (ibtracs_path is not None) and (not args.skip_ibtracs_maps):
+            blocked.extend(_check_required_file(ibtracs_path, "report.ibtracs (tracks)", args.preflight_min_rows))
+        if not args.skip_sanity:
+            blocked.extend(_check_required_file(seed_summary, "report.summary (seed-summary)", args.preflight_min_rows))
+
+        if blocked:
+            for item in blocked:
+                print(f"[manager] BLOCKED {item.get('step')}: {item.get('reason')} {item.get('detail')} ({item.get('path')})")
+            blocked_path = report_pack_out / "blocked.json"
+            _write_blocked(blocked_path, blocked)
+            if not args.skip_reporting_v2:
+                script = HERE / "reporting_v2.py"
+                step_args = [
+                    "--run-name", args.run_name,
+                    "--out-dir", str(run_dir),
+                    "--tables-dir", str(report_pack_out),
+                    "--objects", args.objects_out,
+                    "--matches", args.object_matches_out,
+                    "--blocked", str(blocked_path),
+                ]
+                if ibtracs_path:
+                    step_args += ["--tracks", ibtracs_path]
+                if report_pack_config:
+                    step_args += ["--config", report_pack_config]
+                run_step("reporting-v2", script, step_args)
+            return 2
+
+    # Agent: object-based reporting to avoid seed-map blobs.
+    # --- STEP 0: object extraction (per-hour components) ---
+    if not args.skip_objects:
+        script = HERE / "objects_by_hour.py"
+        require_file(objects_in, "objects input")
+        step_args = [
+            "--infile", objects_in,
+            "--objects-out", args.objects_out,
+            "--mask-col", args.objects_mask_col,
+            "--score-col", args.objects_score_col,
+            "--connectivity", "8",
+            "--min-neighbors", "1",
+        ]
+        step_args += [
+            "--min-area-cells", str(args.objects_min_area_cells),
+            "--persist-hours-small", str(args.objects_persist_hours_small),
+            "--persist-link-km", str(args.objects_persist_link_km),
+            "--morphology", str(args.objects_morphology),
+            "--morph-k", str(args.objects_morph_k),
+        ]
+        if args.objects_threshold is not None:
+            step_args += ["--threshold", str(args.objects_threshold)]
+        if args.cells_out:
+            step_args += ["--cells-out", args.cells_out]
+        if objects_rejects_out:
+            step_args += ["--rejects-out", objects_rejects_out]
+        ok, code = run_step("objects-by-hour", script, step_args)
+        if not ok and args.strict:
+            return code
+
+    # --- STEP 0b: object-to-track matching ---
+    if not args.skip_object_matches:
+        if ibtracs_path is None:
+            raise SystemExit("[manager] object matching requires --ibtracs.")
+        require_file(args.objects_out, "objects-out")
+        require_file(ibtracs_path, "ibtracs")
+        script = HERE / "match_objects_to_tracks.py"
+        step_args = [
+            "--objects", args.objects_out,
+            "--tracks", ibtracs_path,
+            "--out", args.object_matches_out,
+            "--normalize-lon", args.ibtracs_normalize_lon,
+            "--top-n", str(args.objects_match_top_n),
+            "--top-k", str(args.objects_top_k),
+            "--min-sep-km", str(args.objects_min_sep_km),
+        ]
+        if args.objects_adaptive_quantile is not None:
+            step_args += ["--adaptive-quantile", str(args.objects_adaptive_quantile)]
+        if args.objects_adaptive_base_threshold is not None:
+            step_args += ["--adaptive-base-threshold", str(args.objects_adaptive_base_threshold)]
+        if args.objects_with_motion_out:
+            step_args += ["--objects-out", args.objects_with_motion_out]
+        if args.tracks_with_motion_out:
+            step_args += ["--tracks-out", args.tracks_with_motion_out]
+        ok, code = run_step("object-matches", script, step_args)
+        if not ok and args.strict:
+            return code
+
+    # --- STEP 0c: object-based per-storm maps ---
+    if not args.skip_object_maps:
+        if ibtracs_path is None:
+            raise SystemExit("[manager] object maps require --ibtracs.")
+        require_file(args.object_matches_out, "object matches")
+        require_file(ibtracs_path, "ibtracs")
+        script = HERE / "plot_object_matches.py"
+        step_args = [
+            "--matches", args.object_matches_out,
+            "--tracks", ibtracs_path,
+            "--out-dir", str(object_maps_dir),
+            "--normalize-lon", args.ibtracs_normalize_lon,
+            "--hours-before", str(args.object_hours_before),
+            "--hours-after", str(args.object_hours_after),
+            "--objects", args.objects_out,
+            "--match-top-n", str(args.objects_match_top_n),
+        ]
+        if args.object_maps_per_hour:
+            step_args.append("--per-hour")
+        if args.object_maps_arrows:
+            step_args.append("--show-arrows")
+        if args.object_maps_flow_arrows:
+            step_args.append("--show-flow-arrows")
+        ok, code = run_step("object-maps", script, step_args)
+        if not ok and args.strict:
+            return code
+
     # --- STEP 1: quick QA maps (simple scatter maps) ---
     if not args.skip_quick_maps:
+        require_file(union_csv, "union-csv")
+        require_file(patches_csv, "patches-csv")
         script = HERE / "report_make_maps.py"
         step_args = [
             "--run-name", args.run_name,
@@ -404,12 +1144,18 @@ def main() -> int:
             "--color-by-time-band",
             "--top-quantile", "0.9",
         ]
+        step_args += ["--max-points-per-hour", "2000"]
+        if objects_in:
+            step_args += ["--prob-path", objects_in]
+        if args.objects_out:
+            step_args += ["--objects-path", args.objects_out]
         ok, code = run_step("quick-maps", script, step_args)
         if not ok and args.strict:
             return code
 
     # --- STEP 2: cartopy seed map from union CSV ---
     if not args.skip_cartopy_seed_map:
+        require_file(union_csv, "union-csv")
         script = HERE / "plot_seed_map_cartopy.py"
         out_png = maps_dir / "seeds_union_cartopy.png"
         step_args = [
@@ -418,7 +1164,8 @@ def main() -> int:
             "--value-col", "prob_max",
             "--min-prob", "0.9",
             "--top-quantile", "0.9",
-            "--title", f"Seeds (union by hour) — {args.run_name}",
+            "--max-points-per-hour", "2000",
+            "--title", f"Seeds (union by hour) - {args.run_name}",
         ]
         if ibtracs_path:
             step_args += [
@@ -445,6 +1192,7 @@ def main() -> int:
         if matches_path.exists():
             step_args += ["--matches", str(matches_path)]
         else:
+            require_file(union_csv, "union-csv")
             step_args += ["--seeds", union_csv]
 
         if args.ibtracs_area:
@@ -458,6 +1206,7 @@ def main() -> int:
 
     # --- STEP 4: seed-track match map (cartopy) ---
     if (not args.skip_ibtracs_maps) and Path(matches_csv).exists():
+        require_file(matches_csv, "matches-csv")
         script = HERE / "plot_seed_track_map_cartopy.py"
         out_png = maps_dir / "seed_track_map.png"
         step_args = [
@@ -480,6 +1229,7 @@ def main() -> int:
         "--viability-thresholds", viability_thr,
         "--storm-timeseries", args.storm_timeseries,
     ]
+    require_file(seed_summary, "seed-summary")
     if seed_analysis:
         step_args += ["--seed-analysis", seed_analysis]
     if conversion_csv:
@@ -496,7 +1246,8 @@ def main() -> int:
         return code
 
     # --- Optional: slow-tick diagnostics on alerts ---
-    if args.run_slowtick:
+    run_slowtick = bool(args.run_slowtick) and not args.skip_slowtick
+    if run_slowtick:
         leads = _parse_leads(args.slowtick_leads)
         if not leads:
             print("[manager] slowtick: no valid leads parsed; skipping.")
@@ -505,8 +1256,9 @@ def main() -> int:
             out_dir = Path(args.slowtick_out_subdir)
             if not out_dir.is_absolute():
                 out_dir = run_dir / out_dir
+            slowtick_alerts_dir = args.slowtick_alerts_dir or args.alerts_dir
             step_args = [
-                "--alerts-dir", args.slowtick_alerts_dir,
+                "--alerts-dir", slowtick_alerts_dir,
                 "--run-name", args.slowtick_run_name or args.run_name,
                 "--leads", *map(str, leads),
                 "--flag-col", args.slowtick_flag_col,
@@ -558,6 +1310,103 @@ def main() -> int:
         ok, code = run_step("sanity-checks", script, step_args)
         if not ok and args.strict:
             return code
+
+    # --- STEP 7: report-pack tables ---
+    if not args.skip_report_pack:
+        script = HERE / "report_pack.py"
+        step_args = [
+            "--run-name", args.run_name,
+            "--out-dir", str(report_pack_out),
+            "--objects", args.objects_out,
+            "--matches", args.object_matches_out,
+        ]
+        if report_pack_config:
+            step_args += ["--config", report_pack_config]
+        if ibtracs_path:
+            step_args += ["--tracks", ibtracs_path]
+        ok, code = run_step("report-pack", script, step_args)
+        if not ok and args.strict:
+            return code
+
+    # --- STEP 8: reporting_v2 summary (MD/JSON + storm pages) ---
+    if not args.skip_reporting_v2:
+        script = HERE / "reporting_v2.py"
+        step_args = [
+            "--run-name", args.run_name,
+            "--out-dir", str(run_dir),
+            "--tables-dir", str(report_pack_out),
+            "--objects", args.objects_out,
+            "--matches", args.object_matches_out,
+        ]
+        step_args += [
+            "--seed-summary", seed_summary,
+            "--alerts-dir", args.alerts_dir,
+            "--storm-timeseries", args.storm_timeseries,
+            "--viability-thresholds", viability_thr,
+            "--seed-union", union_csv,
+            "--write-txt",
+        ]
+        if seed_analysis:
+            step_args += ["--seed-analysis", seed_analysis]
+        if conversion_csv:
+            step_args += ["--conversion-csv", conversion_csv]
+        blocked_path = report_pack_out / "blocked.json"
+        if blocked_path.exists():
+            step_args += ["--blocked", str(blocked_path)]
+        if ibtracs_path:
+            step_args += ["--tracks", ibtracs_path]
+        if ibtracs_path:
+            step_args += ["--ibtracs", ibtracs_path]
+        if report_pack_config:
+            step_args += ["--config", report_pack_config]
+        if args.ibtracs_area:
+            step_args += ["--ibtracs-area", args.ibtracs_area]
+        if args.ibtracs_normalize_lon:
+            step_args += [f"--ibtracs-normalize-lon={args.ibtracs_normalize_lon}"]
+        ok, code = run_step("reporting-v2", script, step_args)
+        if not ok and args.strict:
+            return code
+
+    # --- STEP 9: provenance summary ---
+    git_commit = _git_commit(REPO_ROOT)
+    source_inputs: List[Dict[str, Any]] = []
+    source_input_paths = [
+        Path(union_csv),
+        Path(patches_csv),
+        Path(matches_csv),
+        Path(seed_summary),
+        Path(objects_in) if objects_in else None,
+        Path(args.objects_out) if args.objects_out else None,
+        Path(args.object_matches_out) if args.object_matches_out else None,
+        Path(objects_rejects_out) if objects_rejects_out else None,
+    ]
+    if seed_analysis:
+        source_input_paths.append(Path(seed_analysis))
+    if conversion_csv:
+        source_input_paths.append(Path(conversion_csv))
+    if ibtracs_path:
+        source_input_paths.append(Path(ibtracs_path))
+    source_inputs = [_file_signature(p) for p in _collect_files([p for p in source_input_paths if p])]
+
+    artifacts: List[Path] = []
+    artifacts.extend([p for p in source_input_paths if p is not None])
+    artifacts.extend(_collect_alert_files(Path(args.alerts_dir), args.run_name))
+    artifacts.extend(_collect_metrics_files(args.run_name))
+    artifacts.extend([p for p in report_pack_out.rglob("*") if p.is_file()])
+    artifacts.extend([p for p in (maps_dir).rglob("*") if p.is_file()])
+    if object_maps_dir:
+        artifacts.extend([p for p in object_maps_dir.rglob("*") if p.is_file()])
+    artifacts.extend([p for p in run_dir.rglob("*") if p.is_file()])
+
+    prov_path = _write_provenance(
+        run_dir,
+        args.run_name,
+        config_sha,
+        source_inputs,
+        artifacts,
+        git_commit,
+    )
+    print(f"[manager] provenance -> {prov_path}")
 
     print(f"\n[manager] Completed. Run artifacts in: {run_dir}")
     return 0

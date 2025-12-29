@@ -139,7 +139,12 @@ def _prep_seed_mask(df: pd.DataFrame, prob_col: Optional[str], flag_col: Optiona
     if prob_col and prob_col in df.columns and thr is not None and math.isfinite(thr):
         masks.append(pd.to_numeric(df[prob_col], errors="coerce") >= float(thr))
     if not masks:
-        return base
+        raise SystemExit(
+            "No usable seed mask columns found (prob/flag missing). "
+            f"prob_col={prob_col} flag_col={flag_col} thr={thr}. "
+            "Provide a probability or flag column so seeds can be filtered; "
+            "otherwise the entire panel would be treated as seeds."
+        )
     out = masks[0]
     for m in masks[1:]:
         out = out | m

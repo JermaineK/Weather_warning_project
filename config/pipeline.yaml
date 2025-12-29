@@ -3,24 +3,37 @@ run_name: coral_sea_demo
 workdir: .
 reports_dir: results/reports
 table_format: parquet  # set to parquet or csv.gz; conversion copies are auto-built when switching
-report:
-  enabled: true
-  steps:
-    - mode: manager
-      enabled: true
-      run-name: coral_sea_demo
-      run-root: results/reports
-      ibtracs: data/tracks/tracks_subset.csv
-report_pdf: true
-
+force_keep_quantile: 1.0  # safety override: force keep-quantile style args to keep all rows
 # -------- Global defaults (use anchors so everything is controlled here) --------
 defaults:
   start: &start "2025-02-01"
   end:   &end   "2025-05-01"
   hours: &hours "0..23"
   normalize_lon: &norm "-180..180"
-  area: &area " -5,125,-35,175"   # widened Coral Sea + surroundings
-  time_format:
+  area: &area "-5,125,-35,175"   # widened Coral Sea + surroundings
+
+report:
+  enabled: true
+  steps:
+    - mode: bundle
+      enabled: true
+      run-name: coral_sea_demo
+      run-root: results/reports
+      objects-in: results/alerts/alerts_coral_sea_demo_final.parquet
+      objects-out: results/objects/objects_by_hour.parquet
+      object-matches-out: results/matches/storm_object_matches.parquet
+      union-csv: results/seedmaps/coral_sea_demo_union_byhour.csv
+      patches-csv: results/seedmaps/coral_sea_demo_seed_patches.csv
+      matches-csv: results/seedmaps/coral_sea_demo_seed_track_matches.csv
+      seed-summary: results/seedmaps/coral_sea_demo_seed_summary.txt
+      seed-analysis: results/seedmaps/coral_sea_demo_seed_analysis.txt
+      conversion-csv: results/seedmaps/coral_sea_demo_conversion_rates.csv
+      alerts-dir: results/alerts
+      viability-thresholds: results/sweeps/viability_best_thresholds.csv
+      storm-timeseries: data/storm_timeseries_panel.parquet
+      ibtracs: data/tracks/tracks_subset.csv
+      ibtracs-normalize-lon: *norm
+report_pdf: true
 
 # =====================================================================
 # 0) Fetch — enabled to harvest ERA5 before merging existing files
@@ -66,11 +79,11 @@ fetch:
 # 1) Features (NC → Parquet/CSV)
 # =====================================================================
 features:
-  enabled: true
+  enabled: false
   steps:
     # 1. Base grid from ERA5 single-level
     - mode: build
-      enabled: false
+      enabled: true
       nc_glob: data_era5/extracted/**/era5_single_*_*.nc
       out: data/features_eoi.parquet
       normalize_lon: *norm
@@ -80,59 +93,66 @@ features:
       require_vars: ["u10","v10","msl","t2m"]
       dedup: time_lat_lon
       emit_grid_index: true
+      overwrite: false
+      skip_if_exists: true
 
     # 2. Pressure-level bulk shear (separate table)
     - mode: bulk-shear
-      enabled: false
+      enabled: true
       pl_glob: data_era5/extracted/**/era5_pl_*_uv.nc
       out: data/features_bulk_shear.parquet
       low_pair: 1000,925
       deep_pair: 1000,500
-      overwrite: true
+      overwrite: false
       normalize_lon: *norm
       area: *area
+      skip_if_exists: true
 
     # 3. Merge shear onto base grid
     - mode: join-features
-      enabled: false
+      enabled: true
       left:  data/features_eoi.parquet
       right: data/features_bulk_shear.parquet
       "on": "time, lat, lon"
       out: data/features_merged.parquet
-      overwrite: true
+      overwrite: false
+      skip_if_exists: true
 
     # 4. Patch / rolling stats / shear proxies / S3 / tendencies
     - mode: patch
-      enabled: false
+      enabled: true
       in:  data/features_merged.parquet
       out: data/features_merged_patched.parquet
       neighbor_step: 0.0
       radius_cells: 1
       prefer_shear: shear_deep   # uses deep bulk shear as preferred S source
       s3_window: 3
-      overwrite: true
+      overwrite: false
+      skip_if_exists: true
 
     # 5. GKA + geometric-kernel features on labelled grid
     - mode: gka
-      enabled: false
+      enabled: true
       infile:  data/features_merged_patched.parquet
       outfile: data/grid_FMA_gka.parquet
-      overwrite: true
+      overwrite: false
+      skip_if_exists: true
 
     # 6. Integrate ERA5 thermo (u10/v10/msl/t2m) back in (exact (time,lat,lon) join)
     - mode: integrate-thermo
-      enabled: false
+      enabled: true
       features: data/grid_FMA_gka.parquet
       thermo_glob: data_era5/extracted/**/era5_single_*_*.nc
       out: data/grid_FMA_gka_realthermo.parquet
       nearest: true
       nearest_maxdeg: 0.4
       normalize_lon: *norm
-      overwrite: true
+      overwrite: false
+      skip_if_exists: true
 
     # 7. Spherical-feedback features (SFI / SFI2)
     - mode: spherical-feedback
-      enabled: false
+      enabled: true
       infile:  data/grid_FMA_gka_realthermo.parquet
       out:     data/grid_FMA_gka_realthermo_sph.parquet
       neighbor_step: 0.0
@@ -149,19 +169,21 @@ features:
       w_pdrop:  0.10
       w_thermo: 0.10
       overwrite: false
+      skip_if_exists: true
 
     # 8. Multi-scale GKA (spiral probe on S/S3 etc.)
     - mode: gka-ms
-      enabled: false
+      enabled: true
       infile:  data/grid_FMA_gka_realthermo_sph.parquet
       outfile: data/grid_FMA_gka_realthermo_sph_ms.parquet
       parquet-rows: 250000
-      overwrite: true
+      overwrite: false
+      skip_if_exists: true
       verbose: true
 
     # 9. Attach labels to fully-enriched feature table
     - mode: join-labels-grid
-      enabled: false
+      enabled: true
       features: data/grid_FMA_gka_realthermo_sph_ms.parquet
       labels:   data/tracks/tracks_subset.parquet
       out:      data/grid_labelled_FMA_gka_realthermo_sph_ms.parquet
@@ -175,15 +197,9 @@ features:
       near_time_h: 12.0
       features-chunk-rows: 400000
       chunk-hours: 72
-      overwrite: true
+      overwrite: false
+      skip_if_exists: true
 
-    # 10. Add row_id at the end of feature enrichment
-    - mode: add-ids
-      enabled: false
-      infile:  data/grid_labelled_FMA_gka_realthermo_sph_ms.parquet
-      outfile: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
-      chunk-rows: 200000
-      overwrite: true
 
 # =====================================================================
 # 2) Data stage (staging; GSE panel; viability)
@@ -191,18 +207,31 @@ features:
 data_stage:
   enabled: true
   steps:
-    # 2.0 Optional symmetry/OAM-inspired metrics after full ID table
-    - mode: symmetry
+
+    # 1. Add row_id at the end of feature enrichment
+    - mode: add-ids
       enabled: true
-      panel:   data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
-      out:     data/grid_labelled_FMA_gka_realthermo_sph_ms_id_sym.parquet
-      intensity-col: gka_kappa   # fallback auto-picks gka_kappa > S > wspd > zeta > msl
-      radius-cells: 3
-      n-radii: 3
-      theta-bins: 16
-      null-baseline: false
-      overwrite: true
+      infile:  data/grid_labelled_FMA_gka_realthermo_sph_ms.parquet
+      outfile: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
       chunk-rows: 200000
+      overwrite: false
+      skip_if_exists: true
+
+    # 1.1 State transitions (G/E deltas + pulses)
+    - mode: state-transitions
+      enabled: true
+      infile:  data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+      outfile: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
+      chunk-rows: 200000
+      parquet-rows: 200000
+      G-high-thr: 0.8
+      G-pulse-thr: 0.8
+      E-pulse-thr: 0.8
+      persist-hours: 24
+      pulse-hours: 96
+      lite: false
+      overwrite: true
+      skip_if_exists: false
 
     # 2.1 Build slim lookup panel (all rows) from the ID'd feature file
     - mode: lookup-panel
@@ -221,7 +250,8 @@ data_stage:
         - near_storm
       out: data/grid_slim_start.parquet
       chunk-rows: 200000
-      overwrite: true
+      overwrite: false
+      skip_if_exists: true
 
     # 2.2 Build training subset keyed by row_id, using t_to_storm_min_h
     - mode: subset-by-id
@@ -235,6 +265,7 @@ data_stage:
       max-rows: 20000000
       chunksize: 500000
       seed: 42
+      skip_if_exists: true
 
     # 2.4 GSE-style panel
     - mode: gse-panel
@@ -242,6 +273,7 @@ data_stage:
       subset: data/grid_train_subset_by_id.parquet
       out: data/grid_train_gse_panel.parquet
       chunksize: 200000
+      skip_if_exists: true
 
     # 2.5 Lagged GSE panel
     - mode: gse-lagged
@@ -251,6 +283,7 @@ data_stage:
       lags: "1,2,3,6,12,24"
       radius-deg: 0.0
       round-dp: 3
+      skip_if_exists: true
 
     # 2.6 Slow-tick features
     - mode: slowtick-features
@@ -259,6 +292,7 @@ data_stage:
       out: data/grid_train_gse_panel_slowtick.parquet
       period-hours: 24.0
       use-modulated: true
+      skip_if_exists: true
 
     # 2.6b Discretised G/S/E states (for diagnostics/markov analysis)
     - mode: gse-states
@@ -270,6 +304,7 @@ data_stage:
       e-col: E_energy
       quantiles: "0,0.2,0.4,0.6,0.8,1.0"
       slow-phase-bins: 8
+      skip_if_exists: true
 
     # 2.7 Viability targets / labels
     - mode: viability-targets
@@ -278,10 +313,11 @@ data_stage:
       out: data/grid_train_gse_panel_targets.parquet
       lead-col: t_to_storm_min_h
       horizon-max: 240
-      g-min-quantile: 0.5
+      g-min-quantile: 
       g-min:
       chunksize: 400000
       seed: 42
+      skip_if_exists: true
 
     # 2.8 Train viability model
     - mode: train-viability
@@ -311,6 +347,7 @@ data_stage:
       model-out: models/viability_model.pkl
       metrics-json: models/viability_model_metrics.json
       coefs-csv: models/viability_model_coefs.csv
+      skip_if_exists: true
 
     # 2.9 Storm-centric time series panel (optional)
     - mode: storm-timeseries
@@ -322,13 +359,13 @@ data_stage:
       t-after: 48
       radius-deg: 2.0
       ref-kind: genesis
-
+      skip_if_exists: true
 
 # =====================================================================
-# 3) Alerts logic (viability -> alerts_final)
+# 4) Alerts logic (viability -> alerts_final)
 # =====================================================================
 alerts_logic:
-  enabled: false
+  enabled: true
   steps:
     - mode: viability-pipeline
       run-name: coral_sea_demo
@@ -337,7 +374,7 @@ alerts_logic:
       labelled: data/grid_train_gse_panel_targets.parquet
       model: models/viability_model.pkl
       thr: 0.37
-      keep-quantile: 0.5
+      keep-quantile: 1
       persist-hours: 1
       min-neighbors: 3
       normalize-lon: *norm
@@ -345,15 +382,94 @@ alerts_logic:
       thr-out: results/alerts/alerts_coral_sea_demo_thr.parquet
       out: results/alerts/alerts_coral_sea_demo_final.parquet
       overwrite: true
+      skip_if_exists: false
 
 
 # =====================================================================
-# 4) Seeds / tracks diagnostics
+# 3) Training (base + alert specialist + inference + tracking)
+# =====================================================================
+training:
+  enabled: true
+  steps:
+    - mode: train-base
+      enabled: true
+      train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
+      label: storm
+      train-end: "2025-03-31"
+      val-end: "2025-05-30"
+      include_prefixes:
+        - "gka_"
+        - "sph_"
+        - "SFI"
+        - "S3"
+        - "zeta"
+        - "div"
+        - "msl_"
+        - "dG_"
+        - "dE_"
+        - "G_"
+        - "E_"
+      sample-frac: 1
+      max-rows: 2000000
+      calibrate: true
+      model-out: models/base_model.pkl
+      calibration-out: models/base_calibrator.pkl
+      metrics-out: models/base_metrics.json
+      chunk-rows: 200000
+      parquet-rows: 200000
+      skip_if_exists: false
+
+    - mode: train-alert-specialist
+      enabled: true
+      calibrate: true
+      train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
+      alerts: results/alerts/alerts_coral_sea_demo_final.parquet
+      label: storm
+      G-thr: 0.8
+      SFI-thr: 0.8
+      knee-thr: 0.6
+      sample-frac: 0.5
+      max-rows: 1500000
+      model-out: models/alert_specialist.pkl
+      calibration-out: models/alert_specialist_cal.pkl
+      metrics-out: models/alert_specialist_metrics.json
+      skip_if_exists: false
+
+    - mode: predict-alerts
+      enabled: true
+      features: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
+      base-model: models/base_model.pkl
+      base-calibrator: models/base_calibrator.pkl
+      specialist-model: models/alert_specialist.pkl
+      specialist-calibrator: models/alert_specialist_cal.pkl
+      base-thr: 0.6
+      alert-thr: 0.6
+      blend-weight: 0.6
+      outfile: results/predictions_base_specialist.parquet
+      chunk-rows: 200000
+      parquet-rows: 200000
+      skip_if_exists: false
+
+    - mode: track-objects
+      enabled: true
+      infile: results/predictions_base_specialist.parquet
+      mask-col: P_final
+      threshold: 0.6
+      connectivity: 8
+      objects-out: results/objects/objects.parquet
+      join-out: results/objects/cell_objects.parquet
+      max-gap-hours: 3
+      max-centroid-km: 50
+      skip_if_exists: false
+
+
+# =====================================================================
+# 5) Seeds / tracks diagnostics
 # =====================================================================
 seeds:
   enabled: true
   from_alerts:
-    enabled: false
+    enabled: true
     alerts: results/alerts/alerts_coral_sea_demo_final.parquet
     prob-col: prob_viable
     flag-col: alert_final
@@ -364,7 +480,7 @@ seeds:
     chunk-rows: 400000
     write-parquet: false
   starts:
-    enabled: false
+    enabled: true
     seeds: results/seedmaps/coral_sea_demo_union_byhour.csv
     tracks: data/tracks/tracks_subset.csv
     out-dir: results/seedmaps
@@ -377,7 +493,7 @@ seeds:
     save-parquet: false
     chunk-rows: 400000
   outcomes:
-    enabled: false
+    enabled: true
     seeds: results/seedmaps/coral_sea_demo_union_byhour.csv
     ibtracs: data/tracks/tracks_subset.csv
     run-name: coral_sea_demo
@@ -385,11 +501,11 @@ seeds:
     normalize-lon: *norm
     lookahead-hours: 120
     chunk-rows: 400000
-    structure-radius-km: 150
+    structure-radius-km: 50
     points-format: both
   gse_tracks:
     enabled: true
-    panel: data/grid_train_gse_panel_states.parquet
+    panel: data/grid_train_gse_panel_targets.parquet
     out-dir: results/seedmaps
     run-name: coral_sea_demo
     normalize-lon: *norm
@@ -432,7 +548,7 @@ sweep:
       normalize-lon: *norm
       area: *area
       out: results/sweeps/viability_best_thresholds.csv
-
+      skip_if_exists: false
 
 # =====================================================================
 # 6) Evaluation (model + alerts)
@@ -451,6 +567,7 @@ eval:
       lead-col: t_to_storm_min_h
       target: y_viable
       out: results/metrics/coral_sea_demo_viability_leads.csv
+      skip_if_exists: false
 
     # Alerts coverage / clustering (enable once alerts exist)
     - mode: hourly-metrics
@@ -462,6 +579,7 @@ eval:
       normalize-lon: *norm
       tag: coral_sea_demo
       out: results/metrics/coral_sea_demo_hourly_metrics.csv
+      skip_if_exists: false
 
     # Alerts rollup (enable once alerts exist)
     - mode: hourly-rollup
@@ -471,7 +589,7 @@ eval:
       flag-col: alert_final
       risk-cols: prob_viable
       out: results/metrics/coral_sea_demo_hourly_rollup.parquet
-
+      skip_if_exists: false
 
 # =====================================================================
 # Column dictionary

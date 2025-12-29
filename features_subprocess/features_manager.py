@@ -10,16 +10,17 @@ Modes -> scripts
   patch               -> features_patch.py
   gka                 -> compute_gka_features.py
   gka-ms              -> compute_gka_multiscale.py
+  state-transitions   -> compute_state_transitions.py
   integrate-thermo    -> integrate_era5_thermo.py
   spherical-feedback  -> compute_spherical_feedback.py
   spherical           -> compute_spherical_feedback.py (alias)
+  track-objects       -> track_alert_objects.py
   bulk-shear          -> features_bulk_shear.py
   join-features       -> features_join_features.py
   join-labels-grid    -> join_labels_grid.py
   join                -> join_labels_grid.py (alias)
   add-ids             -> add_row_id.py
   id                  -> add_row_id.py (alias)
-  symmetry            -> compute_symmetry_features.py
 """
 from __future__ import annotations
 import argparse
@@ -39,10 +40,11 @@ ROUTING: Dict[str, str] = {
     "patch":              "features_patch.py",
     "gka":                "compute_gka_features.py",
     "gka-ms":             "compute_gka_multiscale.py",
-    "symmetry":           "compute_symmetry_features.py",
+    "state-transitions":  "compute_state_transitions.py",
     "integrate-thermo":   "integrate_era5_thermo.py",
     "spherical-feedback": "compute_spherical_feedback.py",
     "spherical":          "compute_spherical_feedback.py",  # alias
+    "track-objects":      "track_alert_objects.py",
     "bulk-shear":         "features_bulk_shear.py",
     "join-features":      "features_join_features.py",
     "join-labels-grid":   "join_labels_grid.py",
@@ -62,9 +64,10 @@ FLAG_MAPS: Dict[str, Dict[str, str]] = {
     "patch": {},
     "gka": {},
     "gka-ms": {},
-    "symmetry": {},
+    "state-transitions": {},
     "integrate-thermo": {},
     "spherical-feedback": {},
+    "track-objects": {},
     "bulk-shear": {},
     "join-features": {},
     "join-labels-grid": {

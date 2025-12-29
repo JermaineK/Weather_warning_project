@@ -2,10 +2,12 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import math
 import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from pandas.util import hash_pandas_object
 
 def _strip_choice(val: str) -> str:
     return str(val).strip()
@@ -87,6 +89,70 @@ def _parse_area(aoi: str | None):
         return latN, lonW, latS, lonE
     except Exception:
         raise ValueError("--area must be 'latN,lonW,latS,lonE' (e.g., -10,135,-30,155)")
+
+def _stable_hash_frac(df: pd.DataFrame) -> np.ndarray:
+    """
+    Deterministic hash -> [0,1) for selection without row-order bias.
+    Uses pandas siphash with a fixed key for reproducibility across runs.
+    """
+    if df.empty:
+        return np.array([], dtype=np.float64)
+    hashed = hash_pandas_object(df, index=False, hash_key="keepq", encoding="utf8")
+    vals = hashed.to_numpy(dtype=np.uint64)
+    scale = float(1 << 53)  # keep within exact float mantissa range
+    return (vals % np.uint64(1 << 53)).astype(np.float64) / scale
+
+def _deterministic_keep_mask(elig: pd.DataFrame,
+                             keep_counts: dict,
+                             keep_quantile: float,
+                             protected_idx: pd.Index) -> np.ndarray:
+    """
+    Order-invariant selection: within each hour, keep a fraction of rows
+    based on a stable hash of (time_h, lat, lon[, row_id]).
+    """
+    n = len(elig)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    if keep_quantile is None or keep_quantile >= 1.0:
+        return np.ones(n, dtype=bool)
+
+    key_cols = {
+        "time_h": elig["time_h"].to_numpy(),
+        "lat": elig["lat"].round(6).to_numpy(),
+        "lon": elig["lon"].round(6).to_numpy(),
+    }
+    if "row_id" in elig.columns:
+        key_cols["row_id"] = pd.to_numeric(elig["row_id"], errors="coerce")
+    elig = elig.copy()
+    elig["__keep_hash__"] = _stable_hash_frac(pd.DataFrame(key_cols))
+
+    protected_mask = elig.index.isin(protected_idx)
+    keep_mask = np.zeros(n, dtype=bool)
+
+    for t_val, idx in elig.groupby("time_h", sort=False).indices.items():
+        idx_arr = np.fromiter(idx, dtype=np.int64)
+        sub = elig.loc[idx_arr]
+        sub_protected = protected_mask[idx_arr]
+
+        need = int(max(keep_counts.get(t_val, len(sub)), int(sub_protected.sum())))
+        need = min(need, len(sub))
+        if need >= len(sub):
+            keep_mask[idx_arr] = True
+            continue
+
+        hashes = sub["__keep_hash__"].to_numpy()
+        order = np.argsort(hashes, kind="mergesort")
+
+        chosen = np.zeros(len(sub), dtype=bool)
+        if sub_protected.any():
+            chosen[sub_protected] = True
+        remaining = [i for i in order if not sub_protected[i]]
+        if need > chosen.sum():
+            chosen[remaining[: max(0, need - int(chosen.sum()))]] = True
+
+        keep_mask[idx_arr] = chosen
+
+    return keep_mask
 
 # ---------------- main ----------------
 
@@ -236,29 +302,26 @@ def main():
     if has_score and args.protect_score_threshold is not None:
         protected_idx = elig.index[elig[score_col] >= float(args.protect_score_threshold)]
 
-    # Sort once for stable per-hour selection
+    # Sort once for stable per-hour grouping; selection itself is hash-based
     elig = elig.sort_values(sort_cols, ascending=True, kind="mergesort")
 
-    # Per-hour keep counts
-    grp = elig.groupby("time_h", sort=False)
-    pos = grp.cumcount()
-    n = grp["time_h"].transform("size").astype(int)
+    # Per-hour keep targets
+    keep_counts: dict = {}
+    for t_val, count in elig.groupby("time_h", sort=False)["time_h"].size().items():
+        base = math.ceil(float(args.keep_quantile) * int(count))
+        base = max(base, int(max(0, args.min_keep_per_hour)))
+        if args.only_alerts and float(args.keep_frac_of_alerts) > 0:
+            base = max(base, math.ceil(float(args.keep_frac_of_alerts) * int(count)))
+        keep_counts[t_val] = min(int(base), int(count))
 
-    # Hourly floors
-    keep_q = np.ceil(args.keep_quantile * n.to_numpy()).astype(int)
-    keep_q = np.maximum(keep_q, int(max(0, args.min_keep_per_hour)))  # quantile ∨ floor
-
-    if args.only_alerts and float(args.keep_frac_of_alerts) > 0:
-        # Count positives per hour among elig (which are already positives)
-        alert_counts = n.to_numpy()
-        keep_min_alerts = np.ceil(float(args.keep_frac_of_alerts) * alert_counts).astype(int)
-        keep_q = np.maximum(keep_q, keep_min_alerts)
-
-    # Respect “protected” set first
-    keep_mask = pos.to_numpy() < keep_q
-    kept_idx = elig.index[keep_mask]
-    if len(protected_idx):
-        kept_idx = pd.Index(np.union1d(kept_idx.values, protected_idx.values))
+    # Order-invariant selection via stable hash; always include protected rows
+    keep_mask = _deterministic_keep_mask(
+        elig=elig,
+        keep_counts=keep_counts,
+        keep_quantile=float(args.keep_quantile),
+        protected_idx=protected_idx,
+    )
+    kept_idx = elig.index[keep_mask | elig.index.isin(protected_idx)]
 
     # Write back into the SAME flag col; preserve base
     out = df.copy()
@@ -287,7 +350,7 @@ def main():
         print(f"[THROTTLE] sparse-output: kept {len(out):,}/{before:,} rows", flush=True)
 
     # Clean temp cols and write
-    out.drop(columns=[c for c in ["__tiebreak__","__negscore__","__rand__","time_h"] if c in out],
+    out.drop(columns=[c for c in ["__tiebreak__","__negscore__","__rand__","__keep_hash__","time_h"] if c in out],
              inplace=True, errors="ignore")
     write_any(args.out, out)
     print(f"Wrote {args.out} | throttled: {kept:,}/{total:,}", flush=True)

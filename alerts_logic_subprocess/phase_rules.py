@@ -145,7 +145,7 @@ def main():
     )
     ap.add_argument(
         "--leads",
-        type=lambda s: [int(x) for x in s.split(",")],
+        type=lambda s: [int(x.strip()) for x in s.split(",") if x.strip()],
         default=[24, 48],
     )
     ap.add_argument("--phase-top-frac", type=float, default=0.10)

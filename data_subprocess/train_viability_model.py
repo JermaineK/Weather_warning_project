@@ -12,8 +12,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import List, Sequence
+
+HERE = Path(__file__).resolve()
+REPO_ROOT = HERE.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import joblib
 import numpy as np
@@ -24,6 +30,8 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+from utils import model_versioning
 
 
 # Agent: baseline viable/not-viable fit; keep maths simple and interpretable.
@@ -184,6 +192,18 @@ def main() -> None:
     ap.add_argument("--model-out", required=True, help="Output path for fitted model (.pkl).")
     ap.add_argument("--metrics-json", default=None, help="Where to write metrics JSON.")
     ap.add_argument("--coefs-csv", default=None, help="Where to write coefficient table CSV.")
+    ap.add_argument("--model-dir", default=None, help="Base directory for versioned model outputs.")
+    ap.add_argument("--run-name", default=None, help="Run name for versioned model subdir.")
+    ap.add_argument("--run-id", default=None, help="Explicit version subdir name under model-dir.")
+    ap.add_argument("--write-latest", action="store_true", help="Update model-dir/latest with output copies.")
+    ap.add_argument(
+        "--allow-existing-version",
+        action="store_true",
+        help="Allow writing into an existing versioned model folder.",
+    )
+    ap.add_argument("--provenance-out", default=None, help="Optional provenance JSON output path.")
+    ap.add_argument("--config-sha256", default=None, help="Optional config SHA256 for provenance.")
+    ap.add_argument("--git-commit", default=None, help="Optional git commit hash for provenance.")
     ap.add_argument("--max-train-rows", type=int, default=2_000_000, help="Optional cap on rows for fitting after sampling.")
     ap.add_argument(
         "--chunksize",
@@ -200,6 +220,16 @@ def main() -> None:
     # normalize features: allow comma-separated single arg or space list
     if len(args.features) == 1 and "," in args.features[0]:
         args.features = [f.strip() for f in args.features[0].split(",") if f.strip()]
+
+    # Agent: optional versioned outputs/provenance; training math unchanged.
+    versioned = None
+    if args.model_dir:
+        versioned = model_versioning.resolve_version_dir(
+            Path(args.model_dir),
+            run_name=args.run_name,
+            run_id=args.run_id,
+            allow_existing=args.allow_existing_version,
+        )
 
     if args.chunksize and args.chunksize > 0:
         chunk_rows = int(args.chunksize)
@@ -258,6 +288,16 @@ def main() -> None:
         Path(args.metrics_json).write_text(json.dumps(metrics, indent=2))
         print(f"[save] metrics -> {args.metrics_json}")
 
+    versioned_outputs: List[Path] = []
+    if versioned:
+        version_dir = versioned.version_dir
+        version_model = version_dir / "model.pkl"
+        joblib.dump(model, version_model)
+        versioned_outputs.append(version_model)
+        version_metrics = version_dir / "metrics.json"
+        version_metrics.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        versioned_outputs.append(version_metrics)
+
     if args.coefs_csv:
         coef_df = _coeff_table(model, args.features)
         Path(args.coefs_csv).parent.mkdir(parents=True, exist_ok=True)
@@ -267,6 +307,32 @@ def main() -> None:
         else:
             coef_df.to_csv(coef_path, index=False)
         print(f"[save] coefficients -> {coef_path}")
+
+    if versioned:
+        provenance_path = Path(args.provenance_out) if args.provenance_out else (versioned.version_dir / "provenance.json")
+        git_commit = args.git_commit or model_versioning.git_commit(Path(__file__).resolve().parents[1])
+        outputs = [out_model]
+        if args.metrics_json:
+            outputs.append(Path(args.metrics_json))
+        if args.coefs_csv:
+            outputs.append(Path(args.coefs_csv))
+        outputs.extend(versioned_outputs)
+        model_versioning.write_provenance(
+            provenance_path,
+            run_id=versioned.version_id,
+            run_name=args.run_name,
+            config_sha256=args.config_sha256,
+            git_commit_hash=git_commit,
+            source_inputs=[Path(args.train)],
+            outputs=outputs,
+            extra={"model_kind": "train-viability"},
+        )
+        versioned_outputs.append(provenance_path)
+        if args.write_latest:
+            model_versioning.update_latest(Path(args.model_dir), versioned.version_dir, versioned_outputs)
+        print(f"[save] versioned dir -> {versioned.version_dir}")
+        if args.write_latest:
+            print(f"[save] latest pointer -> {Path(args.model_dir) / 'latest'}")
 
 
 if __name__ == "__main__":

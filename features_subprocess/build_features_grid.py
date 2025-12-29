@@ -30,7 +30,32 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ---------------- CLI ----------------
 
-def parse_args():
+def _fix_normalize_lon_tokens(argv: list[str]) -> list[str]:
+    """
+    Allow --normalize-lon values that start with '-' to be passed without quoting by
+    rewriting '--normalize-lon -180..180' -> '--normalize-lon=-180..180'. Also trims
+    stray whitespace in the value token.
+    """
+    fixed: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("--normalize-lon", "--normalize_lon") and i + 1 < len(argv):
+            val_raw = argv[i + 1]
+            val = val_raw.strip()
+            if val:
+                fixed.append(f"{tok}={val}")
+                i += 2
+                continue
+        fixed.append(tok)
+        i += 1
+    return fixed
+
+
+def parse_args(argv: list[str] | None = None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    argv = _fix_normalize_lon_tokens(argv)
+
     ap = argparse.ArgumentParser(description="Flatten ERA5 NetCDFs to grid features (time, lat, lon, vars).")
     # Inputs
     ap.add_argument("--nc-glob", default=None, help="Glob of NetCDFs (e.g. data/**/*.nc)")
@@ -70,8 +95,9 @@ def parse_args():
     # Domain / thinning
     ap.add_argument(
         "--normalize-lon",
-        choices=["none", "-180..180", "0..360", " -180..180", " 0..360"],
         default="none",
+        nargs="?",
+        const="-180..180",
     )
     ap.add_argument("--area", default=None, help="latN,lonW,latS,lonE  (match lon range to normalize-lon)")
     ap.add_argument("--stride", type=int, default=1)
@@ -154,6 +180,23 @@ def _resolve_require_vars(require_list: list[str] | None, present: set[str]) -> 
         if not found:
             return False
     return True
+
+def _missing_required(require_list: list[str] | None, present: set[str]) -> list[str]:
+    """Return the subset of require_list that are absent (alias-aware)."""
+    if not require_list:
+        return []
+    missing: list[str] = []
+    for r in require_list:
+        if r in present:
+            continue
+        found = False
+        for _, cands in ALIASES.items():
+            if r in cands and any(c in present for c in cands):
+                found = True
+                break
+        if not found:
+            missing.append(r)
+    return missing
 
 # ---------------- coord normalization ----------------
 
@@ -399,20 +442,23 @@ def main():
 
         present_vars = set(ds.data_vars)
 
-        # Required vars check (alias-aware)
-        if not _resolve_require_vars(required_raw, present_vars):
-            print(f"[skip {i}/{len(files)}] {Path(f).name}: missing one or more required variables (alias-aware).")
+        # Required vars check (alias-aware) -> fail fast with diagnosis
+        missing_required = _missing_required(required_raw, present_vars)
+        if missing_required:
+            sample = ""
             if not printed_missing_debug:
                 printed_missing_debug = True
                 try:
                     pv = sorted(list(present_vars))
                     extra = max(0, len(pv) - 40)
-                    print("  └─ present (sample file) ->", pv[:40], (f"… +{extra} more" if extra > 0 else ""))
+                    sample = f" Present variables (sample): {pv[:40]}" + (f" +{extra} more" if extra > 0 else "")
                 except Exception:
-                    pass
-            skipped_require += 1
+                    sample = ""
             ds.close()
-            continue
+            raise SystemExit(
+                f"[err] {Path(f).name}: missing required variables {missing_required}. "
+                f"Upstream ERA5 merge likely dropped them.{sample}"
+            )
 
         # Resolve aliases for core vars
         u_name   = _resolve_alias(args.uvar,   present_vars, "u10")
