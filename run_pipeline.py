@@ -1107,6 +1107,10 @@ def _autofix_config(
             step_for_preflight = _apply_table_format(step_for_preflight, convert_existing=False)
             pref = preflight_step(section, step_for_preflight)
             stale_reason = _autofix_stale_reason(section, mode, step_for_preflight, stages_manifest)
+            if stale_reason is None and step_for_preflight.get("skip_if_exists"):
+                health_ok, _ = _outputs_health(step_for_preflight, pref.expected_output_columns or [])
+                if health_ok is False:
+                    stale_reason = "output_health_failed"
             if stale_reason:
                 target = _find_step_ref(cfg, section, mode) or step
                 has_overwrite = "overwrite" in target
