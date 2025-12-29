@@ -1047,6 +1047,33 @@ def _find_step_ref(cfg: Dict[str, Any], section: str, mode: str) -> Dict[str, An
     return None
 
 
+def _mark_overwrite(
+    cfg: Dict[str, Any],
+    section: str,
+    mode: str,
+    reason: str,
+    changes: List[str],
+    add_overwrite: bool,
+) -> bool:
+    target = _find_step_ref(cfg, section, mode)
+    if target is None:
+        return False
+    if target.get("enabled") is False:
+        return False
+    has_overwrite = "overwrite" in target
+    if not has_overwrite and not add_overwrite:
+        print(
+            f"[autofix] {section}.{mode}: {reason} but no overwrite key; "
+            "rerun with --autofix-add-overwrite to force overwrite."
+        )
+        return False
+    if target.get("overwrite") is True:
+        return False
+    target["overwrite"] = True
+    changes.append(f"overwrite {section}.{mode}=true ({reason})")
+    return True
+
+
 def _autofix_config(
     cfg: Dict[str, Any],
     sections: List[str],
@@ -1056,6 +1083,8 @@ def _autofix_config(
     changes: List[str] = []
     run_name = cfg.get("run_name") or RUN_NAME
     stages_manifest = _load_stage_manifest_for_autofix(run_name)
+    pre_add_ids_stale = False
+    pre_add_sections = {"fetch", "features"}
 
     for section in sections:
         steps = _section_steps_for_fix(cfg, section)
@@ -1111,18 +1140,19 @@ def _autofix_config(
                 health_ok, _ = _outputs_health(step_for_preflight, pref.expected_output_columns or [])
                 if health_ok is False:
                     stale_reason = "output_health_failed"
+            if (section in pre_add_sections or (section == "data_stage" and mode == "add-ids")) and (pref.errors or pref.input_issues):
+                pre_add_ids_stale = True
             if stale_reason:
-                target = _find_step_ref(cfg, section, mode) or step
-                has_overwrite = "overwrite" in target
-                if has_overwrite or add_overwrite:
-                    if target.get("overwrite") is not True:
-                        target["overwrite"] = True
-                        changes.append(f"overwrite {section}.{mode}=true (stale: {stale_reason})")
-                else:
-                    print(
-                        f"[autofix] stale outputs detected for {section}.{mode} ({stale_reason}); "
-                        "rerun with --autofix-add-overwrite to force overwrite."
-                    )
+                _mark_overwrite(
+                    cfg,
+                    section,
+                    mode,
+                    f"stale: {stale_reason}",
+                    changes,
+                    add_overwrite,
+                )
+                if section in pre_add_sections or (section == "data_stage" and mode == "add-ids"):
+                    pre_add_ids_stale = True
             for issue in pref.input_issues:
                 for prod in issue.spec.produced_by or ():
                     if "." not in prod:
@@ -1139,6 +1169,24 @@ def _autofix_config(
                         if target.get("overwrite") is not True:
                             target["overwrite"] = True
                             changes.append(f"overwrite {prod_section}.{prod_mode}=true")
+
+    if pre_add_ids_stale:
+        _mark_overwrite(
+            cfg,
+            "features",
+            "join-labels-grid",
+            "upstream stale before add-ids",
+            changes,
+            add_overwrite,
+        )
+        _mark_overwrite(
+            cfg,
+            "data_stage",
+            "add-ids",
+            "upstream stale before add-ids",
+            changes,
+            add_overwrite,
+        )
 
     if not changes:
         print("[autofix] no changes applied.")

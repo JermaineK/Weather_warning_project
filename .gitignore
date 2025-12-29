@@ -96,3 +96,9 @@ external_data/**
 *.h5
 *.npz
 *.npy
+
+#########################
+## AUTOFIX OUTPUTS     ##
+#########################
+*.autofix.yaml
+*.autofix.yml
