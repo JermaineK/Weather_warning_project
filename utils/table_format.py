@@ -173,6 +173,23 @@ def ensure_preferred_copy(path: Path, preferred: str | None, convert_existing: b
         return path
 
     if target.exists():
+        if convert_existing and path.exists():
+            try:
+                src_mtime = path.stat().st_mtime
+                dst_mtime = target.stat().st_mtime
+                if src_mtime > dst_mtime:
+                    print(f"[table-format] refreshing {target} from newer {path}")
+                    try:
+                        target.unlink()
+                    except Exception:
+                        pass
+                    if _stream_convert(path, target):
+                        return target
+                    df = io_common.read_any(path)
+                    io_common.write_any(str(target), df)
+                    return target
+            except Exception:
+                pass
         return target
 
     if convert_existing and path.exists():

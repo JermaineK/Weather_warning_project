@@ -37,9 +37,10 @@ import argparse
 import gzip
 import hashlib
 import json
+import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -53,6 +54,24 @@ from utils import config_normalize
 from pipeline_contracts import order_steps, preflight_step, postflight_step
 
 HERE = HERE.parent
+
+
+def _ensure_venv() -> None:
+    venv_bin = "Scripts" if os.name == "nt" else "bin"
+    venv_exe = "python.exe" if os.name == "nt" else "python"
+    venv_py = (REPO_ROOT / ".venv" / venv_bin / venv_exe)
+    if not venv_py.exists():
+        return
+    if os.environ.get("PIPELINE_ALLOW_SYSTEM_PYTHON", "").strip().lower() in {"1", "true", "yes"}:
+        return
+    try:
+        if venv_py.resolve() != Path(sys.executable).resolve():
+            raise SystemExit(
+                "[python] refusing to run reports with system interpreter while .venv exists "
+                "(set PIPELINE_ALLOW_SYSTEM_PYTHON=1 to override)."
+            )
+    except Exception:
+        pass
 
 
 def _rewrite_flag_values(argv: List[str], flags: set[str]) -> List[str]:
@@ -213,7 +232,7 @@ def _file_signature(path: Path) -> Dict[str, Any]:
         return sig
     try:
         sig["size_mb"] = round(path.stat().st_size / 1e6, 2)
-        sig["mtime"] = datetime.utcfromtimestamp(path.stat().st_mtime).isoformat() + "Z"
+        sig["mtime"] = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
     except Exception:
         pass
     rows_meta, rows_counted = _row_counts(path)
@@ -339,7 +358,7 @@ def _write_provenance(
         "run_id": run_name,
         "git_commit": git_commit,
         "config_sha256": config_sha,
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_inputs": source_inputs,
         "artifacts": rows,
     }
@@ -570,6 +589,7 @@ def _run_eval_from_config(
 
 
 def main() -> int:
+    _ensure_venv()
     # Support mode-first calls (e.g., "summary") as used by run_pipeline.
     argv = sys.argv[1:]
     mode_first = None
@@ -731,6 +751,56 @@ def main() -> int:
         "--skip-ibtracs-maps",
         action="store_true",
         help="Skip IBTrACS-related plots (even if --ibtracs is given).",
+    )
+    ap.add_argument(
+        "--union-seeds-per-hour",
+        action="store_true",
+        help="Emit per-hour frames for the union seed map.",
+    )
+    ap.add_argument(
+        "--seeds-ibtracs-per-hour",
+        action="store_true",
+        help="Emit per-hour frames for seeds-with-IBTrACS maps.",
+    )
+    ap.add_argument(
+        "--seed-track-per-hour",
+        action="store_true",
+        help="Emit per-hour frames for seed-track match maps.",
+    )
+    ap.add_argument(
+        "--per-hour-step",
+        type=int,
+        default=2,
+        help="Step between per-hour frames (2 = every 2nd hour).",
+    )
+    ap.add_argument(
+        "--per-hour-max-frames",
+        type=int,
+        default=150,
+        help="Limit per-hour frame count (0 disables).",
+    )
+    ap.add_argument(
+        "--animate",
+        action="store_true",
+        help="Stitch per-hour frames into an animation.",
+    )
+    ap.add_argument(
+        "--animate-format",
+        choices=["gif", "mp4"],
+        default="gif",
+        help="Animation output format.",
+    )
+    ap.add_argument(
+        "--animate-fps",
+        type=float,
+        default=6.0,
+        help="Frames per second for animations.",
+    )
+    ap.add_argument(
+        "--animate-loop",
+        type=int,
+        default=0,
+        help="GIF loop count (0 = infinite).",
     )
     ap.add_argument(
         "--skip-sanity",
@@ -909,6 +979,7 @@ def main() -> int:
     run_dir = make_run_dir(run_root, args.run_date)
     maps_dir = run_dir / "maps"
     maps_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir = maps_dir / "frames"
 
     print(f"[manager] Run folder: {run_dir}")
 
@@ -924,6 +995,20 @@ def main() -> int:
         if pattern and args.run_name:
             return pattern.format(run=args.run_name)
         return fallback or ""
+
+    def run_animation(tag: str, frame_glob: str, out_path: Path) -> Tuple[bool, int]:
+        # Agent: centralize animation stitching for per-hour maps.
+        script = HERE / "animate_frames.py"
+        step_args = [
+            "--frames", frame_glob,
+            "--out", str(out_path),
+            "--fps", str(args.animate_fps),
+        ]
+        if out_path.suffix.lower() == ".gif":
+            step_args += ["--loop", str(args.animate_loop)]
+        if args.per_hour_max_frames and args.per_hour_max_frames > 0:
+            step_args += ["--max-frames", str(args.per_hour_max_frames)]
+        return run_step(tag, script, step_args)
 
     union_csv = or_default(args.union_csv, "results/seedmaps/{run}_union_byhour.csv")
     patches_csv = or_default(args.patches_csv, "results/seedmaps/{run}_seed_patches.csv")
@@ -1178,6 +1263,31 @@ def main() -> int:
         ok, code = run_step("seed-map-cartopy", script, step_args)
         if not ok and args.strict:
             return code
+        if args.union_seeds_per_hour:
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            out_png = frames_dir / "seeds_union_hourly.png"
+            step_args = [
+                "--seeds", union_csv,
+                "--out-png", str(out_png),
+                "--value-col", "prob_max",
+                "--min-prob", "0.9",
+                "--top-quantile", "0.9",
+                "--max-points-per-hour", "2000",
+                "--title", f"Seeds (union by hour) - {args.run_name}",
+                "--per-hour",
+                "--time-col", "time",
+                "--hour-step", str(args.per_hour_step),
+                "--max-frames", str(args.per_hour_max_frames),
+            ]
+            ok, code = run_step("seed-map-cartopy-hourly", script, step_args)
+            if not ok and args.strict:
+                return code
+            if ok and args.animate:
+                anim_out = maps_dir / f"seeds_union_hourly.{args.animate_format}"
+                frame_glob = str(frames_dir / "seeds_union_hourly_*.png")
+                ok, code = run_animation("seed-map-cartopy-anim", frame_glob, anim_out)
+                if not ok and args.strict:
+                    return code
 
     # --- STEP 3: IBTrACS + seeds overlay ---
     if (ibtracs_path is not None) and (not args.skip_ibtracs_maps):
@@ -1186,6 +1296,8 @@ def main() -> int:
         step_args = [
             "--ibtracs", ibtracs_path,
             "--out-png", str(out_png),
+            "--max-points-per-hour", "2000",
+            "--max-points-total", "20000",
         ]
         # prefer matches if present; otherwise union seeds
         matches_path = Path(matches_csv)
@@ -1204,6 +1316,58 @@ def main() -> int:
         if not ok and args.strict:
             return code
 
+        # time-colored variant for temporal progression
+        out_png = maps_dir / "seeds_with_ibtracs_time.png"
+        step_args = [
+            "--ibtracs", ibtracs_path,
+            "--out-png", str(out_png),
+            "--max-points-per-hour", "2000",
+            "--max-points-total", "20000",
+            "--color-by-time",
+        ]
+        # prefer matches if present; otherwise union seeds
+        if matches_path.exists():
+            step_args += ["--matches", str(matches_path)]
+        else:
+            step_args += ["--seeds", union_csv]
+        if args.ibtracs_area:
+            step_args += ["--area", args.ibtracs_area]
+        if args.ibtracs_normalize_lon:
+            step_args += ["--normalize-lon", args.ibtracs_normalize_lon]
+        ok, code = run_step("seeds-with-ibtracs-time", script, step_args)
+        if not ok and args.strict:
+            return code
+
+        if args.seeds_ibtracs_per_hour:
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            out_png = frames_dir / "seeds_with_ibtracs_hourly.png"
+            step_args = [
+                "--ibtracs", ibtracs_path,
+                "--out-png", str(out_png),
+                "--max-points-per-hour", "2000",
+                "--max-points-total", "20000",
+                "--per-hour",
+                "--hour-step", str(args.per_hour_step),
+                "--max-frames", str(args.per_hour_max_frames),
+            ]
+            if matches_path.exists():
+                step_args += ["--matches", str(matches_path)]
+            else:
+                step_args += ["--seeds", union_csv]
+            if args.ibtracs_area:
+                step_args += ["--area", args.ibtracs_area]
+            if args.ibtracs_normalize_lon:
+                step_args += ["--normalize-lon", args.ibtracs_normalize_lon]
+            ok, code = run_step("seeds-with-ibtracs-hourly", script, step_args)
+            if not ok and args.strict:
+                return code
+            if ok and args.animate:
+                anim_out = maps_dir / f"seeds_with_ibtracs_hourly.{args.animate_format}"
+                frame_glob = str(frames_dir / "seeds_with_ibtracs_hourly_*.png")
+                ok, code = run_animation("seeds-with-ibtracs-anim", frame_glob, anim_out)
+                if not ok and args.strict:
+                    return code
+
     # --- STEP 4: seed-track match map (cartopy) ---
     if (not args.skip_ibtracs_maps) and Path(matches_csv).exists():
         require_file(matches_csv, "matches-csv")
@@ -1214,8 +1378,62 @@ def main() -> int:
             "--out", str(out_png),
             "--overlay-prob", "prob_max",
             "--min-prob", "0.5",
+            "--max-points-per-hour", "2000",
+            "--max-points-total", "20000",
         ]
         ok, code = run_step("seed-track-map", script, step_args)
+        if not ok and args.strict:
+            return code
+
+        out_png = maps_dir / "seed_track_map_time.png"
+        step_args = [
+            "--matches", matches_csv,
+            "--out", str(out_png),
+            "--overlay-prob", "prob_max",
+            "--min-prob", "0.5",
+            "--max-points-per-hour", "2000",
+            "--max-points-total", "20000",
+            "--color-by-time",
+        ]
+        ok, code = run_step("seed-track-map-time", script, step_args)
+        if not ok and args.strict:
+            return code
+
+        if args.seed_track_per_hour:
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            out_png = frames_dir / "seed_track_map_hourly.png"
+            step_args = [
+                "--matches", matches_csv,
+                "--out", str(out_png),
+                "--overlay-prob", "prob_max",
+                "--min-prob", "0.5",
+                "--max-points-per-hour", "2000",
+                "--max-points-total", "20000",
+                "--per-hour",
+                "--hour-step", str(args.per_hour_step),
+                "--max-frames", str(args.per_hour_max_frames),
+            ]
+            ok, code = run_step("seed-track-map-hourly", script, step_args)
+            if not ok and args.strict:
+                return code
+            if ok and args.animate:
+                anim_out = maps_dir / f"seed_track_map_hourly.{args.animate_format}"
+                frame_glob = str(frames_dir / "seed_track_map_hourly_*.png")
+                ok, code = run_animation("seed-track-map-anim", frame_glob, anim_out)
+                if not ok and args.strict:
+                    return code
+
+    # --- STEP 4b: per-storm hourly counts (heatmap) ---
+    if Path(matches_csv).exists():
+        script = HERE / "storm_hourly_counts.py"
+        out_csv = report_pack_out / "seed_storm_hourly_counts.csv"
+        out_png = maps_dir / "seed_storm_hourly_counts.png"
+        step_args = [
+            "--matches", matches_csv,
+            "--out-csv", str(out_csv),
+            "--out-png", str(out_png),
+        ]
+        ok, code = run_step("storm-hourly-counts", script, step_args)
         if not ok and args.strict:
             return code
 
@@ -1257,9 +1475,10 @@ def main() -> int:
             if not out_dir.is_absolute():
                 out_dir = run_dir / out_dir
             slowtick_alerts_dir = args.slowtick_alerts_dir or args.alerts_dir
+            slowtick_run = args.slowtick_run_name or args.run_name
             step_args = [
                 "--alerts-dir", slowtick_alerts_dir,
-                "--run-name", args.slowtick_run_name or args.run_name,
+                "--run-name", slowtick_run,
                 "--leads", *map(str, leads),
                 "--flag-col", args.slowtick_flag_col,
                 "--out-dir", str(out_dir),
@@ -1269,6 +1488,22 @@ def main() -> int:
                 "--min-hours-per-lead", str(args.slowtick_min_hours_per_lead),
                 "--fft-gap-fill", str(args.slowtick_fft_gap_fill),
             ]
+            fallback_candidates = [
+                f"alerts_{slowtick_run}_final.parquet",
+                f"alerts_{slowtick_run}_thr.parquet",
+                f"alerts_{slowtick_run}_base.parquet",
+                f"alerts_{slowtick_run}_final.csv.gz",
+                f"alerts_{slowtick_run}_thr.csv.gz",
+                f"alerts_{slowtick_run}_base.csv.gz",
+                f"alerts_{slowtick_run}_final.csv",
+                f"alerts_{slowtick_run}_thr.csv",
+                f"alerts_{slowtick_run}_base.csv",
+            ]
+            for name in fallback_candidates:
+                candidate = Path(slowtick_alerts_dir) / name
+                if candidate.exists():
+                    step_args += ["--fallback-alerts", str(candidate)]
+                    break
             if args.slowtick_area:
                 step_args += ["--area", args.slowtick_area]
             if args.slowtick_time_format:

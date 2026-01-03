@@ -18,6 +18,7 @@ Updated:
 from __future__ import annotations
 
 import argparse
+import atexit
 import gzip
 import hashlib
 import json
@@ -25,7 +26,7 @@ import os
 import shutil
 import sys
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Union, Tuple
 from collections import Counter
@@ -76,16 +77,170 @@ GIT_COMMIT: str | None = None
 RUN_NAME: str | None = None
 RUN_MANIFEST_PATH: Path | None = None
 CACHE_CFG: Dict[str, Any] = {}
+LOG_PATH: Path | None = None
+LOG_FH = None
+PIPELINE_CODE_SHA256: str | None = None
+RUN_LOCK_PATH: Path | None = None
 
 # ---------------- shell helpers ----------------
 
 def sh(cmd: List[Union[str, Path]], check: bool = True) -> int:
     cmd = [str(c) for c in cmd]
     print(f"\n$ {' '.join(cmd)}")
-    r = subprocess.run(cmd)
-    if check and r.returncode != 0:
-        raise SystemExit(r.returncode)
-    return r.returncode
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if proc.stdout:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+        sys.stdout.flush()
+    rc = proc.wait()
+    if check and rc != 0:
+        raise SystemExit(rc)
+    return rc
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        for s in self._streams:
+            try:
+                if s.isatty():
+                    return True
+            except Exception:
+                continue
+        return False
+
+
+def _close_log() -> None:
+    global LOG_FH
+    if LOG_FH is None:
+        return
+    try:
+        LOG_FH.flush()
+        LOG_FH.close()
+    except Exception:
+        pass
+    LOG_FH = None
+
+
+def _init_logging(run_name: str | None, log_file: str | None) -> None:
+    global LOG_PATH, LOG_FH
+    if LOG_FH is not None:
+        return
+    if log_file and str(log_file).strip().lower() in {"none", "off", "false"}:
+        return
+    safe_run = _safe_run_name(run_name)
+    if log_file:
+        path = Path(log_file)
+    else:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        path = Path("results/runs") / safe_run / "logs" / f"{safe_run}_{ts}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    LOG_PATH = path
+    LOG_FH = path.open("w", encoding="utf-8")
+    atexit.register(_close_log)
+    sys.stdout = _Tee(sys.stdout, LOG_FH)
+    sys.stderr = _Tee(sys.stderr, LOG_FH)
+    print(f"[log] writing to {path}")
+
+
+def _ensure_loky_cpu_count() -> None:
+    """
+    Silence joblib/loky physical-core warnings by setting a sane default.
+    """
+    if os.environ.get("LOKY_MAX_CPU_COUNT"):
+        return
+    count = os.cpu_count()
+    if not count:
+        return
+    os.environ["LOKY_MAX_CPU_COUNT"] = str(count)
+    print(f"[env] LOKY_MAX_CPU_COUNT={count} (logical cores)")
+
+
+def _pid_alive(pid: int) -> bool | None:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes  # pragma: no cover - platform-specific
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            return False
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return None
+
+
+def _release_run_lock() -> None:
+    global RUN_LOCK_PATH
+    if RUN_LOCK_PATH is None:
+        return
+    try:
+        info = _load_json(RUN_LOCK_PATH)
+        if info.get("pid") not in {None, os.getpid()}:
+            return
+        RUN_LOCK_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _acquire_run_lock(run_name: str | None, force: bool) -> None:
+    if not run_name:
+        return
+    global RUN_LOCK_PATH
+    safe_run = _safe_run_name(run_name)
+    lock_path = Path("results/runs") / safe_run / "locks" / "run_pipeline.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if lock_path.exists():
+        info = _load_json(lock_path)
+        pid = info.get("pid")
+        alive = _pid_alive(pid) if isinstance(pid, int) else None
+        if alive is True and not force:
+            raise SystemExit(
+                f"[lock] run already active for {safe_run} (pid {pid}). "
+                "Use --force-lock to override."
+            )
+        if alive is None and not force:
+            raise SystemExit(
+                f"[lock] existing lock for {safe_run}, unable to verify pid {pid}. "
+                "Use --force-lock to override."
+            )
+        try:
+            lock_path.unlink()
+        except Exception:
+            pass
+    payload = {
+        "pid": os.getpid(),
+        "run_name": run_name,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "exe": sys.executable,
+        "cmdline": " ".join(sys.argv),
+    }
+    _write_json(lock_path, payload)
+    RUN_LOCK_PATH = lock_path
+    atexit.register(_release_run_lock)
 
 
 def _canonical_config_path(cfg_path: Path) -> Path:
@@ -320,14 +475,19 @@ def _load_json(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def _load_stage_manifest_for_autofix(run_name: str | None) -> Dict[str, Any]:
+def _load_stage_manifest_for_autofix(run_name: str | None) -> tuple[Dict[str, Any], Dict[str, Any]]:
     if not run_name:
-        return {}
+        return {}, {}
     safe_run = _safe_run_name(run_name)
     path = Path("results/runs") / safe_run / "manifests" / "stages.json"
     data = _load_json(path)
     stages = data.get("stages", {})
-    return stages if isinstance(stages, dict) else {}
+    meta = {
+        "pipeline_code_sha256": data.get("pipeline_code_sha256"),
+        "config_sha256": data.get("config_sha256"),
+        "git_commit": data.get("git_commit"),
+    }
+    return (stages if isinstance(stages, dict) else {}), meta
 
 
 def _autofix_stale_reason(
@@ -401,6 +561,43 @@ def _sha256_file(path: Path) -> str | None:
     return h.hexdigest()
 
 
+def _pipeline_code_sha256(root: Path) -> str | None:
+    targets: List[Path] = [root / "run_pipeline.py", root / "pipeline_contracts.py"]
+    for folder in [
+        "fetch_subprocess",
+        "features_subprocess",
+        "data_subprocess",
+        "alerts_logic_subprocess",
+        "sweep_subprocess",
+        "eval_subprocess",
+        "seeds_subprocess",
+        "reports_subprocess",
+        "utils",
+    ]:
+        base = root / folder
+        if not base.exists():
+            continue
+        for p in base.rglob("*.py"):
+            if "archive" in p.parts:
+                continue
+            if p.name.endswith(".bak"):
+                continue
+            targets.append(p)
+    uniq = sorted({p.resolve() for p in targets if p.exists()})
+    if not uniq:
+        return None
+    h = hashlib.sha256()
+    for p in uniq:
+        h.update(str(p).encode("utf-8"))
+        try:
+            with p.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+        except Exception:
+            continue
+    return h.hexdigest()
+
+
 def _cache_enabled(section: str, mode: str, step: Dict[str, Any]) -> bool:
     if step.get("cache") is True:
         return True
@@ -455,7 +652,7 @@ def _path_signature(path: Path) -> Dict[str, Any]:
     try:
         stat = path.stat()
         entry["size"] = int(stat.st_size)
-        entry["mtime"] = datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z"
+        entry["mtime"] = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
     except Exception:
         pass
     if path.is_file():
@@ -476,6 +673,7 @@ def _step_fingerprint(section: str, mode: str, step: Dict[str, Any]) -> tuple[st
         "inputs": inputs,
         "config_sha256": CONFIG_SHA256,
         "git_commit": GIT_COMMIT,
+        "pipeline_code_sha256": PIPELINE_CODE_SHA256,
         "table_format": PREFERRED_TABLE_FORMAT,
     }
     blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -648,11 +846,14 @@ def _record_stage_manifest(
         "outputs": outputs_info,
         "cache_path": cache_path,
         "health_ok": health_ok,
-        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     payload["run_name"] = RUN_NAME
     payload["config_sha256"] = CONFIG_SHA256
     payload["git_commit"] = GIT_COMMIT
+    payload["pipeline_code_sha256"] = PIPELINE_CODE_SHA256
+    if LOG_PATH:
+        payload["log_path"] = str(LOG_PATH)
     payload["stages"] = stages
     _write_json(RUN_MANIFEST_PATH, payload)
 
@@ -730,7 +931,7 @@ def _cache_store(
         entry = index.get(fingerprint, {})
         entry["bad"] = True
         entry["bad_reason"] = reason or "health_failed"
-        entry["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        entry["updated_at"] = datetime.now(timezone.utc).isoformat()
         index[fingerprint] = entry
         _save_cache_index(section, mode, index)
         return False, outputs_info, None
@@ -739,7 +940,7 @@ def _cache_store(
     stage_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = stage_dir / fingerprint
     if cache_dir.exists():
-        alt = stage_dir / f"{fingerprint}__{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+        alt = stage_dir / f"{fingerprint}__{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
         cache_dir = alt
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -760,7 +961,7 @@ def _cache_store(
         "inputs": inputs,
         "outputs": output_entries,
         "health_ok": True,
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _write_json(cache_dir / "manifest.json", manifest)
 
@@ -769,7 +970,7 @@ def _cache_store(
         "cache_dir": str(cache_dir),
         "health_ok": True,
         "bad": False,
-        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     _save_cache_index(section, mode, index)
     return True, outputs_info, str(cache_dir)
@@ -1082,7 +1283,18 @@ def _autofix_config(
 ) -> None:
     changes: List[str] = []
     run_name = cfg.get("run_name") or RUN_NAME
-    stages_manifest = _load_stage_manifest_for_autofix(run_name)
+    stages_manifest, stages_meta = _load_stage_manifest_for_autofix(run_name)
+    code_changed = bool(stages_meta.get("pipeline_code_sha256")) and bool(PIPELINE_CODE_SHA256) and (
+        stages_meta.get("pipeline_code_sha256") != PIPELINE_CODE_SHA256
+    )
+    config_changed = bool(stages_meta.get("config_sha256")) and bool(CONFIG_SHA256) and (
+        stages_meta.get("config_sha256") != CONFIG_SHA256
+    )
+    if code_changed or config_changed:
+        print(
+            f"[autofix] upstream change detected: "
+            f"code_changed={code_changed} config_changed={config_changed}"
+        )
     pre_add_ids_stale = False
     pre_add_sections = {"fetch", "features"}
 
@@ -1137,6 +1349,15 @@ def _autofix_config(
             pref = preflight_step(section, step_for_preflight)
             stale_reason = _autofix_stale_reason(section, mode, step_for_preflight, stages_manifest)
             if stale_reason is None and step_for_preflight.get("skip_if_exists"):
+                outputs = _output_paths(step_for_preflight)
+                if outputs and any(p.exists() for p in outputs):
+                    if code_changed and config_changed:
+                        stale_reason = "pipeline_code_or_config_changed"
+                    elif code_changed:
+                        stale_reason = "pipeline_code_changed"
+                    elif config_changed:
+                        stale_reason = "config_changed"
+            if stale_reason is None and step_for_preflight.get("skip_if_exists"):
                 health_ok, _ = _outputs_health(step_for_preflight, pref.expected_output_columns or [])
                 if health_ok is False:
                     stale_reason = "output_health_failed"
@@ -1153,6 +1374,8 @@ def _autofix_config(
                 )
                 if section in pre_add_sections or (section == "data_stage" and mode == "add-ids"):
                     pre_add_ids_stale = True
+            if (code_changed or config_changed) and (section in pre_add_sections or (section == "data_stage" and mode == "add-ids")):
+                pre_add_ids_stale = True
             for issue in pref.input_issues:
                 for prod in issue.spec.produced_by or ():
                     if "." not in prod:
@@ -2281,6 +2504,18 @@ SECTION_ORDER = [
 def main() -> int:
     ap = argparse.ArgumentParser(description="Thin pipeline orchestrator")
     ap.add_argument("--config", required=True, help="YAML config path")
+    ap.add_argument(
+        "--log-file",
+        default=None,
+        help="Optional log file path (default: results/runs/<run_name>/logs/<run_name>_<UTC>.log). Use 'none' to disable.",
+    )
+    ap.add_argument("--no-lock", action="store_true", help="Disable the run lock guard.")
+    ap.add_argument("--force-lock", action="store_true", help="Override an existing run lock.")
+    ap.add_argument(
+        "--allow-system-python",
+        action="store_true",
+        help="Allow running with system Python even if .venv exists.",
+    )
     ap.add_argument("--dry-run", action="store_true", help="Preflight only; do not execute steps.")
     ap.add_argument(
         "--autofix-config",
@@ -2305,6 +2540,24 @@ def main() -> int:
     cfg_path = Path(ns.config).resolve()
     cfg_text = cfg_path.read_text(encoding="utf-8")
     cfg = yaml.safe_load(cfg_text) or {}
+    _init_logging(cfg.get("run_name"), ns.log_file)
+    _ensure_loky_cpu_count()
+    print(f"[python] exe={sys.executable} prefix={sys.prefix} base_prefix={sys.base_prefix}")
+    venv_bin = "Scripts" if os.name == "nt" else "bin"
+    venv_exe = "python.exe" if os.name == "nt" else "python"
+    venv_py = HERE / ".venv" / venv_bin / venv_exe
+    if venv_py.exists():
+        try:
+            if venv_py.resolve() != Path(sys.executable).resolve():
+                msg = f"[python] warning: .venv detected but active interpreter is {sys.executable}"
+                print(msg)
+                if not ns.allow_system_python:
+                    raise SystemExit(
+                        "[python] refusing to run with system interpreter while .venv exists "
+                        "(use --allow-system-python to override)."
+                    )
+        except Exception:
+            pass
     cfg, cfg_changes = config_normalize.normalize_config(cfg)
     if cfg_changes:
         print(f"[config] normalized {len(cfg_changes)} entries:")
@@ -2329,12 +2582,20 @@ def main() -> int:
     global GIT_COMMIT
     GIT_COMMIT = _git_commit(HERE)
 
+    global PIPELINE_CODE_SHA256
+    PIPELINE_CODE_SHA256 = _pipeline_code_sha256(HERE)
+    if PIPELINE_CODE_SHA256:
+        print(f"[pipeline] code sha256={PIPELINE_CODE_SHA256[:12]}...")
+
     global RUN_NAME
     RUN_NAME = cfg.get("run_name")
     if RUN_NAME:
         safe_run = _safe_run_name(RUN_NAME)
         global RUN_MANIFEST_PATH
         RUN_MANIFEST_PATH = Path("results/runs") / safe_run / "manifests" / "stages.json"
+    if not ns.no_lock:
+        # Agent: avoid duplicate runs and OOM by locking per run_name.
+        _acquire_run_lock(RUN_NAME, force=bool(ns.force_lock))
 
     global CACHE_CFG
     cache_cfg = cfg.get("cache", {})
@@ -2384,7 +2645,9 @@ def main() -> int:
     global ENV_HINTS
     ENV_HINTS = env_check.summarize()
     if ENV_HINTS:
-        print(f"[env] available_gb={ENV_HINTS.get('available_gb'):.2f} "
+        avail = ENV_HINTS.get("available_gb")
+        avail_txt = f"{float(avail):.2f}" if isinstance(avail, (int, float)) else "n/a"
+        print(f"[env] available_gb={avail_txt} "
               f"csv_rows={ENV_HINTS.get('csv_rows')} parquet_rows={ENV_HINTS.get('parquet_rows')} "
               f"cpu_count={ENV_HINTS.get('cpu_count')}")
 

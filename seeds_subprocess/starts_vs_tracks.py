@@ -128,8 +128,9 @@ def cluster_starts_one_hour(df_h: pd.DataFrame,
 
     # Build adjacency lists (O(n^2) is fine for dozens/hundreds; if thousands, could grid-hash)
     # To be safer, use a simple bin hash by rounding to nearest step.
-    lat_k = np.round(lat_vals / max(lat_step, tol_lat), 3) if lat_step > 0 else np.round(lat_vals, 3)
-    lon_k = np.round(lon_vals / max(lon_step, tol_lon), 3) if lon_step > 0 else np.round(lon_vals, 3)
+    # Use grid step for bin keys so adjacent grid cells differ by 1.
+    lat_k = np.rint(lat_vals / (lat_step if lat_step > 0 else tol_lat)).astype(int)
+    lon_k = np.rint(lon_vals / (lon_step if lon_step > 0 else tol_lon)).astype(int)
     # map from (key_lat,key_lon) to indices
     from collections import defaultdict
     bins = defaultdict(list)
@@ -305,7 +306,7 @@ def find_seed_starts(df: pd.DataFrame,
         if t.size == 0:
             continue
         t_min, t_max = t.min(), t.max()
-        full = pd.date_range(t_min, t_max, freq="H")
+        full = pd.date_range(t_min, t_max, freq="h")
         # Reindex to full hours, fill flag with 0 where missing
         gg = g.set_index("time_h").sort_index()
         s = gg[flag_col].reindex(full).fillna(0).astype(int).to_numpy()
@@ -352,7 +353,7 @@ def match_patches_to_tracks(patches: pd.DataFrame,
         lat0 = r["lat_cen"]; lon0 = r["lon_cen"]
 
         # search in hours [t0 - time_tol_h, t0 + time_tol_h]
-        hwin = pd.date_range(t0 - td, t0 + td, freq="H")
+        hwin = pd.date_range(t0 - td, t0 + td, freq="h")
         cands = []
         for th in hwin:
             g = by_hour.get(th)

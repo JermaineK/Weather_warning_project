@@ -106,7 +106,7 @@ def main():
 
     # Normalize time -> hour
     df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True).dt.tz_localize(None)
-    df["_hour"] = df["time"].dt.floor("H")
+    df["_hour"] = df["time"].dt.floor("h")
 
     # Pick risk columns
     risk_cols = []

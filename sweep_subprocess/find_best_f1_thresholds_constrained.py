@@ -8,17 +8,17 @@ Fast constrained per-lead threshold search directly from:
   - a trained model bundle (joblib)
 
 It does NOT consume sweep summaries. Instead it:
-  • loads the model bundle (global model and/or per-lead models)
-  • scores probabilities on the labelled grid
-  • builds time-aware labels per lead:
+  - loads the model bundle (global model and/or per-lead models)
+  - scores probabilities on the labelled grid
+  - builds time-aware labels per lead:
       - primary: success_col at t+lead (same grid)
       - fallback: future window of base target in (t, t+lead] per (lat,lon)
-  • sweeps probability thresholds and maximises:
+  - sweeps probability thresholds and maximises:
       - F1  (under constraints on precision / coverage)
-      - Fβ (beta configurable)
+      - Fbeta (beta configurable)
 
 Output:
-  • CSV with one row per lead:
+  - CSV with one row per lead:
       lead_h, thr_f1, F1, P_f1, R_f1, Cov_f1, Alerts_f1,
       thr_Fbeta, Fbeta, P_Fbeta, R_Fbeta, Cov_Fbeta, Alerts_Fbeta,
       status_f1, status_Fbeta, label_mode
@@ -364,7 +364,7 @@ def _fmt(res: dict, tag_label: str, score_key: str) -> None:
     Cov = res.get("Cov", 0.0)
     Alrt = res.get("Alerts", None)
     stat = res.get("status", "unknown")
-    extra = f"  Alerts≈{Alrt:,}" if isinstance(Alrt, (int, np.integer)) else ""
+    extra = f"  Alerts~{Alrt:,}" if isinstance(Alrt, (int, np.integer)) else ""
     print(
         f"Lead +{res.get('lead_h','?')}h -> [{stat}]  Best {tag_label} = {scr:.3f} @ thr={thr:.3f} "
         f"(P={P:.3f}, R={R:.3f})  Cov={Cov:.3f}{extra}"
@@ -382,10 +382,19 @@ def _warn_if_flat(table: pd.DataFrame, y: np.ndarray, lead_h: int, tag: str = ""
     if uniq_thr <= 5:
         print(f"[warn] lead={lead_h}h{tag}: threshold grid collapsed (uniq_thr={uniq_thr}).")
     if uniq_pts <= 3:
-        print(f"[warn] lead={lead_h}h{tag}: PR curve has ≤3 distinct points (uniq_pts={uniq_pts}).")
+        print(f"[warn] lead={lead_h}h{tag}: PR curve has <=3 distinct points (uniq_pts={uniq_pts}).")
 
 
 # --------- main ---------
+
+
+
+def _prob_quantiles(prob: np.ndarray) -> Dict[str, float]:
+    vals = prob[np.isfinite(prob)]
+    if vals.size == 0:
+        return {"prob_q01": float("nan"), "prob_q50": float("nan"), "prob_q99": float("nan")}
+    q01, q50, q99 = np.quantile(vals, [0.01, 0.5, 0.99])
+    return {"prob_q01": float(q01), "prob_q50": float(q50), "prob_q99": float(q99)}
 
 def _strip_choice(val: str) -> str:
     """Normalize choice strings to allow leading/trailing spaces in YAML/CLI."""
@@ -458,7 +467,7 @@ def _load_metrics_features(path: Optional[str]) -> Tuple[list[str], Optional[str
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Fast constrained F1 / Fβ threshold finder (per-lead aware)"
+        description="Fast constrained F1 / Fbeta threshold finder (per-lead aware)"
     )
     ap.add_argument("--labelled", required=True, help="Labelled CSV(.gz) or Parquet")
     ap.add_argument("--model", required=True, help="Trained model bundle (joblib)")
@@ -630,7 +639,7 @@ def main():
         hint = args.chunk_rows or args.chunksize or args.parquet_rows
         print(f"[info] chunking hints received (chunk_rows={hint}); processing full table in-memory for now.")
 
-    print("== Fast Fβ Threshold Finder (constrained, per-lead aware) ==")
+    print("== Fast Fbeta Threshold Finder (constrained, per-lead aware) ==")
     print(f"Labelled : {args.labelled}")
     print(f"Model    : {args.model}")
     print(f"Target   : {args.target}  | Success={args.success_col} (lead-aware)")
@@ -639,7 +648,7 @@ def main():
     print(f"Leads    : {leads}")
     print(
         f"Constraints -> min_precision={args.min_precision}  "
-        f"max_coverage={args.max_coverage}  β={args.fbeta}"
+        f"max_coverage={args.max_coverage}  beta={args.fbeta}"
     )
     print(f"Out      : {args.out}")
 
@@ -694,7 +703,7 @@ def main():
         base = base.sample(n=int(args.max_rows), random_state=42)
         print(f"[info] sampled down to {len(base):,} rows (max_rows={args.max_rows})")
 
-    # Ensure core cols exist (target may be missing only if success exists—handled below)
+    # Ensure core cols exist (target may be missing only if success exists-handled below)
     need = {"time", "lat", "lon"}
     missing = need - set(base.columns)
     if missing:
@@ -823,9 +832,9 @@ def main():
         # Pick estimator for this lead (fallback to global)
         est = per_lead.get(h, model_global)
         if h in per_lead:
-            print("  • using per-lead estimator", flush=True)
+            print("  - using per-lead estimator", flush=True)
         else:
-            print("  • no per-lead estimator; using global", flush=True)
+            print("  - no per-lead estimator; using global", flush=True)
 
         # Score probs for this lead
         prob = score_probs(est, X)
@@ -861,11 +870,11 @@ def main():
 
         pos = int(y.sum())
         print(
-            f"  • label mode: {label_mode} | positives={pos:,}  frac={pos/len(y):.4f}"
+            f"  - label mode: {label_mode} | positives={pos:,}  frac={pos/len(y):.4f}"
         )
         if last_pos is not None:
             d = pos - last_pos
-            print(f"  • Δpositives vs prev lead: {d:+,}")
+            print(f"  - deltapositives vs prev lead: {d:+,}")
         last_pos = pos
 
         # Early degeneracy flags (warn, but still compute)
@@ -881,6 +890,12 @@ def main():
 
         # Anti-flattening diagnostics
         _warn_if_flat(tbl, y, h, tag="")
+        prob_diag = _prob_quantiles(prob)
+        total_rows = int(len(y))
+        pos_frac = float(pos / total_rows) if total_rows else float("nan")
+        feasible = tbl[(tbl["precision"] >= args.min_precision) & (tbl["coverage"] <= args.max_coverage)]
+        feasible_count = int(len(feasible))
+        feasible_frac = float(feasible_count / len(tbl)) if len(tbl) else float("nan")
 
         if args.verbose:
             print(
@@ -893,7 +908,7 @@ def main():
         best_fbet["lead_h"] = h
 
         _fmt(best_f1, "F1", "F1")
-        _fmt(best_fbet, f"Fβ={args.fbeta}", "Fbeta")
+        _fmt(best_fbet, f"Fbeta={args.fbeta}", "Fbeta")
 
         results_rows.append(
             {
@@ -913,6 +928,14 @@ def main():
                 "status_f1": best_f1["status"],
                 "status_Fbeta": best_fbet["status"],
                 "label_mode": label_mode,
+                "n_rows": total_rows,
+                "positives": pos,
+                "pos_frac": pos_frac,
+                "prob_q01": prob_diag["prob_q01"],
+                "prob_q50": prob_diag["prob_q50"],
+                "prob_q99": prob_diag["prob_q99"],
+                "feasible_count": feasible_count,
+                "feasible_frac": feasible_frac,
             }
         )
 

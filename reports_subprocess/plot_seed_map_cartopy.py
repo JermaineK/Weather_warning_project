@@ -60,6 +60,8 @@ def main():
     ap.add_argument("--value-col", default="prob_max", help="Optional numeric column to color/size by")
     ap.add_argument("--time-col", default=None, help="Optional time column; if provided with --per-hour, make one map/hour")
     ap.add_argument("--per-hour", action="store_true", help="Produce one PNG per hour if time is available")
+    ap.add_argument("--hour-step", type=int, default=1, help="Step between hours (e.g., 2 = every 2nd hour).")
+    ap.add_argument("--max-frames", type=int, default=0, help="Limit per-hour frames (0 disables).")
     ap.add_argument("--flag-col", default=None, help="Optional flag column; if provided, filter to rows == 1")
     ap.add_argument("--min-prob", type=float, default=0.5, help="Minimum value/prob to plot (filters points)")
     ap.add_argument("--top-quantile", type=float, default=None, help="Keep only rows with value_col above this quantile (0-1)")
@@ -147,9 +149,15 @@ def main():
             print(f"[map] value_col '{args.value_col}' not found; ignoring.", flush=True)
 
     # Time column (optional)
-    tcol = None
+    tcol_name = None
     if args.time_col and args.time_col in df.columns:
-        tcol = pd.to_datetime(df[args.time_col], utc=True, errors="coerce").dt.tz_localize(None).dt.floor("h")
+        tcol_name = args.time_col
+    elif "time" in df.columns:
+        tcol_name = "time"
+    elif "time_h" in df.columns:
+        tcol_name = "time_h"
+    if tcol_name:
+        tcol = pd.to_datetime(df[tcol_name], utc=True, errors="coerce").dt.tz_localize(None).dt.floor("h")
         df["_time_h"] = tcol
     elif args.per_hour:
         print("[map] --per-hour given but time column missing; producing single map.", flush=True)
@@ -263,9 +271,18 @@ def main():
             return
 
     if args.per_hour and "_time_h" in df.columns:
-        for th, grp in df.groupby("_time_h", sort=True):
+        hours = sorted(df["_time_h"].dropna().unique().tolist())
+        step = max(1, int(args.hour_step))
+        if step > 1:
+            hours = hours[::step]
+        if args.max_frames and args.max_frames > 0:
+            hours = hours[: int(args.max_frames)]
+        base, ext = (Path(args.out_png).with_suffix("").as_posix(), Path(args.out_png).suffix or ".png")
+        for th in hours:
+            grp = df.loc[df["_time_h"] == th]
+            if grp.empty:
+                continue
             suffix = f"_{th:%Y%m%d_%H%M}"
-            base, ext = (Path(args.out_png).with_suffix("").as_posix(), Path(args.out_png).suffix or ".png")
             out = f"{base}{suffix}{ext}"
             ttl = args.title or "Seeds"
             _render(grp, out, f"{ttl} - {th:%Y-%m-%d %H:00}")

@@ -251,7 +251,7 @@ def quick_precision_estimate(alert_files: List[Path],
             return None
     lab = lab[[tcol, latc, lonc, ycol]].copy()
     lab[tcol] = _to_utc_naive(lab[tcol])
-    lab[tcol] = lab[tcol].dt.floor("H")
+    lab[tcol] = lab[tcol].dt.floor("h")
     lab[ycol] = pd.to_numeric(lab[ycol], errors="coerce").fillna(0).astype(int)
 
     # Take up to 3 alert files to keep it light
@@ -273,7 +273,7 @@ def quick_precision_estimate(alert_files: List[Path],
             continue
 
         tmp = df.copy()
-        tmp["time"] = _to_utc_naive(tmp["time"]).dt.floor("H")
+        tmp["time"] = _to_utc_naive(tmp["time"]).dt.floor("h")
         tmp = tmp[["time", "lat", "lon", fcol]]
         tmp[fcol] = pd.to_numeric(tmp[fcol], errors="coerce").fillna(0).astype(int)
         tmp = tmp[tmp[fcol] == 1]

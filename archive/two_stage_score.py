@@ -111,8 +111,8 @@ def main():
     df["risk_ctx"] = ctx_proba(Xc).astype("float32")
 
     # Keep top quantile per hour (vectorized; exact-hour groups)
-    # Use floor("H") just in case time stamps aren't perfectly aligned
-    hour = pd.to_datetime(df["time"]).dt.floor("H")
+    # Use floor("h") just in case time stamps aren't perfectly aligned
+    hour = pd.to_datetime(df["time"]).dt.floor("h")
     qthr = df.groupby(hour, sort=False)["risk_ctx"].transform(lambda s: s.quantile(args.context_quantile))
     df["ctx_keep"] = (df["risk_ctx"] >= qthr).astype("int8")
 

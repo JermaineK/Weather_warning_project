@@ -238,7 +238,7 @@ def throttle_hourly(
         thr = group.nlargest(k).min()
         return group >= thr
 
-    mask = s.groupby(times.dt.floor("H"), sort=False).apply(_keep)
+    mask = s.groupby(times.dt.floor("h"), sort=False).apply(_keep)
     return (
         mask.reset_index(level=0, drop=True)
         .reindex(s.index)
@@ -338,10 +338,10 @@ def main() -> None:
 
     # Optional subsample by hour for quicker sweeps
     if args.subsample_hours and args.subsample_hours > 0:
-        hrs = df["time"].dt.floor("H").drop_duplicates().sort_values()
+        hrs = df["time"].dt.floor("h").drop_duplicates().sort_values()
         keep_hrs = hrs.sample(frac=args.subsample_hours, random_state=42)
         df = (
-            df[df["time"].dt.floor("H").isin(keep_hrs)]
+            df[df["time"].dt.floor("h").isin(keep_hrs)]
             .sort_values(["time", "lat", "lon"])
             .reset_index(drop=True)
         )

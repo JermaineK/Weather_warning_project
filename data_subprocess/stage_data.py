@@ -695,7 +695,7 @@ def build_ids_from_csv(
         # --- build IDs and outputs from (possibly merged) chunk ---
 
         # floor time to hour for ID
-        t_floor = base_time.dt.floor("H")
+        t_floor = base_time.dt.floor("h")
 
         hash_frame = pd.DataFrame({
             "time": t_floor,

@@ -59,6 +59,38 @@ def _read_csv_tolerant(path: Path, usecols=None, nrows: Optional[int] = None) ->
         )
 
 
+def _is_parquet(path: Path) -> bool:
+    suffixes = "".join(path.suffixes[-2:]).lower()
+    return suffixes == ".parquet" or path.suffix.lower() == ".parquet"
+
+
+def _read_table_tolerant(path: Path, usecols=None, nrows: Optional[int] = None) -> pd.DataFrame:
+    if _is_parquet(path):
+        try:
+            return pd.read_parquet(path, columns=usecols)
+        except Exception:
+            return pd.read_parquet(path)
+    return _read_csv_tolerant(path, usecols=usecols, nrows=nrows)
+
+
+def _peek_columns(path: Path) -> List[str]:
+    if _is_parquet(path):
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+
+            return list(pq.ParquetFile(path).schema.names)
+        except Exception:
+            try:
+                return list(pd.read_parquet(path, columns=None).columns)
+            except Exception:
+                return []
+    try:
+        head = _read_csv_tolerant(path, nrows=1)
+        return list(head.columns)
+    except Exception:
+        return []
+
+
 def _try_parse_time_raw(s: pd.Series, fmt: Optional[str]) -> pd.Series:
     raw = s.astype(str).str.strip().str.replace("Z", "", regex=False)
 
@@ -124,23 +156,21 @@ def _pick_candidate(paths: List[Path], prefer: str) -> Optional[Path]:
     # prefer can be 'throttled' | 'denoised' | 'base'
     def stage_score(p: Path) -> int:
         n = p.name
-        if n.endswith("_throttled.csv.gz"):
+        if "_throttled" in n:
             return 0
-        if n.endswith("_denoised.csv.gz"):
+        if "_denoised" in n:
             return 1
         return 2
 
     if not paths:
         return None
 
-    endings = {
-        "throttled": "_throttled.csv.gz",
-        "denoised": "_denoised.csv.gz",
-        "base": ".csv.gz",
-    }
-    end = endings["throttled"] if prefer == "throttled" else endings["denoised"] if prefer == "denoised" else endings["base"]
-
-    wanted = [p for p in paths if p.name.endswith(end)]
+    if prefer == "throttled":
+        wanted = [p for p in paths if "_throttled" in p.name]
+    elif prefer == "denoised":
+        wanted = [p for p in paths if "_denoised" in p.name]
+    else:
+        wanted = [p for p in paths if "_throttled" not in p.name and "_denoised" not in p.name]
     pool = wanted if wanted else paths
     pool = sorted(pool, key=lambda p: (stage_score(p), -p.stat().st_mtime))
     return pool[0] if pool else None
@@ -156,26 +186,35 @@ def _read_alert_for_lead(
     aoi: Optional[str],
     prefer: str,
     debug: bool,
+    fallback_path: Optional[Path],
 ) -> Tuple[Optional[pd.DataFrame], Optional[Path], Optional[str]]:
     """
     Locate the preferred alerts file for a given lead, load it, normalize time/lat/lon,
     determine the effective flag column (with fallbacks), and return (df, path, eff_flag).
     """
-    pattern = f"alerts_{run}_lead{lead}_thr*.csv.gz"
-    cand = sorted(alerts_dir.glob(pattern))
+    patterns = [
+        f"alerts_{run}_lead{lead}_thr*.csv.gz",
+        f"alerts_{run}_lead{lead}_thr*.csv",
+        f"alerts_{run}_lead{lead}_thr*.parquet",
+    ]
+    cand: List[Path] = []
+    for pat in patterns:
+        cand.extend(alerts_dir.glob(pat))
+    cand = sorted(cand)
     if not cand:
-        return None, None, None
-
-    path = _pick_candidate(cand, prefer)
-    if path is None:
-        return None, None, None
+        if fallback_path and fallback_path.exists():
+            path = fallback_path
+            if debug:
+                print(f"[slowtick][debug] lead={lead} using fallback {path.name}")
+        else:
+            return None, None, None
+    else:
+        path = _pick_candidate(cand, prefer)
+        if path is None:
+            return None, None, None
 
     # Peek columns
-    try:
-        head = _read_csv_tolerant(path, nrows=1)
-        cols = set(head.columns)
-    except Exception:
-        cols = set()
+    cols = set(_peek_columns(path))
 
     # Decide effective flag
     eff_flag = requested_flag if requested_flag in cols else None
@@ -188,11 +227,11 @@ def _read_alert_for_lead(
         eff_flag = requested_flag or "alert_final"
 
     usecols = [c for c in ("time", "lat", "lon", eff_flag) if c in cols] or None
-    df = _read_csv_tolerant(path, usecols=usecols)
+    df = _read_table_tolerant(path, usecols=usecols)
 
     # Ensure required columns exist
     if not {"time", "lat", "lon"}.issubset(df.columns):
-        df = _read_csv_tolerant(path)  # last resort full read
+        df = _read_table_tolerant(path)  # last resort full read
 
     # Normalize
     df["time"] = _try_parse_time_raw(df["time"], time_fmt)
@@ -317,6 +356,7 @@ def main():
     ap = argparse.ArgumentParser(description="Slow-tick diagnostics from throttled/denoised/base alerts.")
     ap.add_argument("--alerts-dir", required=True, help="Directory with alerts (throttled/denoised/base).")
     ap.add_argument("--run-name", required=True, help="Run name used in filenames (alerts_<run>_leadX_...).")
+    ap.add_argument("--fallback-alerts", default=None, help="Optional alerts file to use when per-lead files are missing.")
     ap.add_argument("--leads", type=int, nargs="+", required=True, help="Lead hours to include.")
     ap.add_argument("--flag-col", default="alert_final", help="Preferred flag column (tries fallbacks).")
     ap.add_argument("--out-dir", default="results/slowtick", help="Output directory for CSVs/plots.")
@@ -349,6 +389,7 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     alerts_dir = Path(args.alerts_dir)
+    fallback_path = Path(args.fallback_alerts) if args.fallback_alerts else None
 
     rows: List[Dict] = []
     cov_time: Dict[int, pd.Series] = {}
@@ -366,6 +407,7 @@ def main():
             aoi=args.area,
             prefer=args.prefer,
             debug=args.debug,
+            fallback_path=fallback_path,
         )
         if df is None or df.empty or eff_flag is None:
             print(f"[slowtick] lead={L}: no usable alerts file; skipping.")
@@ -390,6 +432,10 @@ def main():
             )
         )
 
+    if not rows:
+        print("[slowtick] no lead summaries produced; skipping diagnostics.")
+        (out_dir / "slowtick_summary.csv").write_text("lead_h,hours,mean_cov,file,flag_col\n", encoding="utf-8")
+        return 0
     summary = pd.DataFrame(rows).sort_values("lead_h")
     summary.to_csv(out_dir / "slowtick_summary.csv", index=False)
 

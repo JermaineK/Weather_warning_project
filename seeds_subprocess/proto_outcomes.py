@@ -458,7 +458,7 @@ def label_tracks_kdtree(track_pts: pd.DataFrame,
     st_df = _first_TS_time_and_vmax(ib, sid)
 
     # Build hourly trees
-    ib["_hour"] = ib["_t_"].dt.floor("H")
+    ib["_hour"] = ib["_t_"].dt.floor("h")
     trees: Dict[pd.Timestamp, KDTree] = {}
     per_hour: Dict[pd.Timestamp, pd.DataFrame] = {}
     if _HAVE_SK:
@@ -479,7 +479,7 @@ def label_tracks_kdtree(track_pts: pd.DataFrame,
         if _HAVE_SK and trees:
             # Query per-hour trees in window
             P = _ecef_xyz(g["lat"].to_numpy(), g["lon"].to_numpy())
-            for th in pd.date_range(t0.floor("H"), t_end.floor("H"), freq="H"):
+            for th in pd.date_range(t0.floor("h"), t_end.floor("h"), freq="h"):
                 T = trees.get(th)
                 G = per_hour.get(th)
                 if T is None or G is None or G.empty:

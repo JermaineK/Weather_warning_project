@@ -315,7 +315,9 @@ def main() -> int:
     needed_cols.update(agg_cols)
     needed_cols = [c for c in needed_cols if c in cols]
 
-    object_rows: List[Dict[str, object]] = []
+    obj_writer = None
+    obj_first = True
+    obj_written = 0
     cell_writer = None
     cell_first = True
 
@@ -324,6 +326,14 @@ def main() -> int:
     next_track_id = 1
     active_tracks: Dict[int, Dict[str, object]] = {}
     reject_rows: List[Dict[str, object]] = []
+
+    def _write_objects(rows: List[Dict[str, object]]) -> None:
+        nonlocal obj_writer, obj_first, obj_written
+        if not rows:
+            return
+        obj_df = pd.DataFrame(rows)
+        obj_writer, obj_first = _write_stream(args.objects_out, obj_df, obj_writer, obj_first)
+        obj_written += len(obj_df)
 
     for t_val, df_t in batches:
         if df_t.empty:
@@ -458,17 +468,19 @@ def main() -> int:
         if not use_persist:
             rejected_small = 0
             kept_total = 0
+            kept_rows: List[Dict[str, object]] = []
             for obj in current_objs:
                 area = int(obj.get("area", 0))
                 row = obj["row"]
                 if area >= min_area_cells:
                     kept_total += 1
-                    object_rows.append(row)
+                    kept_rows.append(row)
                     if args.cells_out and obj.get("comp_df") is not None:
                         comp_df = obj["comp_df"]
                         cell_writer, cell_first = _write_stream(args.cells_out, comp_df, cell_writer, cell_first)
                 else:
                     rejected_small += 1
+            _write_objects(kept_rows)
             if args.rejects_out:
                 reject_rows.append(
                     {
@@ -486,6 +498,7 @@ def main() -> int:
         rejected_small = 0
         kept_small = 0
         kept_total = 0
+        kept_rows: List[Dict[str, object]] = []
 
         for idx, obj in enumerate(current_objs):
             track_id = assignments.get(idx)
@@ -517,9 +530,9 @@ def main() -> int:
                 if area < min_area_cells:
                     kept_small += 1
                 if buffer and track_len >= persist_hours_small:
-                    object_rows.extend(buffer)
+                    kept_rows.extend(buffer)
                     buffer = []
-                object_rows.append(row)
+                kept_rows.append(row)
                 if args.cells_out and obj.get("comp_df") is not None:
                     comp_df = obj["comp_df"]
                     cell_writer, cell_first = _write_stream(args.cells_out, comp_df, cell_writer, cell_first)
@@ -545,18 +558,22 @@ def main() -> int:
                     "rejected_small": rejected_small,
                 }
             )
+        _write_objects(kept_rows)
 
     if cell_writer is not None and hasattr(cell_writer, "close"):
         cell_writer.close()
+    if obj_writer is not None and hasattr(obj_writer, "close"):
+        obj_writer.close()
 
     out_path = Path(args.objects_out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    obj_df = pd.DataFrame(object_rows)
-    if _is_parquet(out_path):
-        obj_df.to_parquet(out_path, index=False)
-    else:
-        obj_df.to_csv(out_path, index=False, date_format="%Y-%m-%d %H:%M:%S")
-    print(f"[objects] wrote {len(obj_df):,} rows -> {out_path}")
+    if obj_written == 0:
+        empty = pd.DataFrame()
+        if _is_parquet(out_path):
+            empty.to_parquet(out_path, index=False)
+        else:
+            empty.to_csv(out_path, index=False, date_format="%Y-%m-%d %H:%M:%S")
+    print(f"[objects] wrote {obj_written:,} rows -> {out_path}")
     if args.cells_out:
         print(f"[objects] cells with object_id -> {args.cells_out}")
     if args.rejects_out:

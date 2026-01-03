@@ -242,7 +242,7 @@ def main():
 
     # Normalize time -> UTC-naive floor-hour
     t = pd.to_datetime(df["time"], utc=True, errors="coerce")
-    df["_hour"] = t.dt.tz_convert(None).dt.floor("H")
+    df["_hour"] = t.dt.tz_convert(None).dt.floor("h")
 
     # Coerce flags to numeric 0/1
     df[args.flag_col] = pd.to_numeric(df[args.flag_col], errors="coerce").fillna(0).astype(int)

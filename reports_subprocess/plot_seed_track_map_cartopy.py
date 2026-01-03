@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from typing import Optional
 
 try:
     import cartopy.crs as ccrs
@@ -32,10 +33,39 @@ def pick_col(df, names):
             return n
     return None
 
+def _thin_points(df: pd.DataFrame, time_col: Optional[str], max_per_hour: int, max_total: int) -> pd.DataFrame:
+    # Agent: thin dense seed layers to avoid blob-like maps.
+    if df.empty:
+        return df
+    out = df
+    if max_per_hour and max_per_hour > 0 and time_col and time_col in out.columns:
+        tvals = pd.to_datetime(out[time_col], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
+        if tvals.notna().any():
+            keep_idx = []
+            for _, sub in out.groupby(tvals, sort=False):
+                if len(sub) > max_per_hour:
+                    sub = sub.sample(int(max_per_hour), random_state=42)
+                keep_idx.extend(sub.index.tolist())
+            out = out.loc[keep_idx]
+    if max_total and max_total > 0 and len(out) > max_total:
+        out = out.sample(int(max_total), random_state=42)
+    return out.reset_index(drop=True)
+
+def _time_color_vals(df: pd.DataFrame, time_col: Optional[str]) -> tuple[Optional[np.ndarray], Optional[str]]:
+    if time_col is None or time_col not in df.columns:
+        return None, None
+    t = pd.to_datetime(df[time_col], utc=True, errors="coerce").dt.tz_convert(None)
+    if t.notna().sum() == 0:
+        return None, None
+    t0 = t.min()
+    hours = (t - t0).dt.total_seconds() / 3600.0
+    label = f"hours since {t0.strftime('%Y-%m-%d %H:%M')} UTC"
+    return hours.to_numpy(), label
+
 
 def main():
-    ap = argparse.ArgumentParser(description="Plot seed–track matches on a map.")
-    ap.add_argument("--matches", required=True, help="CSV/Parquet with seed–track matches.")
+    ap = argparse.ArgumentParser(description="Plot seed-track matches on a map.")
+    ap.add_argument("--matches", required=True, help="CSV/Parquet with seed-track matches.")
     ap.add_argument("--out", default="results/maps/seed_track_map.png", help="Output image path.")
     ap.add_argument("--lat-range", nargs=2, type=float, default=None, help="Optional map latitude range.")
     ap.add_argument("--lon-range", nargs=2, type=float, default=None, help="Optional map longitude range.")
@@ -46,6 +76,14 @@ def main():
     ap.add_argument("--storm-id-col", default=None, help="Storm id column name in matches (e.g., storm_id or name).")
     ap.add_argument("--use-tiles", action="store_true", help="Add background tiles (requires internet).")
     ap.add_argument("--dpi", type=int, default=200)
+    ap.add_argument("--max-points-per-hour", type=int, default=0, help="Cap points per hour (0 disables).")
+    ap.add_argument("--max-points-total", type=int, default=0, help="Cap total points after sampling (0 disables).")
+    ap.add_argument("--color-by-time", action="store_true", help="Color seeds by time (hours since first seed).")
+    ap.add_argument("--time-col", default=None, help="Optional time column override for coloring.")
+    ap.add_argument("--time-cmap", default="viridis", help="Colormap for time coloring.")
+    ap.add_argument("--per-hour", action="store_true", help="Emit one map per hour when time is available.")
+    ap.add_argument("--hour-step", type=int, default=1, help="Step between hours (e.g., 2 = every 2nd hour).")
+    ap.add_argument("--max-frames", type=int, default=0, help="Limit frames (0 disables).")
     args = ap.parse_args()
 
     p = Path(args.matches)
@@ -86,6 +124,17 @@ def main():
                 df = df.loc[vals >= cutoff]
 
     df = df.dropna(subset=[lat_c, lon_c]).reset_index(drop=True)
+    time_col = args.time_col
+    if time_col is None:
+        for cand in ("time", "time_h", "seed_time"):
+            if cand in df.columns:
+                time_col = cand
+                break
+    if len(df):
+        before = len(df)
+        df = _thin_points(df, time_col, args.max_points_per_hour, args.max_points_total)
+        if len(df) != before:
+            print(f"[map] thinned points: {before:,} -> {len(df):,}")
     if len(df) == 0:
         print("[seed-track-map] no valid coordinate rows; skipping plot.")
         return
@@ -99,27 +148,40 @@ def main():
         lat_min, lat_max = float(df[lat_c].min()) - 1, float(df[lat_c].max()) + 1
 
     # --- Plot ---
-    if not CARTOPY_AVAILABLE:
-        print("[warn] Cartopy not available — falling back to plain scatter.")
-        plt.figure(figsize=(8,6))
-        plt.scatter(df[lon_c], df[lat_c], s=12, c="tab:blue", alpha=0.6, label="Seeds")
-        if lat_t and lon_t:
-            plt.scatter(df[lon_t], df[lat_t], s=20, c="tab:red", marker="x", label="Tracks")
-        plt.xlabel("Longitude")
-        plt.ylabel("Latitude")
-        plt.title("Seed–Track Matches (no map projection)")
-        plt.legend()
-        plt.xlim(lon_min, lon_max)
-        plt.ylim(lat_min, lat_max)
-        plt.tight_layout()
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(args.out, dpi=args.dpi)
-        plt.close()
-        print(f"[map] saved (simple) -> {args.out}")
-        return
+    use_cartopy = CARTOPY_AVAILABLE
+    if not use_cartopy:
+        print("[warn] Cartopy not available - falling back to plain scatter.")
 
-    # renderer
     def render(ddf: pd.DataFrame, out_path: str, title: str):
+        if not use_cartopy:
+            plt.figure(figsize=(8,6))
+            tvals, tlabel = _time_color_vals(ddf, time_col) if args.color_by_time else (None, None)
+            if tvals is not None:
+                sc = plt.scatter(ddf[lon_c], ddf[lat_c], s=12, c=tvals, cmap=args.time_cmap, alpha=0.6, label="Seeds")
+                cb = plt.colorbar(sc, orientation="vertical", shrink=0.7)
+                cb.set_label(tlabel or "hours since first seed")
+            elif args.overlay_prob and args.overlay_prob in ddf.columns:
+                vals = pd.to_numeric(ddf[args.overlay_prob], errors="coerce")
+                sc = plt.scatter(ddf[lon_c], ddf[lat_c], s=12, c=vals, cmap="viridis", alpha=0.6, label="Seeds")
+                cb = plt.colorbar(sc, orientation="vertical", shrink=0.7)
+                cb.set_label(args.overlay_prob)
+            else:
+                plt.scatter(ddf[lon_c], ddf[lat_c], s=12, c="tab:blue", alpha=0.6, label="Seeds")
+            if lat_t and lon_t:
+                plt.scatter(ddf[lon_t], ddf[lat_t], s=20, c="tab:red", marker="x", label="Tracks")
+            plt.xlabel("Longitude")
+            plt.ylabel("Latitude")
+            plt.title(title)
+            plt.legend()
+            plt.xlim(lon_min, lon_max)
+            plt.ylim(lat_min, lat_max)
+            plt.tight_layout()
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(out_path, dpi=args.dpi)
+            plt.close()
+            print(f"[map] saved (simple) -> {out_path}")
+            return
+
         fig = plt.figure(figsize=(9,7))
         if args.use_tiles:
             tiler = StamenTerrain()
@@ -134,7 +196,13 @@ def main():
 
         ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
 
-        if args.overlay_prob and args.overlay_prob in ddf.columns:
+        tvals, tlabel = _time_color_vals(ddf, time_col) if args.color_by_time else (None, None)
+        if tvals is not None:
+            sc = ax.scatter(ddf[lon_c], ddf[lat_c], s=18, c=tvals, cmap=args.time_cmap,
+                            transform=ccrs.PlateCarree(), label="Seeds", alpha=0.8)
+            cb = plt.colorbar(sc, ax=ax, orientation="vertical", shrink=0.7)
+            cb.set_label(tlabel or "hours since first seed")
+        elif args.overlay_prob and args.overlay_prob in ddf.columns:
             vals = pd.to_numeric(ddf[args.overlay_prob], errors="coerce")
             sc = ax.scatter(ddf[lon_c], ddf[lat_c], s=18, c=vals, cmap="viridis",
                             transform=ccrs.PlateCarree(), label="Seeds", alpha=0.8)
@@ -158,6 +226,49 @@ def main():
         plt.savefig(out_path, dpi=args.dpi, bbox_inches="tight")
         plt.close()
         print(f"[map] saved -> {out_path}")
+
+    # per-hour maps (optionally per-storm)
+    if args.per_hour:
+        if time_col is None or time_col not in df.columns:
+            print("[seed-track-map] --per-hour requested but no time column found; falling back to single map.")
+        else:
+            tvals = pd.to_datetime(df[time_col], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
+            if tvals.notna().sum() == 0:
+                print("[seed-track-map] --per-hour requested but time values are invalid; falling back to single map.")
+            else:
+                df = df.assign(_time_h=tvals)
+                hours = sorted(df["_time_h"].dropna().unique().tolist())
+                step = max(1, int(args.hour_step))
+                if step > 1:
+                    hours = hours[::step]
+                if args.max_frames and args.max_frames > 0:
+                    hours = hours[: int(args.max_frames)]
+
+                out_base = Path(args.out).with_suffix("")
+                ext = Path(args.out).suffix or ".png"
+                if args.per_storm:
+                    sid_col = args.storm_id_col
+                    if sid_col is None:
+                        for cand in ("storm_id", "name", "sid"):
+                            if cand in df.columns:
+                                sid_col = cand
+                                break
+                    if sid_col and sid_col in df.columns:
+                        for sid, grp in df.groupby(sid_col):
+                            for h in hours:
+                                sub = grp.loc[grp["_time_h"] == h]
+                                if sub.empty:
+                                    continue
+                                stamp = pd.Timestamp(h).strftime("%Y%m%d%H")
+                                render(sub, f"{out_base}_storm_{sid}_{stamp}{ext}", f"Seed-Track Matches - {sid} {stamp}")
+                        return
+                for h in hours:
+                    sub = df.loc[df["_time_h"] == h]
+                    if sub.empty:
+                        continue
+                    stamp = pd.Timestamp(h).strftime("%Y%m%d%H")
+                    render(sub, f"{out_base}_{stamp}{ext}", f"Seed-Track Matches {stamp}")
+                return
 
     # per-storm if requested
     if args.per_storm:

@@ -804,6 +804,7 @@ def _correlation_permtest(
         return pd.DataFrame()
     if not {"lat", "time"}.issubset(df.columns):
         return pd.DataFrame()
+    df = df.reset_index(drop=True)
     lat_vals = pd.to_numeric(df["lat"], errors="coerce")
     labels = [f"{lat_bands[i]}..{lat_bands[i+1]}" for i in range(len(lat_bands) - 1)]
     lat_bin = pd.cut(lat_vals, bins=lat_bands, labels=labels, include_lowest=True)
@@ -1119,6 +1120,59 @@ def main() -> int:
                 "area": (cfg_obj.get("defaults", {}) or {}).get("area"),
             }
         )
+    seen_paths = {r.get("path") for r in rows if r.get("path")}
+
+    def _append_extra_row(section: str, mode: str, path: Optional[Path], expected: List[str]) -> None:
+        if path is None:
+            return
+        if str(path) in seen_paths:
+            return
+        exists = path.exists()
+        cols = _peek_columns(path) if exists and path.is_file() else []
+        missing = [c for c in expected if c not in cols]
+        spans = _minmax_columns(path, ["time", "lat", "lon"], max_rows=args.health_scan_rows) if exists and path.is_file() else {}
+        rows_meta, rows_counted = _row_counts(path) if exists and path.is_file() else (None, 0)
+        rows_warn = False
+        if rows_meta is not None and rows_counted is not None and rows_meta != rows_counted:
+            rows_warn = True
+        rows_value = int(rows_counted or 0)
+        rows.append(
+            {
+                "section": section,
+                "mode": mode,
+                "path": str(path),
+                "exists": bool(exists),
+                "rows": rows_value,
+                "rows_metadata": int(rows_meta) if rows_meta is not None else None,
+                "rows_counted": int(rows_counted) if rows_counted is not None else None,
+                "rows_warn": bool(rows_warn),
+                "missing_cols": ",".join(missing) if missing else "",
+                "time_min": spans.get("time", (None, None))[0],
+                "time_max": spans.get("time", (None, None))[1],
+                "lat_min": spans.get("lat", (None, None))[0],
+                "lat_max": spans.get("lat", (None, None))[1],
+                "lon_min": spans.get("lon", (None, None))[0],
+                "lon_max": spans.get("lon", (None, None))[1],
+                "normalize_lon": (cfg_obj.get("defaults", {}) or {}).get("normalize_lon"),
+                "area": (cfg_obj.get("defaults", {}) or {}).get("area"),
+            }
+        )
+        seen_paths.add(str(path))
+
+    obj_contract = contract_for("report", "objects-by-hour")
+    match_contract = contract_for("report", "object-matches")
+    _append_extra_row(
+        "report",
+        "bundle.objects-by-hour",
+        Path(args.objects) if args.objects else None,
+        obj_contract.expected_output_columns({}) if obj_contract else [],
+    )
+    _append_extra_row(
+        "report",
+        "bundle.object-matches",
+        Path(args.matches) if args.matches else None,
+        match_contract.expected_output_columns({}) if match_contract else [],
+    )
     run_health = pd.DataFrame(rows)
     run_health.to_parquet(out_dir / "run_health.parquet", index=False)
 

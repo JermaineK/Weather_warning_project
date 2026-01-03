@@ -88,7 +88,7 @@ def throttle_by_hour_quantile(df: pd.DataFrame, prob_col: str, base_flag: str, q
         out = pd.Series(np.zeros(len(g), dtype=int), index=g.index)
         out.loc[keep_sub.index] = keep_sub.to_numpy()
         return out
-    return (df.groupby(df["time"].dt.floor("H"), sort=False, group_keys=False)
+    return (df.groupby(df["time"].dt.floor("h"), sort=False, group_keys=False)
               .apply(_keep)
               .reindex(df.index)
               .to_numpy())
@@ -176,10 +176,10 @@ def main():
 
     # Optional hour subsample
     if 0 < args.subsample_hours < 1.0:
-        hours = df["time"].dt.floor("H").drop_duplicates().sort_values()
+        hours = df["time"].dt.floor("h").drop_duplicates().sort_values()
         k = max(1, int(len(hours) * args.subsample_hours))
         keep_hours = set(hours.sample(n=k, random_state=42))
-        df = df[df["time"].dt.floor("H").isin(keep_hours)].copy()
+        df = df[df["time"].dt.floor("h").isin(keep_hours)].copy()
     print(f"Rows -> {len(df):,}")
 
     # Load models

@@ -45,6 +45,22 @@ def _read_any(path: Path, columns: Optional[List[str]] = None, nrows: Optional[i
     return pd.read_csv(path, usecols=columns, nrows=nrows, low_memory=False)
 
 
+def _peek_columns(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    if _is_parquet(path):
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+
+            return list(pq.ParquetFile(path).schema.names)
+        except Exception:
+            return []
+    try:
+        return list(pd.read_csv(path, nrows=0, compression="infer").columns)
+    except Exception:
+        return []
+
+
 def _read_text_safe(path: Optional[Path]) -> str:
     if not path:
         return ""
@@ -205,8 +221,50 @@ def _viability_thresholds_snapshot(path: Optional[Path]) -> pd.DataFrame:
         if cand in tbl.columns:
             tbl = tbl.rename(columns={cand: "lead_h"})
             break
-    keep = [c for c in ["lead_h", "thr_Fbeta", "thr_fbeta", "thr_F1", "Fbeta", "F1", "precision", "recall", "coverage"] if c in tbl.columns]
+    keep = [
+        c
+        for c in [
+            "lead_h",
+            "thr_Fbeta",
+            "thr_fbeta",
+            "thr_F1",
+            "Fbeta",
+            "F1",
+            "precision",
+            "recall",
+            "coverage",
+        ]
+        if c in tbl.columns
+    ]
     return tbl[keep].head(12) if keep else tbl.head(12)
+
+
+def _viability_sweep_diag(path: Optional[Path]) -> pd.DataFrame:
+    if not _exists_nonempty(path):
+        return pd.DataFrame()
+    try:
+        tbl = _read_any(Path(path))
+    except Exception:
+        return pd.DataFrame()
+    if tbl is None or tbl.empty:
+        return pd.DataFrame()
+    for cand in ("lead_h", "lead", "lead_hours"):
+        if cand in tbl.columns:
+            tbl = tbl.rename(columns={cand: "lead_h"})
+            break
+    diag_cols = [
+        "lead_h",
+        "n_rows",
+        "positives",
+        "pos_frac",
+        "prob_q01",
+        "prob_q50",
+        "prob_q99",
+        "feasible_count",
+        "feasible_frac",
+    ]
+    keep = [c for c in diag_cols if c in tbl.columns]
+    return tbl[keep].head(12) if keep else pd.DataFrame()
 
 
 def _viability_metrics_snapshot(path: Optional[Path]) -> Dict[str, Any]:
@@ -618,25 +676,32 @@ def _lead_metrics_from_objects(
     return summary
 
 
-def _alert_stats(alerts: pd.DataFrame, flag_col: str) -> Dict[str, Any]:
+def _alert_stats(alerts: pd.DataFrame, flag_col: str, time_col: Optional[str] = None) -> Dict[str, Any]:
     if alerts.empty or flag_col not in alerts.columns:
         return {}
-    df = alerts.copy()
-    time_col = "time"
-    if time_col not in df.columns:
-        for cand in ["valid_time", "datetime", "forecast_time"]:
-            if cand in df.columns:
-                time_col = cand
-                break
-    if time_col not in df.columns:
+    if time_col is None:
+        time_col = "time"
+        if time_col not in alerts.columns:
+            for cand in ["valid_time", "datetime", "forecast_time"]:
+                if cand in alerts.columns:
+                    time_col = cand
+                    break
+    if time_col not in alerts.columns:
         return {}
-    df["time"] = _coerce_time(df[time_col])
-    df = df.dropna(subset=["time"])
-    df["time_h"] = df["time"].dt.floor("h")
-    flags = pd.to_numeric(df[flag_col], errors="coerce").fillna(0).astype(int)
-    per_hour = df.loc[flags > 0].groupby("time_h").size()
+    time_vals = _coerce_time(alerts[time_col])
+    valid = time_vals.notna()
+    if not valid.any():
+        return {"hours": 0, "alerts": 0}
+    flags = pd.to_numeric(alerts[flag_col], errors="coerce").fillna(0).astype(int)
+    flags = flags.loc[valid]
+    time_h = time_vals.loc[valid].dt.floor("h")
+    mask = flags > 0
+    if mask.any():
+        per_hour = time_h.loc[mask].value_counts()
+    else:
+        per_hour = pd.Series(dtype=int)
     if per_hour.empty:
-        return {"hours": int(df["time_h"].nunique()), "alerts": 0}
+        return {"hours": int(time_h.nunique()), "alerts": 0}
     top_hours = {}
     for k, v in per_hour.sort_values(ascending=False).head(5).to_dict().items():
         if isinstance(k, pd.Timestamp) and pd.notna(k):
@@ -645,7 +710,7 @@ def _alert_stats(alerts: pd.DataFrame, flag_col: str) -> Dict[str, Any]:
             key = str(k)
         top_hours[key] = int(v)
     stats = {
-        "hours": int(df["time_h"].nunique()),
+        "hours": int(time_h.nunique()),
         "alerts": int(flags.sum()),
         "per_hour_q50": float(per_hour.quantile(0.50)),
         "per_hour_q90": float(per_hour.quantile(0.90)),
@@ -653,6 +718,22 @@ def _alert_stats(alerts: pd.DataFrame, flag_col: str) -> Dict[str, Any]:
         "top_hours": top_hours,
     }
     return stats
+
+
+def _alert_stats_from_path(path: Path, flag_col: str) -> Dict[str, Any]:
+    cols = _peek_columns(path)
+    if not cols:
+        return {}
+    time_col = next((c for c in ("time", "valid_time", "datetime", "forecast_time") if c in cols), None)
+    if time_col is None or flag_col not in cols:
+        return {}
+    try:
+        df = _read_any(path, columns=[time_col, flag_col])
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    return _alert_stats(df, flag_col, time_col=time_col)
 
 
 def _object_stats(objects: pd.DataFrame) -> Dict[str, Any]:
@@ -853,6 +934,30 @@ def _read_stage_manifest(run_name: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _track_objects_from_manifest(stage_manifest: pd.DataFrame) -> Dict[str, Any]:
+    if stage_manifest.empty or "stage" not in stage_manifest.columns:
+        return {}
+    row = stage_manifest.loc[stage_manifest["stage"] == "training.track-objects"]
+    if row.empty:
+        return {}
+    info = row.iloc[0].to_dict()
+    out_paths = str(info.get("output_path") or "")
+    pick = ""
+    for part in out_paths.split(";"):
+        cand = part.strip()
+        if not cand:
+            continue
+        if "objects" in cand and cand.endswith((".parquet", ".csv", ".csv.gz")):
+            pick = cand
+            if cand.endswith("objects.parquet") or cand.endswith("objects.csv") or cand.endswith("objects.csv.gz"):
+                break
+    return {
+        "path": pick or out_paths,
+        "rows": info.get("rows"),
+        "health_ok": info.get("health_ok"),
+    }
+
+
 def _collect_model_paths(cfg: Any, exts: Tuple[str, ...]) -> List[Path]:
     found: List[Path] = []
 
@@ -1037,6 +1142,7 @@ def main() -> int:
     horizons = _parse_horizons(args.viability_horizons)
     viability_conversion = _viability_conversion_snapshot(Path(args.viability_targets), horizons) if args.viability_targets else pd.DataFrame()
     viability_thresholds = _viability_thresholds_snapshot(Path(args.viability_thresholds)) if args.viability_thresholds else pd.DataFrame()
+    viability_sweep_diag = _viability_sweep_diag(Path(args.viability_thresholds)) if args.viability_thresholds else pd.DataFrame()
     viability_metrics = _viability_metrics_snapshot(Path(args.viability_metrics)) if args.viability_metrics else {}
     proto_outcomes = _proto_outcomes_snapshot(conversion_csv_path)
     slowtick_union = _slowtick_union_snapshot(seed_union_path)
@@ -1103,11 +1209,13 @@ def main() -> int:
     run_end = pd.to_datetime(run_summary["time_span"].get("end"), errors="coerce")
 
     # Alert stats
-    alerts = _read_any(alerts_path) if alerts_path else pd.DataFrame()
-    alert_stats = _alert_stats(alerts, args.alert_flag_col) if not alerts.empty else {}
+    alert_stats = _alert_stats_from_path(alerts_path, args.alert_flag_col) if alerts_path else {}
 
     # Object stats
     objects = _read_any(objects_path) if objects_path else pd.DataFrame()
+    objects_sig = _file_signature(objects_path) if objects_path else {}
+    if objects_path and objects_path.exists():
+        objects_sig["rows"] = _row_count(objects_path)
     obj_stats = _object_stats(objects) if not objects.empty else {}
     obj_hours = _object_hour_gaps(objects, run_start, run_end) if not objects.empty else {}
 
@@ -1123,6 +1231,11 @@ def main() -> int:
     rejects_path = tables_dir / "object_rejects_by_hour.parquet"
     if rejects_path.exists():
         rejects_df = _read_any(rejects_path)
+
+    storm_hourly = pd.DataFrame()
+    storm_hourly_path = tables_dir / "seed_storm_hourly_counts.csv"
+    if storm_hourly_path.exists():
+        storm_hourly = _read_any(storm_hourly_path)
 
     # Match skill
     matches = _read_any(matches_path) if matches_path else pd.DataFrame()
@@ -1190,6 +1303,7 @@ def main() -> int:
     stage_manifest = _read_stage_manifest(args.run_name)
     if not stage_manifest.empty and "stage" in stage_manifest.columns:
         stage_manifest = stage_manifest.sort_values("stage")
+    track_objects_info = _track_objects_from_manifest(stage_manifest)
 
     lines.append("")
     lines.append("## Stage Cache Summary")
@@ -1263,6 +1377,10 @@ def main() -> int:
         lines.append("")
         lines.append("## Viability Thresholds (sweep)")
         lines.append(_markdown_table(viability_thresholds, max_rows=20))
+    if not viability_sweep_diag.empty:
+        lines.append("")
+        lines.append("## Viability Sweep Diagnostics")
+        lines.append(_markdown_table(viability_sweep_diag, max_rows=20))
 
     if viability_metrics:
         lines.append("")
@@ -1369,6 +1487,26 @@ def main() -> int:
 
     lines.append("")
     lines.append("## Object Stats")
+    if objects_sig:
+        src_path = objects_sig.get("path")
+        if objects_sig.get("exists"):
+            rows = objects_sig.get("rows")
+            rows_txt = f"{int(rows):,}" if isinstance(rows, (int, np.integer)) else "?"
+            sha = objects_sig.get("sha256")
+            sha_txt = f" sha256={sha[:12]}..." if sha else ""
+            lines.append(f"- Objects source: {src_path} (rows={rows_txt}{sha_txt})")
+        else:
+            lines.append(f"- Objects source: {src_path} (missing)")
+    if track_objects_info and objects_sig:
+        track_path = track_objects_info.get("path") or ""
+        track_rows = track_objects_info.get("rows")
+        track_health = track_objects_info.get("health_ok")
+        if track_path and str(track_path) != str(objects_sig.get("path")):
+            if track_health is False or (isinstance(track_rows, (int, np.integer)) and track_rows == 0):
+                lines.append(
+                    f"- Note: training.track-objects output {track_path} rows={track_rows} health_ok={track_health}; "
+                    f"report uses {objects_sig.get('path')}."
+                )
     if obj_stats:
         lines.append(f"- Objects: {obj_stats.get('objects')}")
         lines.append(f"- Hours: {obj_stats.get('hours')}")
@@ -1425,30 +1563,25 @@ def main() -> int:
         lines.append("_No object diagnostics available._")
 
     lines.append("")
-    lines.append("## Match Skill")
-    if match_skill:
-        dist_q = match_skill.get("distance_quantiles", {})
-        lines.append(
-            f"- Distance km q05={dist_q.get('q05'):.1f} q50={dist_q.get('q50'):.1f} q95={dist_q.get('q95'):.1f}"
+    lines.append("## Storm Hourly Seed Counts")
+    if not storm_hourly.empty:
+        agg = (
+            storm_hourly.groupby("storm_id")["points"]
+            .agg(total_points="sum", hours_with_points="count", max_per_hour="max")
+            .reset_index()
+            .sort_values("total_points", ascending=False)
         )
-        lead_stats = match_skill.get("lead_bins")
-        if isinstance(lead_stats, pd.DataFrame) and not lead_stats.empty:
-            lines.append("")
-            lines.append("Lead-bin distance summary:")
-            lines.append(_markdown_table(lead_stats, max_rows=20))
-        cov = match_skill.get("coverage_precision", [])
-        if cov:
-            cov_df = pd.DataFrame(cov)
-            lines.append("")
-            lines.append("Coverage vs precision by threshold (proxy, d_km <= 50):")
-            lines.append(_markdown_table(cov_df, max_rows=10))
+        lines.append(_markdown_table(agg, max_rows=15))
+        heatmap_path = out_dir / "maps" / "seed_storm_hourly_counts.png"
+        if heatmap_path.exists():
+            lines.append(f"- Heatmap: {heatmap_path}")
     else:
-        lines.append("_No match skill available._")
+        lines.append("_No storm hourly counts available._")
 
     lines.append("")
-    lines.append("## Lead-time (objects vs tracks)")
+    lines.append("## Lead-time (primary, future-only)")
     if lead_metrics:
-        lines.append("- Computed without match-time tolerance (future-only lead windows).")
+        lines.append("- Primary KPI: computed without match-time tolerance (future-only lead windows).")
         lines.append(f"- Objects evaluated: {lead_metrics.get('n_objects')}")
         closest_bins = lead_metrics.get("closest_bins")
         if isinstance(closest_bins, pd.DataFrame) and not closest_bins.empty:
@@ -1471,6 +1604,28 @@ def main() -> int:
             lines.append(_markdown_table(cat1_bins, max_rows=20))
     else:
         lines.append("_No lead-time metrics available._")
+
+    lines.append("")
+    lines.append("## Match Skill (time-tolerant)")
+    lines.append("- Coincidence metric using time-tolerant matching (see match stage).")
+    if match_skill:
+        dist_q = match_skill.get("distance_quantiles", {})
+        lines.append(
+            f"- Distance km q05={dist_q.get('q05'):.1f} q50={dist_q.get('q50'):.1f} q95={dist_q.get('q95'):.1f}"
+        )
+        lead_stats = match_skill.get("lead_bins")
+        if isinstance(lead_stats, pd.DataFrame) and not lead_stats.empty:
+            lines.append("")
+            lines.append("Lead-bin distance summary:")
+            lines.append(_markdown_table(lead_stats, max_rows=20))
+        cov = match_skill.get("coverage_precision", [])
+        if cov:
+            cov_df = pd.DataFrame(cov)
+            lines.append("")
+            lines.append("Coverage vs precision by threshold (proxy, d_km <= 50):")
+            lines.append(_markdown_table(cov_df, max_rows=10))
+    else:
+        lines.append("_No match skill available._")
 
     lines.append("")
     lines.append("## Storm-by-storm Pages")
@@ -1546,6 +1701,7 @@ def main() -> int:
         "storm_timeseries_snapshot": storm_ts_snapshot or {},
         "viability_conversion": viability_conversion.to_dict(orient="records") if not viability_conversion.empty else [],
         "viability_thresholds": viability_thresholds.to_dict(orient="records") if not viability_thresholds.empty else [],
+        "viability_sweep_diagnostics": viability_sweep_diag.to_dict(orient="records") if not viability_sweep_diag.empty else [],
         "viability_metrics": viability_metrics.get("raw") if viability_metrics else {},
         "proto_outcomes": proto_outcomes.to_dict(orient="records") if not proto_outcomes.empty else [],
         "slowtick_union": slowtick_union,
@@ -1560,6 +1716,9 @@ def main() -> int:
         },
         "object_stats": obj_stats,
         "object_hour_gaps": obj_hours,
+        "objects_signature": objects_sig,
+        "track_objects_manifest": track_objects_info,
+        "storm_hourly_counts": storm_hourly.to_dict(orient="records") if not storm_hourly.empty else [],
         "match_skill": {
             "distance_quantiles": match_skill.get("distance_quantiles", {}) if match_skill else {},
             "lead_bins": match_skill.get("lead_bins").to_dict(orient="records") if isinstance(match_skill.get("lead_bins"), pd.DataFrame) else [],

@@ -146,7 +146,7 @@ def main() -> None:
     # drift-aware lags (radius > 0)
     r = float(args.radius_deg)
     if r > 0:
-        df["time_floor"] = df[args.time_col].dt.floor("H")
+        df["time_floor"] = df[args.time_col].dt.floor("h")
         time_groups = {t: block[["lat_r", "lon_r", "G_struct", "S_shear", "E_energy"]] for t, block in df.groupby("time_floor", sort=True)}
 
         for lag in lags:

@@ -82,7 +82,7 @@ def main() -> None:
     ):
         df = batch.to_pandas()
         _require_cols(df, ["time", "lat", "lon"])
-        t = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("H")
+        t = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
         la = pd.to_numeric(df["lat"], errors="coerce").round(3)
         lo = pd.to_numeric(df["lon"], errors="coerce").round(3)
         key_frame = pd.DataFrame({"time": t, "lat": la, "lon": lo})

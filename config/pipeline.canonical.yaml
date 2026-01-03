@@ -30,6 +30,14 @@ report:
     storm_timeseries: data/storm_timeseries_panel.parquet
     ibtracs: data/tracks/tracks_subset.csv
     ibtracs_normalize_lon: -180..180
+    union_seeds_per_hour: true
+    seeds_ibtracs_per_hour: true
+    seed_track_per_hour: true
+    per_hour_step: 2
+    per_hour_max_frames: 150
+    animate: true
+    animate_format: gif
+    animate_fps: 6
 report_pdf: true
 fetch:
   enabled: false
@@ -385,7 +393,7 @@ training:
     enabled: true
     infile: results/predictions_base_specialist.parquet
     mask_col: P_final
-    threshold: 0.6
+    threshold: 0.5
     connectivity: 8
     objects_out: results/objects/objects.parquet
     join_out: results/objects/cell_objects.parquet

@@ -109,7 +109,7 @@ def _compute_row_id_from_tll(
       • hash_pandas_object(..., index=False).astype('uint64')
     """
     t = _to_utc_naive(df[time_col])
-    t_floor = t.dt.floor("H")
+    t_floor = t.dt.floor("h")
 
     latv = pd.to_numeric(df[lat_col], errors="coerce")
     lonv = pd.to_numeric(df[lon_col], errors="coerce")

@@ -175,7 +175,7 @@ def stride_df(df: pd.DataFrame, stride: int) -> pd.DataFrame:
         gi["_ilon"] = g["lon"].map(lon_map).to_numpy()
         keep = (gi["_ilat"] % stride == 0) & (gi["_ilon"] % stride == 0)
         return gi.loc[keep].drop(columns=["_ilat","_ilon"])
-    return df.groupby(pd.to_datetime(df["time"]).dt.floor("H"), sort=False, group_keys=False).apply(_per_time)
+    return df.groupby(pd.to_datetime(df["time"]).dt.floor("h"), sort=False, group_keys=False).apply(_per_time)
 
 # ---------------- vorticity/divergence helpers ----------------
 

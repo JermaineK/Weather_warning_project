@@ -67,7 +67,7 @@ def prf(tp: int, fp: int, fn: int):
 
 
 def by_hour_sum(t: pd.Series, v: np.ndarray) -> pd.Series:
-    idx = to_utc_naive(t).dt.floor("H")
+    idx = to_utc_naive(t).dt.floor("h")
     return pd.Series(v, index=idx).groupby(level=0).sum()
 
 

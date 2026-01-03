@@ -181,7 +181,7 @@ def _apply_step(hours: list[int], step: int) -> list[int]:
 def _by_hour_stats(name, y, t):
     if len(y) == 0:
         return
-    idx = pd.to_datetime(t, utc=True, errors="coerce").dt.tz_convert(None).floor("H")
+    idx = pd.to_datetime(t, utc=True, errors="coerce").dt.tz_convert(None).floor("h")
     s = (pd.Series(y, index=idx).groupby(level=0).sum()).astype(float)
     mean, std = float(s.mean()), float(s.std(ddof=0))
     cv = (std / mean) if mean else float("inf")

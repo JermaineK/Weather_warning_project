@@ -168,6 +168,7 @@ def main() -> int:
     ap.add_argument("--objects-top-quantile", type=float, default=None, help="Per-hour score quantile to plot.")
     ap.add_argument("--objects-pad-deg", type=float, default=5.0, help="Padding around track bbox for objects.")
     ap.add_argument("--per-hour", action="store_true", help="Emit one map per hour in the window.")
+    ap.add_argument("--hour-step", type=int, default=1, help="Step between hours (e.g., 2 = every 2nd hour).")
     ap.add_argument("--show-arrows", action="store_true", help="Overlay motion direction arrows.")
     ap.add_argument("--show-flow-arrows", action="store_true", help="Overlay flow-direction arrows.")
     ap.add_argument("--label-arrows", action="store_true", help="Label arrows with speed/bearing.")
@@ -274,6 +275,10 @@ def main() -> int:
         hours = sorted(m["object_time"].dt.floor("h").unique().tolist())
         if not args.per_hour:
             hours = [None]
+        else:
+            step = max(1, int(args.hour_step))
+            if step > 1:
+                hours = hours[::step]
 
         for h in hours:
             if h is None:

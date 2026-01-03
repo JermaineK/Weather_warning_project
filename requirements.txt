@@ -13,6 +13,7 @@ matplotlib
 cartopy
 shapely
 pyproj
+imageio
 
 # I/O + config
 pyyaml

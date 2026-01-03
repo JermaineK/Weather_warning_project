@@ -70,7 +70,7 @@ def throttle_hourly(df: pd.DataFrame, scores: np.ndarray, base_mask: np.ndarray,
     if q is None:
         return base_mask
     kept = np.zeros(len(df), dtype=bool)
-    for _, idx in df.groupby(pd.to_datetime(df["time"]).dt.floor("H"), sort=False).indices.items():
+    for _, idx in df.groupby(pd.to_datetime(df["time"]).dt.floor("h"), sort=False).indices.items():
         cand = base_mask[idx]
         if not np.any(cand):
             continue

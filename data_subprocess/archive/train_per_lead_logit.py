@@ -61,7 +61,7 @@ except Exception:
 # ---------- Diagnostics helpers ----------
 
 def diag_header(df: pd.DataFrame, mode_str: str):
-    tt = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None).dt.floor("H")
+    tt = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_localize(None).dt.floor("h")
     unique_hours = int(tt.nunique())
     cells = int(
         pd.DataFrame({

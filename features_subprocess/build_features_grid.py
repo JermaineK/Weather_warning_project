@@ -331,7 +331,7 @@ def stride_df(df: pd.DataFrame, stride: int) -> pd.DataFrame:
         return gi.loc[keep].drop(columns=["_ilat", "_ilon"])
 
     return df.groupby(
-        pd.to_datetime(df["time"]).dt.floor("H"),
+        pd.to_datetime(df["time"]).dt.floor("h"),
         sort=False,
         group_keys=False
     ).apply(_per_time)

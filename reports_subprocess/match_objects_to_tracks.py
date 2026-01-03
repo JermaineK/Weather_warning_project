@@ -381,10 +381,17 @@ def main() -> int:
     if "obj_flow_bearing_deg" in obj.columns and obj["obj_flow_bearing_deg"].notna().sum() == 0:
         print("[match] flow-direction columns present but empty (u10/v10 likely missing).")
 
-    if "obj_track_id" in obj.columns and args.time_col in obj.columns:
+    if "obj_track_len_h" in obj.columns:
+        obj["obj_track_len_h"] = pd.to_numeric(obj["obj_track_len_h"], errors="coerce")
+    elif "obj_track_id" in obj.columns and args.time_col in obj.columns:
         track_len = obj.groupby("obj_track_id")[args.time_col].nunique().rename("obj_track_len_h")
         obj = obj.merge(track_len, left_on="obj_track_id", right_index=True, how="left")
-    else:
+        if "obj_track_len_h" not in obj.columns:
+            for cand in ("obj_track_len_h_x", "obj_track_len_h_y"):
+                if cand in obj.columns:
+                    obj["obj_track_len_h"] = pd.to_numeric(obj[cand], errors="coerce")
+                    break
+    if "obj_track_len_h" not in obj.columns:
         obj["obj_track_len_h"] = np.nan
     persist_scale = max(float(args.persist_scale_hours), 1e-6)
     obj["obj_persist"] = np.clip(pd.to_numeric(obj["obj_track_len_h"], errors="coerce") / persist_scale, 0.0, 1.0)
@@ -446,7 +453,7 @@ def main() -> int:
     rows: List[pd.DataFrame] = []
     for _, tr_row in tr.iterrows():
         t0 = tr_row["time"]
-        hwin = pd.date_range(t0 - dt_tol, t0 + dt_tol, freq="H")
+        hwin = pd.date_range(t0 - dt_tol, t0 + dt_tol, freq="h")
         cands: List[Dict[str, object]] = []
         for th in hwin:
             g = obj_groups.get(th)

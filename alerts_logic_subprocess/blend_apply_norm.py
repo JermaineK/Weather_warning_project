@@ -90,7 +90,7 @@ def throttle_by_hour_quantile_on_flagged(df: pd.DataFrame, score_col: str,
             return pd.Series(np.zeros(len(g), dtype=int), index=g.index)
         thr = sub[score_col].quantile(q)
         return pd.Series((g[score_col] >= thr).astype(int), index=g.index)
-    out = df.groupby(df["time"].dt.floor("H"), sort=False, group_keys=False).apply(_keep)
+    out = df.groupby(df["time"].dt.floor("h"), sort=False, group_keys=False).apply(_keep)
     return out.reindex(df.index).to_numpy(dtype=int)
 
 # ---------- main ----------
