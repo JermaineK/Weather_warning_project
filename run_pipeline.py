@@ -520,6 +520,79 @@ def _autofix_stale_reason(
     return None
 
 
+def _load_diagnostics_checks(run_name: str | None) -> List[Dict[str, Any]]:
+    reports_dir = Path("results/reports")
+    if not reports_dir.exists():
+        return []
+    candidates = list(reports_dir.glob("*/diagnostics/diagnostics.json"))
+    if not candidates:
+        return []
+    chosen = None
+    if run_name:
+        for p in candidates:
+            data = _load_json(p)
+            if data.get("run_name") == run_name:
+                if chosen is None or p.stat().st_mtime > chosen.stat().st_mtime:
+                    chosen = p
+    if chosen is None:
+        chosen = max(candidates, key=lambda p: p.stat().st_mtime)
+    data = _load_json(chosen)
+    checks = data.get("checks", [])
+    return checks if isinstance(checks, list) else []
+
+
+def _diagnostics_overwrite_targets(issue: str) -> List[Tuple[str, str]]:
+    key = issue.strip().lower()
+    mapping: Dict[str, List[Tuple[str, str]]] = {
+        "lead_h missing": [
+            ("data_stage", "viability-targets"),
+            ("data_stage", "state-transitions"),
+            ("training", "predict-alerts"),
+            ("alerts_logic", "apply-thresholds"),
+            ("alerts_logic", "throttle"),
+            ("alerts_logic", "denoise"),
+            ("alerts_logic", "viability-pipeline"),
+        ],
+        "identical per-lead inputs": [
+            ("data_stage", "viability-targets"),
+            ("data_stage", "state-transitions"),
+            ("training", "train-base"),
+        ],
+        "train/val overlap": [
+            ("training", "train-base"),
+            ("training", "train-alert-specialist"),
+            ("data_stage", "train-viability"),
+        ],
+        "forbidden/leaky columns in features": [
+            ("training", "train-base"),
+            ("training", "train-alert-specialist"),
+            ("data_stage", "train-viability"),
+        ],
+        "non-causal features in training": [
+            ("training", "train-base"),
+            ("training", "train-alert-specialist"),
+            ("data_stage", "train-viability"),
+        ],
+        "slowtick identical across leads": [
+            ("alerts_logic", "apply-thresholds"),
+            ("alerts_logic", "throttle"),
+            ("alerts_logic", "denoise"),
+            ("alerts_logic", "viability-pipeline"),
+        ],
+        "time-shift test": [
+            ("features", "join-labels-grid"),
+            ("data_stage", "state-transitions"),
+            ("training", "train-base"),
+        ],
+        "join audit": [
+            ("features", "join-features"),
+            ("features", "integrate-thermo"),
+            ("features", "join-labels-grid"),
+        ],
+    }
+    return mapping.get(key, [])
+
+
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
@@ -1295,6 +1368,22 @@ def _autofix_config(
             f"[autofix] upstream change detected: "
             f"code_changed={code_changed} config_changed={config_changed}"
         )
+    diag_checks = _load_diagnostics_checks(run_name)
+    if diag_checks:
+        diag_fails = [c for c in diag_checks if str(c.get("status")).lower() == "fail"]
+        for chk in diag_fails:
+            issue = str(chk.get("issue") or "").strip()
+            if not issue:
+                continue
+            for section, mode in _diagnostics_overwrite_targets(issue):
+                _mark_overwrite(
+                    cfg,
+                    section,
+                    mode,
+                    f"diagnostics: {issue}",
+                    changes,
+                    add_overwrite,
+                )
     pre_add_ids_stale = False
     pre_add_sections = {"fetch", "features"}
 
