@@ -36,11 +36,15 @@ report:
       union-seeds-per-hour: true
       seeds-ibtracs-per-hour: true
       seed-track-per-hour: true
+      seed-track-per-storm-gifs: true
+      seed-track-max-direction-arrows: 400
       per-hour-step: 2
       per-hour-max-frames: 150
       animate: true
       animate-format: gif
       animate-fps: 6
+      diagnostics: true
+      diagnostics-fail-on-checks: true
 report_pdf: true
 
 # =====================================================================
@@ -243,20 +247,20 @@ data_stage:
 
     # 2.1 Build slim lookup panel (all rows) from the ID'd feature file
     - mode: lookup-panel
-      enabled: false
-      source: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+      enabled: true
+      source: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
       all-rows: true
       keep-cols:
         - row_id
         - time
+        - ilat
+        - ilon
         - lat
         - lon
-        - t_to_storm_min_h
         - storm
-        - storm_point
-        - storm_window
-        - near_storm
-      out: data/grid_slim_start.parquet
+      keep-prefixes: "gka_,sph_,SFI,S3,zeta,div,msl_,dG_,dE_,G_,E_"
+      drop-patterns: "storm*,track*,t_to_*,near_storm,row_id,time,time_hr,*_point,*_window,vmax*,dist*track*"
+      out: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state_slim.parquet
       chunk-rows: 200000
       overwrite: false
       skip_if_exists: true
@@ -321,6 +325,7 @@ data_stage:
       out: data/grid_train_gse_panel_targets.parquet
       lead-col: t_to_storm_min_h
       horizon-max: 240
+      lead-h: 240
       g-min-quantile: 
       g-min:
       chunksize: 400000
@@ -355,6 +360,11 @@ data_stage:
       model-out: models/viability_model.pkl
       metrics-json: models/viability_model_metrics.json
       coefs-csv: models/viability_model_coefs.csv
+      key-cols: "time,ilat,ilon"
+      train-keys-out: models/viability_train_keys.parquet
+      val-keys-out: models/viability_val_keys.parquet
+      features-manifest: config/features_manifest.json
+      require-feature-metadata: true
       skip_if_exists: true
 
     # 2.9 Storm-centric time series panel (optional)
@@ -401,7 +411,7 @@ training:
   steps:
     - mode: train-base
       enabled: true
-      train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
+      train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state_slim.parquet
       label: storm
       train-end: "2025-03-31"
       val-end: "2025-05-30"
@@ -423,6 +433,11 @@ training:
       model-out: models/base_model.pkl
       calibration-out: models/base_calibrator.pkl
       metrics-out: models/base_metrics.json
+      key-cols: "time,ilat,ilon"
+      train-keys-out: models/base_train_keys.parquet
+      val-keys-out: models/base_val_keys.parquet
+      features-manifest: config/features_manifest.json
+      require-feature-metadata: true
       chunk-rows: 200000
       parquet-rows: 200000
       skip_if_exists: false
@@ -430,7 +445,7 @@ training:
     - mode: train-alert-specialist
       enabled: true
       calibrate: true
-      train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
+      train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state_slim.parquet
       alerts: results/alerts/alerts_coral_sea_demo_final.parquet
       label: storm
       G-thr: 0.8
@@ -441,6 +456,11 @@ training:
       model-out: models/alert_specialist.pkl
       calibration-out: models/alert_specialist_cal.pkl
       metrics-out: models/alert_specialist_metrics.json
+      key-cols: "time,ilat,ilon"
+      train-keys-out: models/alert_specialist_train_keys.parquet
+      val-keys-out: models/alert_specialist_val_keys.parquet
+      features-manifest: config/features_manifest.json
+      require-feature-metadata: true
       skip_if_exists: false
 
     - mode: predict-alerts

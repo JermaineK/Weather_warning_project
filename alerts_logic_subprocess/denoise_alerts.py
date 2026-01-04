@@ -214,9 +214,12 @@ def main():
     elif score_col == "prob" and "prob" in df.columns:
         out["prob"] = pd.to_numeric(df["prob"], errors="coerce")
 
-    # Always keep t_to_storm and row_id if present
+    # Always keep lead/time-to-storm helpers and row_id if present
     if "t_to_storm" in df.columns:
         out["t_to_storm"] = pd.to_numeric(df["t_to_storm"], errors="coerce")
+    for col in ("t_to_storm_min_h", "lead_h", "cell_id"):
+        if col in df.columns and col not in out.columns:
+            out[col] = df[col]
     if "row_id" in df.columns and "row_id" not in out.columns:
         out["row_id"] = pd.to_numeric(df["row_id"], errors="coerce")
 

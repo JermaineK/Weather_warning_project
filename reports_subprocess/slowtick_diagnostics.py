@@ -176,6 +176,81 @@ def _pick_candidate(paths: List[Path], prefer: str) -> Optional[Path]:
     return pool[0] if pool else None
 
 
+def _load_alert_table(
+    path: Path,
+    time_fmt: Optional[str],
+    norm_lon: str,
+    aoi: Optional[str],
+    usecols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    df = _read_table_tolerant(path, usecols=usecols)
+
+    # Ensure required columns exist
+    if not {"time", "lat", "lon"}.issubset(df.columns):
+        df = _read_table_tolerant(path)  # last resort full read
+
+    # Normalize
+    df["time"] = _try_parse_time_raw(df["time"], time_fmt)
+    df = df.dropna(subset=["time"]).reset_index(drop=True)
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = _norm_lon(df["lon"], norm_lon)
+    df = df.dropna(subset=["lat", "lon"]).reset_index(drop=True)
+
+    # AOI crop (anti-meridian safe)
+    df = _crop_aoi(df, _parse_area(aoi), "lat", "lon")
+    return df
+
+
+def _load_threshold_map(path: Optional[str], thr_col: str) -> Dict[int, float]:
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        df = _read_table_tolerant(p)
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+
+    lead_col = None
+    for cand in ("lead_h", "lead", "lead_hours", "lead_hr"):
+        if cand in df.columns:
+            lead_col = cand
+            break
+    if lead_col is None:
+        return {}
+
+    thr_candidates = [
+        thr_col,
+        thr_col.lower(),
+        "thr_Fbeta",
+        "thr_fbeta",
+        "thr_F1",
+        "thr_f1",
+        "opt_threshold",
+        "thr",
+        "threshold",
+    ]
+    thr_use = None
+    for cand in thr_candidates:
+        if cand in df.columns:
+            thr_use = cand
+            break
+    if thr_use is None:
+        return {}
+
+    lead_vals = pd.to_numeric(df[lead_col], errors="coerce")
+    thr_vals = pd.to_numeric(df[thr_use], errors="coerce")
+    out: Dict[int, float] = {}
+    for lead, thr in zip(lead_vals, thr_vals):
+        if not np.isfinite(lead) or not np.isfinite(thr):
+            continue
+        out[int(lead)] = float(thr)
+    return out
+
+
 def _read_alert_for_lead(
     alerts_dir: Path,
     run: str,
@@ -187,6 +262,9 @@ def _read_alert_for_lead(
     prefer: str,
     debug: bool,
     fallback_path: Optional[Path],
+    thresholds: Dict[int, float],
+    prob_col: str,
+    fallback_df: Optional[pd.DataFrame],
 ) -> Tuple[Optional[pd.DataFrame], Optional[Path], Optional[str]]:
     """
     Locate the preferred alerts file for a given lead, load it, normalize time/lat/lon,
@@ -201,9 +279,11 @@ def _read_alert_for_lead(
     for pat in patterns:
         cand.extend(alerts_dir.glob(pat))
     cand = sorted(cand)
+    using_fallback = False
     if not cand:
         if fallback_path and fallback_path.exists():
             path = fallback_path
+            using_fallback = True
             if debug:
                 print(f"[slowtick][debug] lead={lead} using fallback {path.name}")
         else:
@@ -214,38 +294,62 @@ def _read_alert_for_lead(
             return None, None, None
 
     # Peek columns
-    cols = set(_peek_columns(path))
+    if using_fallback and fallback_df is not None:
+        cols = set(fallback_df.columns)
+    else:
+        cols = set(_peek_columns(path))
+
+    thr = thresholds.get(int(lead))
+    lead_flag = None
+    if requested_flag:
+        lead_candidates = [
+            f"{requested_flag}_lead{lead}",
+            f"{requested_flag}_lead{lead}h",
+            f"{requested_flag}_lead_{lead}",
+            f"{requested_flag}_lead_{lead}h",
+            f"{requested_flag}_{lead}",
+            f"{requested_flag}_{lead}h",
+        ]
+        for cand in lead_candidates:
+            if cand in cols:
+                lead_flag = cand
+                break
+
+    use_prob_threshold = False
+    if thr is not None and prob_col in cols and lead_flag is None:
+        use_prob_threshold = True
 
     # Decide effective flag
-    eff_flag = requested_flag if requested_flag in cols else None
-    if eff_flag is None:
-        for alt in ("alert_throttled", "alert_final", "alert"):
-            if alt in cols:
-                eff_flag = alt
-                break
-    if eff_flag is None:
-        eff_flag = requested_flag or "alert_final"
+    if lead_flag is not None:
+        eff_flag = lead_flag
+    elif use_prob_threshold:
+        eff_flag = f"_prob_thr_{lead}h"
+    else:
+        eff_flag = requested_flag if requested_flag in cols else None
+        if eff_flag is None:
+            for alt in ("alert_throttled", "alert_final", "alert"):
+                if alt in cols:
+                    eff_flag = alt
+                    break
+        if eff_flag is None:
+            eff_flag = requested_flag or "alert_final"
 
-    usecols = [c for c in ("time", "lat", "lon", eff_flag) if c in cols] or None
-    df = _read_table_tolerant(path, usecols=usecols)
+    usecols = [c for c in ("time", "lat", "lon", eff_flag, prob_col) if c in cols] or None
+    if using_fallback and fallback_df is not None:
+        df = fallback_df
+    else:
+        df = _load_alert_table(path, time_fmt, norm_lon, aoi, usecols=usecols)
 
-    # Ensure required columns exist
-    if not {"time", "lat", "lon"}.issubset(df.columns):
-        df = _read_table_tolerant(path)  # last resort full read
-
-    # Normalize
-    df["time"] = _try_parse_time_raw(df["time"], time_fmt)
-    df = df.dropna(subset=["time"]).reset_index(drop=True)
-    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    df["lon"] = _norm_lon(df["lon"], norm_lon)
-    df = df.dropna(subset=["lat", "lon"]).reset_index(drop=True)
-
-    if eff_flag not in df.columns:
-        df[eff_flag] = 0
-    df[eff_flag] = pd.to_numeric(df[eff_flag], errors="coerce").fillna(0).astype(int)
-
-    # AOI crop (anti-meridian safe)
-    df = _crop_aoi(df, _parse_area(aoi), "lat", "lon")
+    if use_prob_threshold:
+        if prob_col in df.columns:
+            prob = pd.to_numeric(df[prob_col], errors="coerce").fillna(-np.inf)
+            df[eff_flag] = (prob >= float(thr)).astype(int)
+        else:
+            df[eff_flag] = 0
+    else:
+        if eff_flag not in df.columns:
+            df[eff_flag] = 0
+        df[eff_flag] = pd.to_numeric(df[eff_flag], errors="coerce").fillna(0).astype(int)
 
     if debug and not df.empty:
         tt = df["time"].dt.floor("h")
@@ -357,6 +461,9 @@ def main():
     ap.add_argument("--alerts-dir", required=True, help="Directory with alerts (throttled/denoised/base).")
     ap.add_argument("--run-name", required=True, help="Run name used in filenames (alerts_<run>_leadX_...).")
     ap.add_argument("--fallback-alerts", default=None, help="Optional alerts file to use when per-lead files are missing.")
+    ap.add_argument("--thresholds", default=None, help="Optional thresholds table (CSV/Parquet) for per-lead flags.")
+    ap.add_argument("--threshold-col", default="thr_Fbeta", help="Threshold column to use in --thresholds.")
+    ap.add_argument("--prob-col", default="prob_viable", help="Probability column for derived per-lead flags.")
     ap.add_argument("--leads", type=int, nargs="+", required=True, help="Lead hours to include.")
     ap.add_argument("--flag-col", default="alert_final", help="Preferred flag column (tries fallbacks).")
     ap.add_argument("--out-dir", default="results/slowtick", help="Output directory for CSVs/plots.")
@@ -383,6 +490,7 @@ def main():
     ap.add_argument("--bootstrap-B", type=int, default=1000, help="Bootstrap draws for knee/parity CIs.")
     ap.add_argument("--min-hours-per-lead", type=int, default=8, help="Skip leads with fewer hourly points.")
     ap.add_argument("--fft-gap-fill", type=int, default=2, help="Fill NaN gaps ≤ this many hours before FFT.")
+    ap.add_argument("--cache-fallback", action="store_true", help="Cache fallback alerts in memory for reuse.")
     ap.add_argument("--debug", action="store_true", help="Print file/range diagnostics.")
     args = ap.parse_args()
 
@@ -390,6 +498,32 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     alerts_dir = Path(args.alerts_dir)
     fallback_path = Path(args.fallback_alerts) if args.fallback_alerts else None
+
+    thr_map = _load_threshold_map(args.thresholds, args.threshold_col)
+    if args.thresholds and not thr_map:
+        print("[slowtick] warning: thresholds provided but no lead thresholds parsed.")
+
+    fallback_df: Optional[pd.DataFrame] = None
+    if args.cache_fallback and fallback_path and fallback_path.exists():
+        cols = set(_peek_columns(fallback_path))
+        candidate_cols = (
+            "time",
+            "lat",
+            "lon",
+            args.prob_col,
+            args.flag_col,
+            "alert_throttled",
+            "alert_final",
+            "alert",
+        )
+        usecols = [c for c in candidate_cols if c in cols] or None
+        fallback_df = _load_alert_table(
+            fallback_path,
+            time_fmt=args.time_format,
+            norm_lon=args.normalize_lon,
+            aoi=args.area,
+            usecols=usecols,
+        )
 
     rows: List[Dict] = []
     cov_time: Dict[int, pd.Series] = {}
@@ -408,6 +542,9 @@ def main():
             prefer=args.prefer,
             debug=args.debug,
             fallback_path=fallback_path,
+            thresholds=thr_map,
+            prob_col=args.prob_col,
+            fallback_df=fallback_df,
         )
         if df is None or df.empty or eff_flag is None:
             print(f"[slowtick] lead={L}: no usable alerts file; skipping.")

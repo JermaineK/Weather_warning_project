@@ -21,6 +21,7 @@ from pathlib import Path
 import importlib
 import inspect
 import pandas as pd
+from utils import join_audit
 
 def _csv_read_kwargs(usecols):
     """Return memory-friendlier kwargs for CSV loading.
@@ -113,6 +114,12 @@ def parse_args():
     ap.add_argument("--chunk-rows", type=int, default=0, help="Rows per CSV chunk when writing (0=all at once).")
     ap.add_argument("--chunksize", type=int, default=0, help="Alias for --chunk-rows.")
     ap.add_argument("--parquet-rows", type=int, default=0, help="Parquet row group size (0=default).")
+    ap.add_argument("--join-audit-out", default="results/diagnostics/join_audit.json",
+                    help="Optional JSON path for join audit logging.")
+    ap.add_argument("--allow-many-to-many", action="store_true",
+                    help="Allow many-to-many joins without failing.")
+    ap.add_argument("--allow-row-explosion", action="store_true",
+                    help="Allow output row growth beyond left/right inputs.")
     return ap.parse_args()
 
 def main():
@@ -138,6 +145,23 @@ def main():
     if "lon" in right:   right["lon"]  = wrap_lon(right["lon"], args.normalize_lon)
 
     out = left.merge(right, on=keys, how="left", suffixes=("","_r"))
+
+    # Agent: join audit guardrails (no math changes).
+    left_dupe = int(left.duplicated(subset=keys).sum()) if keys else 0
+    right_dupe = int(right.duplicated(subset=keys).sum()) if keys else 0
+    entry = join_audit.build_entry(
+        step="features.join-features",
+        keys=keys,
+        join_type="left",
+        left_rows=len(left),
+        right_rows=len(right),
+        out_rows=len(out),
+        left_dupe_keys=left_dupe,
+        right_dupe_keys=right_dupe,
+        extra={"left_path": str(args.left), "right_path": str(args.right), "out_path": str(args.out)},
+    )
+    join_audit.append_entry(args.join_audit_out, entry)
+    join_audit.enforce(entry, allow_many_to_many=args.allow_many_to_many, allow_row_explosion=args.allow_row_explosion)
 
     chunk_rows = args.chunk_rows or args.chunksize
     write_any(args.out, out, overwrite=args.overwrite, chunk_rows=chunk_rows, parquet_rows=args.parquet_rows)

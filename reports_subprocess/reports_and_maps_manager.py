@@ -38,6 +38,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -768,6 +769,16 @@ def main() -> int:
         help="Emit per-hour frames for seed-track match maps.",
     )
     ap.add_argument(
+        "--seed-track-per-storm-gifs",
+        action="store_true",
+        help="Emit per-storm hourly GIFs for seed-track match maps.",
+    )
+    ap.add_argument("--seed-track-storm-id-col", default=None, help="Storm id column override for seed-track maps.")
+    ap.add_argument("--seed-track-direction-col", default=None, help="Bearing column for direction arrows.")
+    ap.add_argument("--seed-track-direction-scale", type=float, default=0.6, help="Arrow length in degrees.")
+    ap.add_argument("--seed-track-direction-color", default="tab:green", help="Arrow color for direction overlay.")
+    ap.add_argument("--seed-track-max-direction-arrows", type=int, default=0, help="Cap direction arrows per frame.")
+    ap.add_argument(
         "--per-hour-step",
         type=int,
         default=2,
@@ -866,6 +877,21 @@ def main() -> int:
         help="Flag column to use (tries fallbacks if missing).",
     )
     ap.add_argument(
+        "--slowtick-thresholds",
+        default=None,
+        help="Optional thresholds table for per-lead slowtick flags.",
+    )
+    ap.add_argument(
+        "--slowtick-threshold-col",
+        default="thr_Fbeta",
+        help="Threshold column to use in --slowtick-thresholds.",
+    )
+    ap.add_argument(
+        "--slowtick-prob-col",
+        default="prob_viable",
+        help="Probability column for derived per-lead flags.",
+    )
+    ap.add_argument(
         "--slowtick-out-subdir",
         default="slowtick",
         help="Subdirectory under the run folder for slow-tick outputs.",
@@ -921,9 +947,31 @@ def main() -> int:
         help="Fill NaN gaps up to this length before FFT (hours).",
     )
     ap.add_argument(
+        "--slowtick-cache-fallback",
+        action="store_true",
+        help="Cache fallback alerts in memory for slowtick reuse.",
+    )
+    ap.add_argument(
         "--slowtick-debug",
         action="store_true",
         help="Verbose file/range debug for diagnostics.",
+    )
+    # Post-run diagnostics (read-only)
+    ap.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Run run_diagnostics.py on the completed run folder.",
+    )
+    ap.add_argument("--diagnostics-out", default=None, help="Override diagnostics output directory.")
+    ap.add_argument("--diagnostics-train-table", default=None, help="Optional training table for diagnostics.")
+    ap.add_argument("--diagnostics-train-keys", default=None, help="Optional train keys table for overlap checks.")
+    ap.add_argument("--diagnostics-val-keys", default=None, help="Optional val keys table for overlap checks.")
+    ap.add_argument("--diagnostics-metrics-json", default=None, help="Optional metrics JSON with feature list.")
+    ap.add_argument("--diagnostics-feature-meta", default=None, help="Optional feature metadata JSON for causality checks.")
+    ap.add_argument(
+        "--diagnostics-fail-on-checks",
+        action="store_true",
+        help="Exit non-zero if diagnostics finds any failures.",
     )
     # Object-based reporting inputs/outputs
     ap.add_argument("--objects-in", default=None, help="Alerts/predictions table for object extraction.")
@@ -1009,6 +1057,18 @@ def main() -> int:
         if args.per_hour_max_frames and args.per_hour_max_frames > 0:
             step_args += ["--max-frames", str(args.per_hour_max_frames)]
         return run_step(tag, script, step_args)
+
+    def _append_seed_track_options(step_args: List[str]) -> None:
+        if args.seed_track_storm_id_col:
+            step_args += ["--storm-id-col", args.seed_track_storm_id_col]
+        if args.seed_track_direction_col:
+            step_args += ["--direction-col", args.seed_track_direction_col]
+        if args.seed_track_direction_scale:
+            step_args += ["--direction-scale", str(args.seed_track_direction_scale)]
+        if args.seed_track_direction_color:
+            step_args += ["--direction-color", args.seed_track_direction_color]
+        if args.seed_track_max_direction_arrows:
+            step_args += ["--max-direction-arrows", str(args.seed_track_max_direction_arrows)]
 
     union_csv = or_default(args.union_csv, "results/seedmaps/{run}_union_byhour.csv")
     patches_csv = or_default(args.patches_csv, "results/seedmaps/{run}_seed_patches.csv")
@@ -1381,6 +1441,7 @@ def main() -> int:
             "--max-points-per-hour", "2000",
             "--max-points-total", "20000",
         ]
+        _append_seed_track_options(step_args)
         ok, code = run_step("seed-track-map", script, step_args)
         if not ok and args.strict:
             return code
@@ -1395,6 +1456,7 @@ def main() -> int:
             "--max-points-total", "20000",
             "--color-by-time",
         ]
+        _append_seed_track_options(step_args)
         ok, code = run_step("seed-track-map-time", script, step_args)
         if not ok and args.strict:
             return code
@@ -1413,6 +1475,7 @@ def main() -> int:
                 "--hour-step", str(args.per_hour_step),
                 "--max-frames", str(args.per_hour_max_frames),
             ]
+            _append_seed_track_options(step_args)
             ok, code = run_step("seed-track-map-hourly", script, step_args)
             if not ok and args.strict:
                 return code
@@ -1422,6 +1485,44 @@ def main() -> int:
                 ok, code = run_animation("seed-track-map-anim", frame_glob, anim_out)
                 if not ok and args.strict:
                     return code
+
+        if args.seed_track_per_storm_gifs:
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            out_png = frames_dir / "seed_track_map_hourly_storm.png"
+            step_args = [
+                "--matches", matches_csv,
+                "--out", str(out_png),
+                "--overlay-prob", "prob_max",
+                "--min-prob", "0.5",
+                "--max-points-per-hour", "2000",
+                "--max-points-total", "20000",
+                "--per-hour",
+                "--per-storm",
+                "--hour-step", str(args.per_hour_step),
+                "--max-frames", str(args.per_hour_max_frames),
+            ]
+            _append_seed_track_options(step_args)
+            ok, code = run_step("seed-track-map-hourly-storm", script, step_args)
+            if not ok and args.strict:
+                return code
+            if ok:
+                storm_dir = maps_dir / "storm_gifs"
+                storm_dir.mkdir(parents=True, exist_ok=True)
+                frame_files = list(frames_dir.glob("seed_track_map_hourly_storm_*_*.png"))
+                storm_ids = set()
+                pattern = re.compile(r"seed_track_map_hourly_storm_(.+)_[0-9]{10}\\.png$")
+                for fp in frame_files:
+                    m = pattern.search(fp.name)
+                    if m:
+                        storm_ids.add(m.group(1))
+                if not storm_ids:
+                    print("[manager] seed-track per-storm GIFs: no frames found.")
+                for sid in sorted(storm_ids):
+                    anim_out = storm_dir / f"seed_track_map_hourly_storm_{sid}.{args.animate_format}"
+                    frame_glob = str(frames_dir / f"seed_track_map_hourly_storm_{sid}_*.png")
+                    ok, code = run_animation(f"seed-track-storm-{sid}", frame_glob, anim_out)
+                    if not ok and args.strict:
+                        return code
 
     # --- STEP 4b: per-storm hourly counts (heatmap) ---
     if Path(matches_csv).exists():
@@ -1488,6 +1589,18 @@ def main() -> int:
                 "--min-hours-per-lead", str(args.slowtick_min_hours_per_lead),
                 "--fft-gap-fill", str(args.slowtick_fft_gap_fill),
             ]
+            slowtick_thr = args.slowtick_thresholds
+            if slowtick_thr is None and viability_thr and Path(viability_thr).exists():
+                slowtick_thr = viability_thr
+            if slowtick_thr:
+                step_args += [
+                    "--thresholds", slowtick_thr,
+                    "--threshold-col", args.slowtick_threshold_col,
+                ]
+            if args.slowtick_prob_col:
+                step_args += ["--prob-col", args.slowtick_prob_col]
+            if args.slowtick_cache_fallback:
+                step_args.append("--cache-fallback")
             fallback_candidates = [
                 f"alerts_{slowtick_run}_final.parquet",
                 f"alerts_{slowtick_run}_thr.parquet",
@@ -1508,8 +1621,8 @@ def main() -> int:
                 step_args += ["--area", args.slowtick_area]
             if args.slowtick_time_format:
                 step_args += ["--time-format", args.slowtick_time_format]
-            if args.slowtick_save_timeseries:
-                step_args.append("--save-timeseries")
+            # Always emit coverage_timeseries.csv so diagnostics can compare leads.
+            step_args.append("--save-timeseries")
             if args.slowtick_save_hemi_timeseries:
                 step_args.append("--save-hemi-timeseries")
             if args.slowtick_debug:
@@ -1602,7 +1715,34 @@ def main() -> int:
         if not ok and args.strict:
             return code
 
-    # --- STEP 9: provenance summary ---
+    # --- STEP 9: diagnostics bundle (read-only) ---
+    if args.diagnostics:
+        script = HERE / "run_diagnostics.py"
+        step_args = [
+            "--run-dir", str(run_dir),
+            "--run-name", args.run_name,
+            "--alerts-dir", args.alerts_dir,
+            "--objects-by-hour", args.objects_out,
+        ]
+        if args.diagnostics_out:
+            step_args += ["--out-dir", args.diagnostics_out]
+        if args.diagnostics_train_table:
+            step_args += ["--train-table", args.diagnostics_train_table]
+        if args.diagnostics_train_keys:
+            step_args += ["--train-keys", args.diagnostics_train_keys]
+        if args.diagnostics_val_keys:
+            step_args += ["--val-keys", args.diagnostics_val_keys]
+        if args.diagnostics_metrics_json:
+            step_args += ["--metrics-json", args.diagnostics_metrics_json]
+        if args.diagnostics_feature_meta:
+            step_args += ["--feature-metadata", args.diagnostics_feature_meta]
+        if args.diagnostics_fail_on_checks:
+            step_args.append("--fail-on-checks")
+        ok, code = run_step("run-diagnostics", script, step_args)
+        if not ok and args.strict:
+            return code
+
+    # --- STEP 10: provenance summary ---
     git_commit = _git_commit(REPO_ROOT)
     source_inputs: List[Dict[str, Any]] = []
     source_input_paths = [

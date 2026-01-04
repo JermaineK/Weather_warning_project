@@ -126,7 +126,9 @@ def _estimate_g_min(path: str, g_col: str, quantile: float, chunksize: Optional[
     return g_min
 
 
-def _add_targets(chunk: pd.DataFrame, args: argparse.Namespace, g_min: float, lead_sign: str) -> pd.DataFrame:
+def _add_targets(
+    chunk: pd.DataFrame, args: argparse.Namespace, g_min: float, lead_sign: str, lead_h_val: float
+) -> pd.DataFrame:
     df = chunk.copy()
     lead = _num(df[args.lead_col]) if args.lead_col in df else np.nan
     g = _num(df[args.g_col]) if args.g_col in df else np.nan
@@ -138,6 +140,8 @@ def _add_targets(chunk: pd.DataFrame, args: argparse.Namespace, g_min: float, le
 
     geom_ok = g >= g_min
     df["y_viable"] = (viable_window & geom_ok).astype("int8")
+    if "lead_h" not in df.columns:
+        df["lead_h"] = float(lead_h_val)
 
     # Add lead-derived helper features for downstream model scoring if not present.
     horizon = float(args.horizon_max)
@@ -164,6 +168,7 @@ def main() -> None:
     ap.add_argument("--horizon-max", type=float, default=240.0, help="Max lead (hours) for viability window.")
     ap.add_argument("--g-min", type=float, default=None, help="Absolute G threshold. If set, bypass quantile.")
     ap.add_argument("--g-min-quantile", type=float, default=0.7, help="Quantile for G threshold when g-min not set.")
+    ap.add_argument("--lead-h", type=float, default=None, help="Optional constant lead_h to add (default: horizon-max).")
     ap.add_argument(
         "--chunksize",
         "--chunk-rows",
@@ -230,6 +235,7 @@ def main() -> None:
     print(f"[info] horizon_max={args.horizon_max} lead_col={args.lead_col}")
 
     writer = _Writer(Path(args.out))
+    lead_h_val = float(args.lead_h) if args.lead_h is not None else float(args.horizon_max)
     total_rows = 0
     total_pos = 0
     # track whether we had any positives; if not, we will relax threshold at end
@@ -237,7 +243,7 @@ def main() -> None:
     for i, chunk in enumerate(_iter_file(args.panel, args.chunksize), start=1):
         if chunk is None or chunk.empty:
             continue
-        out_chunk = _add_targets(chunk, args, g_min, lead_sign)
+        out_chunk = _add_targets(chunk, args, g_min, lead_sign, lead_h_val)
         pos_here = int(out_chunk["y_viable"].sum())
         total_pos += pos_here
         writer.write(out_chunk)
@@ -273,6 +279,7 @@ def main() -> None:
                 df_all["lead_norm"] = 1.0 - (lead_clip / horizon)
                 df_all["lead_inv"] = 1.0 / (1.0 + lead_clip)
                 df_all["G_lead_norm"] = _num(df_all[args.g_col]) * df_all["lead_norm"]
+                df_all["lead_h"] = lead_h_val
                 df_all.to_parquet(args.out, index=False) if _is_parquet(args.out) else df_all.to_csv(
                     args.out, index=False
                 )
@@ -287,6 +294,7 @@ def main() -> None:
                 df_all["lead_norm"] = 1.0 - (lead_clip / horizon)
                 df_all["lead_inv"] = 1.0 / (1.0 + lead_clip)
                 df_all["G_lead_norm"] = _num(df_all[args.g_col]) * df_all["lead_norm"]
+                df_all["lead_h"] = lead_h_val
                 df_all.to_parquet(args.out, index=False) if _is_parquet(args.out) else df_all.to_csv(
                     args.out, index=False
                 )
@@ -296,7 +304,7 @@ def main() -> None:
                 print("[fatal] No rows within lead window; cannot build viability labels.")
 
     if args.save_threshold_json:
-        meta = {"g_min": g_min, "g_min_quantile": args.g_min_quantile, "seed": args.seed}
+        meta = {"g_min": g_min, "g_min_quantile": args.g_min_quantile, "seed": args.seed, "lead_h": lead_h_val}
         Path(args.save_threshold_json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.save_threshold_json).write_text(json.dumps(meta, indent=2))
         print(f"[meta] saved threshold info -> {args.save_threshold_json}")

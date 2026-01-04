@@ -1267,12 +1267,15 @@ def main() -> int:
     # --- skill-by-lead ---
     skill_path = args.skill_by_lead
     if not skill_path:
-        candidate = Path(f"results/metrics/{args.run_name}_viability_leads.csv")
-        if candidate.exists():
-            skill_path = str(candidate)
+        for ext in ("parquet", "csv"):
+            candidate = Path(f"results/metrics/{args.run_name}_viability_leads.{ext}")
+            if candidate.exists():
+                skill_path = str(candidate)
+                break
     if skill_path and Path(skill_path).exists():
         skill = _read_any(skill_path)
         skill.to_parquet(out_dir / "skill_by_lead.parquet", index=False)
+        skill.to_csv(out_dir / "skill_by_lead.csv", index=False)
 
     # --- object fragmentation + hourly stats ---
     if Path(args.objects).exists():

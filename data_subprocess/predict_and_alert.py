@@ -119,7 +119,8 @@ def predict(path: str, args) -> None:
     if not features:
         raise SystemExit("No feature columns selected for prediction.")
 
-    columns_needed = {args.time_col, args.label_col, "lat", "lon", "G", "SFI", *features}
+    extra_cols = {"lead_h", "t_to_storm_min_h", "row_id", "cell_id", "ilat", "ilon"}
+    columns_needed = {args.time_col, args.label_col, "lat", "lon", "G", "SFI", *features, *extra_cols}
     columns_needed = [c for c in columns_needed if c in cols_all]
     writer = None
     first = True

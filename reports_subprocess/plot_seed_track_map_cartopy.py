@@ -9,9 +9,12 @@ New features:
 - Optional AOI or auto extent.
 - Optional color overlay by probability or any numeric column.
 - Optional background tiles (e.g. StamenTerrain) for context.
+- Optional direction arrows from bearing columns or seed drift.
 """
 
 import argparse
+import math
+import re
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -63,6 +66,35 @@ def _time_color_vals(df: pd.DataFrame, time_col: Optional[str]) -> tuple[Optiona
     return hours.to_numpy(), label
 
 
+def _safe_storm_id(value: object) -> str:
+    raw = str(value)
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_")
+    return safe or "storm"
+
+
+def _pick_direction_col(df: pd.DataFrame, override: Optional[str]) -> Optional[str]:
+    if override and override in df.columns:
+        return override
+    for cand in ("track_bearing_deg", "obj_motion_bearing_deg", "obj_flow_bearing_deg", "bearing_deg"):
+        if cand in df.columns:
+            return cand
+    return None
+
+
+def _direction_subset(df: pd.DataFrame, max_arrows: int, seed: int) -> pd.DataFrame:
+    if max_arrows and max_arrows > 0 and len(df) > max_arrows:
+        return df.sample(n=int(max_arrows), random_state=seed)
+    return df
+
+
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    if dlat == 0 and dlon == 0:
+        return float("nan")
+    return (math.degrees(math.atan2(dlon, dlat)) + 360.0) % 360.0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Plot seed-track matches on a map.")
     ap.add_argument("--matches", required=True, help="CSV/Parquet with seed-track matches.")
@@ -81,6 +113,11 @@ def main():
     ap.add_argument("--color-by-time", action="store_true", help="Color seeds by time (hours since first seed).")
     ap.add_argument("--time-col", default=None, help="Optional time column override for coloring.")
     ap.add_argument("--time-cmap", default="viridis", help="Colormap for time coloring.")
+    ap.add_argument("--direction-col", default=None, help="Optional bearing column (deg) for direction arrows.")
+    ap.add_argument("--direction-scale", type=float, default=0.6, help="Arrow length in degrees.")
+    ap.add_argument("--direction-color", default="tab:green", help="Color for direction arrows.")
+    ap.add_argument("--max-direction-arrows", type=int, default=0, help="Cap direction arrows (0 disables).")
+    ap.add_argument("--direction-seed", type=int, default=42, help="Random seed for arrow sampling.")
     ap.add_argument("--per-hour", action="store_true", help="Emit one map per hour when time is available.")
     ap.add_argument("--hour-step", type=int, default=1, help="Step between hours (e.g., 2 = every 2nd hour).")
     ap.add_argument("--max-frames", type=int, default=0, help="Limit frames (0 disables).")
@@ -139,6 +176,37 @@ def main():
         print("[seed-track-map] no valid coordinate rows; skipping plot.")
         return
 
+    dir_col = _pick_direction_col(df, args.direction_col)
+    if dir_col is None:
+        sid_col = args.storm_id_col
+        if sid_col is None:
+            for cand in ("storm_id", "name", "sid"):
+                if cand in df.columns:
+                    sid_col = cand
+                    break
+        if sid_col and time_col and sid_col in df.columns and time_col in df.columns:
+            dir_vals = pd.Series(index=df.index, dtype="float64")
+            for _, grp in df.groupby(sid_col, sort=False):
+                grp = grp.sort_values(time_col)
+                idxs = grp.index.to_list()
+                coords = grp[[lat_c, lon_c]].to_numpy()
+                for i, idx in enumerate(idxs):
+                    if i + 1 < len(coords):
+                        lat2, lon2 = coords[i + 1]
+                    elif i > 0:
+                        lat2, lon2 = coords[i - 1]
+                    else:
+                        dir_vals.loc[idx] = np.nan
+                        continue
+                    lat1, lon1 = coords[i]
+                    dir_vals.loc[idx] = _bearing_deg(float(lat1), float(lon1), float(lat2), float(lon2))
+            df["_dir_bearing"] = dir_vals
+            dir_col = "_dir_bearing"
+            print("[map] direction arrows from seed drift")
+    if dir_col:
+        df[dir_col] = pd.to_numeric(df[dir_col], errors="coerce")
+        print(f"[map] direction arrows from {dir_col}")
+
     # Extent
     if args.lon_range and args.lat_range:
         lon_min, lon_max = args.lon_range
@@ -167,6 +235,26 @@ def main():
                 cb.set_label(args.overlay_prob)
             else:
                 plt.scatter(ddf[lon_c], ddf[lat_c], s=12, c="tab:blue", alpha=0.6, label="Seeds")
+            if dir_col and dir_col in ddf.columns:
+                dir_vals = pd.to_numeric(ddf[dir_col], errors="coerce")
+                sub = ddf.loc[np.isfinite(dir_vals)]
+                sub = _direction_subset(sub, args.max_direction_arrows, args.direction_seed)
+                for _, r in sub.iterrows():
+                    bearing = math.radians(float(r[dir_col]))
+                    dx = args.direction_scale * math.sin(bearing)
+                    dy = args.direction_scale * math.cos(bearing)
+                    plt.arrow(
+                        r[lon_c],
+                        r[lat_c],
+                        dx,
+                        dy,
+                        width=0.03,
+                        head_width=0.12,
+                        head_length=0.12,
+                        color=args.direction_color,
+                        alpha=0.6,
+                        length_includes_head=True,
+                    )
             if lat_t and lon_t:
                 plt.scatter(ddf[lon_t], ddf[lat_t], s=20, c="tab:red", marker="x", label="Tracks")
             plt.xlabel("Longitude")
@@ -211,6 +299,27 @@ def main():
         else:
             ax.scatter(ddf[lon_c], ddf[lat_c], s=18, color="tab:blue", transform=ccrs.PlateCarree(),
                        alpha=0.7, label="Seeds")
+        if dir_col and dir_col in ddf.columns:
+            dir_vals = pd.to_numeric(ddf[dir_col], errors="coerce")
+            sub = ddf.loc[np.isfinite(dir_vals)]
+            sub = _direction_subset(sub, args.max_direction_arrows, args.direction_seed)
+            for _, r in sub.iterrows():
+                bearing = math.radians(float(r[dir_col]))
+                dx = args.direction_scale * math.sin(bearing)
+                dy = args.direction_scale * math.cos(bearing)
+                ax.arrow(
+                    r[lon_c],
+                    r[lat_c],
+                    dx,
+                    dy,
+                    width=0.03,
+                    head_width=0.12,
+                    head_length=0.12,
+                    color=args.direction_color,
+                    alpha=0.6,
+                    transform=ccrs.PlateCarree(),
+                    length_includes_head=True,
+                )
 
         if lat_t and lon_t:
             ax.scatter(ddf[lon_t], ddf[lat_t], s=25, color="tab:red", marker="x",
@@ -255,12 +364,17 @@ def main():
                                 break
                     if sid_col and sid_col in df.columns:
                         for sid, grp in df.groupby(sid_col):
+                            sid_safe = _safe_storm_id(sid)
                             for h in hours:
                                 sub = grp.loc[grp["_time_h"] == h]
                                 if sub.empty:
                                     continue
                                 stamp = pd.Timestamp(h).strftime("%Y%m%d%H")
-                                render(sub, f"{out_base}_storm_{sid}_{stamp}{ext}", f"Seed-Track Matches - {sid} {stamp}")
+                                render(
+                                    sub,
+                                    f"{out_base}_storm_{sid_safe}_{stamp}{ext}",
+                                    f"Seed-Track Matches - {sid} {stamp}",
+                                )
                         return
                 for h in hours:
                     sub = df.loc[df["_time_h"] == h]
@@ -282,7 +396,8 @@ def main():
             out_base = Path(args.out).with_suffix("")
             ext = Path(args.out).suffix or ".png"
             for sid, grp in df.groupby(sid_col):
-                render(grp, f"{out_base}_storm_{sid}{ext}", f"Seed–Track Matches — {sid}")
+                sid_safe = _safe_storm_id(sid)
+                render(grp, f"{out_base}_storm_{sid_safe}{ext}", f"Seed-Track Matches - {sid}")
             return
 
     # single map

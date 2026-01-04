@@ -259,8 +259,11 @@ def parse_args():
     ap.add_argument("--force-csv-out-when-chunking", action="store_true",
                     help="When input is CSV and out is Parquet, force a CSV(.gz) sibling. Otherwise error.")
     ap.add_argument("--run-name", default=None, help="Optional run name for default outputs (alerts_<run>_base.parquet).")
-    ap.add_argument("--passthrough-cols", default="row_id,ilat,ilon",
-                    help="Comma list of extra columns to keep if present (e.g., row_id,ilat,ilon).")
+    ap.add_argument(
+        "--passthrough-cols",
+        default="row_id,ilat,ilon,cell_id,lead_h,t_to_storm_min_h",
+        help="Comma list of extra columns to keep if present (e.g., row_id,ilat,ilon,lead_h).",
+    )
     argv = _preprocess_norm(sys.argv[1:])
     return ap.parse_args(argv)
 
@@ -338,6 +341,8 @@ def main():
         out = df_meta[keep_cols].copy()
         out[args.prob_col] = probs
         out[args.flag_col] = (out[args.prob_col] >= thr).astype(int)
+        if args.lead_hours is not None and "lead_h" not in out.columns:
+            out["lead_h"] = int(args.lead_hours)
 
         # drop invalid meta
         out["time"] = parse_time(out["time"], args.time_format)

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Iterable, Optional, Set
+from fnmatch import fnmatch
 
 import numpy as np
 import pandas as pd
@@ -41,6 +42,14 @@ except Exception:
 def _is_parquet(path: str) -> bool:
     low = path.lower()
     return low.endswith((".parquet", ".parq", ".pq"))
+
+
+def _peek_columns(path: str) -> list[str]:
+    if _is_parquet(path):
+        if pq is None:
+            return list(pd.read_parquet(path, nrows=1).columns)
+        return list(pq.ParquetFile(path).schema.names)
+    return list(pd.read_csv(path, nrows=1, low_memory=False).columns)
 
 
 def _iter_table(path: str, chunksize: Optional[int]) -> Iterable[pd.DataFrame]:
@@ -146,6 +155,16 @@ def parse_args() -> argparse.Namespace:
         help="Columns to keep (row_id always kept when present). Empty = keep all columns.",
     )
     ap.add_argument(
+        "--keep-prefixes",
+        default="",
+        help="Comma-separated prefixes to include when building keep-cols from schema.",
+    )
+    ap.add_argument(
+        "--drop-patterns",
+        default="",
+        help="Comma-separated glob patterns to drop from keep-cols (explicit keep-cols are preserved).",
+    )
+    ap.add_argument(
         "--chunksize",
         "--chunk-rows",
         "--chunk_rows",
@@ -161,6 +180,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow overwriting existing output file.",
     )
+    ap.add_argument(
+        "--skip-if-exists",
+        action="store_true",
+        help="Skip if output already exists (use --overwrite to rebuild).",
+    )
     return ap.parse_args()
 
 
@@ -169,8 +193,18 @@ def main() -> None:
 
     out_path = Path(args.out)
     if out_path.exists() and not args.overwrite:
-        print(f"[lookup] skip (exists, use --overwrite): {out_path}")
-        return
+        if args.skip_if_exists:
+            src_paths = [Path(args.source)]
+            if args.ids_file:
+                src_paths.append(Path(args.ids_file))
+            newest_src = max((p.stat().st_mtime for p in src_paths if p.exists()), default=None)
+            if newest_src is not None and out_path.stat().st_mtime < newest_src:
+                print(f"[lookup] output older than source; rebuilding {out_path}")
+            else:
+                print(f"[lookup] skip (exists, use --overwrite): {out_path}")
+                return
+        else:
+            raise SystemExit(f"[lookup] output exists: {out_path} (use --overwrite or --skip-if-exists)")
 
     ids: Set[object] = set()
     if not args.all_rows:
@@ -188,13 +222,40 @@ def main() -> None:
 
     # normalize keep-cols: split on commas, strip, dedupe while preserving order
     keep_cols: list[str] = []
+    explicit_cols: list[str] = []
     seen = set()
     for item in (args.keep_cols or []):
         for part in str(item).split(","):
             part = part.strip()
             if part and part not in seen:
                 keep_cols.append(part)
+                explicit_cols.append(part)
                 seen.add(part)
+
+    # build keep-cols from prefixes if requested
+    prefixes = [p.strip() for p in str(args.keep_prefixes).split(",") if p.strip()]
+    if prefixes:
+        schema_cols = _peek_columns(args.source)
+        pref = tuple(prefixes)
+        for col in schema_cols:
+            if col.startswith(pref) and col not in seen:
+                keep_cols.append(col)
+                seen.add(col)
+
+    # ensure id column is preserved when keep-cols are used
+    if keep_cols and args.ids_col not in keep_cols:
+        keep_cols.insert(0, args.ids_col)
+        explicit_cols.insert(0, args.ids_col)
+
+    # drop patterns (but preserve explicitly requested columns)
+    drop_patterns = [p.strip() for p in str(args.drop_patterns).split(",") if p.strip()]
+    if drop_patterns and keep_cols:
+        keep_cols = [
+            c
+            for c in keep_cols
+            if (c in explicit_cols)
+            or not any(fnmatch(c, pat) for pat in drop_patterns)
+        ]
 
     writer = _Writer(out_path)
     total_rows = 0

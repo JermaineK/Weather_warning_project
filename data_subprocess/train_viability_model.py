@@ -11,10 +11,12 @@ Default: logistic regression with balanced class weights.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
-from typing import List, Sequence
+from typing import List, Sequence, Optional, Dict
+from fnmatch import fnmatch
 
 HERE = Path(__file__).resolve()
 REPO_ROOT = HERE.parent.parent
@@ -35,6 +37,187 @@ from utils import model_versioning
 
 
 # Agent: baseline viable/not-viable fit; keep maths simple and interpretable.
+
+# Guardrails for leakage-prone columns.
+BLOCKLIST_DEFAULT = [
+    "storm*",
+    "track*",
+    "t_to_*",
+    "near_storm",
+    "row_id",
+    "time",
+    "time_hr",
+    "*_point",
+    "*_window",
+    "vmax*",
+    "dist*track*",
+]
+
+
+def _parse_csv_list(raw: str) -> List[str]:
+    return [p.strip() for p in str(raw).split(",") if p.strip()]
+
+
+def _blocked_features(features: Sequence[str], patterns: Sequence[str]) -> List[str]:
+    blocked: List[str] = []
+    for feat in features:
+        for pat in patterns:
+            if fnmatch(feat, pat):
+                blocked.append(feat)
+                break
+    return sorted(set(blocked))
+
+
+def _load_feature_manifest(path: str | None) -> List[dict]:
+    if not path:
+        return []
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"Feature manifest not found: {p}")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "features" in data:
+        return list(data["features"])
+    if isinstance(data, list):
+        return data
+    raise SystemExit(f"Invalid feature manifest format in {p}")
+
+
+def _feature_meta_for(feature: str, manifest: List[dict]) -> Optional[dict]:
+    exact = [m for m in manifest if str(m.get("name")) == feature]
+    if exact:
+        return exact[0]
+    for meta in manifest:
+        name = str(meta.get("name", ""))
+        if "*" in name or "?" in name:
+            if fnmatch(feature, name):
+                return meta
+    return None
+
+
+def _enforce_feature_manifest(
+    features: Sequence[str],
+    manifest_path: str | None,
+    require_metadata: bool,
+) -> None:
+    manifest = _load_feature_manifest(manifest_path)
+    if not manifest and require_metadata:
+        raise SystemExit("Feature manifest is required but empty or missing.")
+    if not manifest:
+        return
+    missing = []
+    non_causal = []
+    for feat in features:
+        meta = _feature_meta_for(feat, manifest)
+        if meta is None:
+            missing.append(feat)
+            continue
+        if meta.get("past_only") is False:
+            non_causal.append(feat)
+    if missing and require_metadata:
+        raise SystemExit(f"Missing feature metadata for: {missing}")
+    if non_causal:
+        raise SystemExit(f"Non-causal features are blocked for training: {non_causal}")
+
+
+def _resolve_key_paths(model_out: str, train_keys_out: str | None, val_keys_out: str | None) -> tuple[Path, Path]:
+    base = Path(model_out).with_suffix("")
+    train_path = Path(train_keys_out) if train_keys_out else base.with_name(base.name + "_train_keys.parquet")
+    val_path = Path(val_keys_out) if val_keys_out else base.with_name(base.name + "_val_keys.parquet")
+    return train_path, val_path
+
+
+def _write_keys(df: pd.DataFrame, key_cols: Sequence[str], out_path: Path) -> None:
+    if not key_cols:
+        return
+    keys = df[list(key_cols)].copy()
+    if "time" in keys.columns:
+        keys["time"] = pd.to_datetime(keys["time"], errors="coerce")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.suffix.lower() in {".parquet", ".parq", ".pq", ".pqt"}:
+        keys.to_parquet(out_path, index=False)
+    else:
+        keys.to_csv(out_path, index=False)
+
+
+def _count_overlap(train_keys: pd.DataFrame, val_keys: pd.DataFrame, key_cols: Sequence[str]) -> int:
+    merged = train_keys.merge(val_keys, on=list(key_cols), how="inner")
+    return int(len(merged))
+
+
+def _append_json_list(path: Path, entry: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: List[Dict[str, object]] = []
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                payload = loaded
+        except Exception:
+            payload = []
+    payload.append(entry)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _hash_feature_list(features: Sequence[str]) -> str:
+    raw = "\n".join(features)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _table_fingerprint(
+    df: pd.DataFrame,
+    cols: Sequence[str],
+    key_cols: Sequence[str],
+    sample_rows: int = 10_000,
+) -> str:
+    sample_cols = [c for c in cols if c in df.columns]
+    if not sample_cols:
+        return ""
+    sample = df[sample_cols].copy()
+    sort_cols = [c for c in key_cols if c in sample.columns]
+    if sort_cols:
+        sample = sample.sort_values(sort_cols)
+    if len(sample) > sample_rows:
+        sample = sample.head(sample_rows)
+    h = pd.util.hash_pandas_object(sample, index=True).values
+    return hashlib.sha256(h.tobytes()).hexdigest()
+
+
+def _lead_summary(df: pd.DataFrame, lead_col: str = "lead_h") -> Optional[object]:
+    if lead_col not in df.columns:
+        return None
+    vals = pd.to_numeric(df[lead_col], errors="coerce").dropna().unique().tolist()
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return float(vals[0])
+    if len(vals) <= 10:
+        return sorted(float(v) for v in vals)
+    return "mixed"
+
+
+def _infer_task_kind(raw: str, label: str, df: pd.DataFrame) -> str:
+    if raw and str(raw).lower() != "auto":
+        return str(raw).lower()
+    label_l = str(label).lower()
+    if "coincident" in label_l or "now" in label_l:
+        return "coincident"
+    if "lead" in label_l or "future" in label_l or "viable" in label_l:
+        return "lead"
+    if "t_to_storm_min_h" in df.columns or "lead_h" in df.columns:
+        return "lead"
+    return "coincident"
+
+
+def _label_sample(df: pd.DataFrame, key_cols: Sequence[str], label: str, n: int = 10) -> List[Dict[str, object]]:
+    cols = [c for c in key_cols if c in df.columns]
+    if label in df.columns:
+        cols.append(label)
+    if not cols:
+        return []
+    sample = df[cols].head(n).copy()
+    if "time" in sample.columns:
+        sample["time"] = sample["time"].astype(str)
+    return sample.to_dict(orient="records")
 
 def _load_table(path: str) -> pd.DataFrame:
     if path.lower().endswith((".parquet", ".parq", ".pq")):
@@ -182,6 +365,21 @@ def main() -> None:
         default=["G_struct", "S_shear", "E_energy"],
         help="Feature columns to use (space-separated or comma-separated).",
     )
+    ap.add_argument(
+        "--blocklist",
+        default="",
+        help="Comma-separated glob patterns to block from training features (added to defaults).",
+    )
+    ap.add_argument(
+        "--features-manifest",
+        default=None,
+        help="Optional JSON manifest mapping features to metadata (past_only, source, window).",
+    )
+    ap.add_argument(
+        "--require-feature-metadata",
+        action="store_true",
+        help="Fail if any training feature lacks manifest metadata.",
+    )
     ap.add_argument("--min-lead", type=float, default=None, help="Optional minimum lead (hours) to include (>=).")
     ap.add_argument("--max-lead", type=float, default=None, help="Optional maximum lead (hours) to include (<=).")
     ap.add_argument("--neg-pos-ratio", type=float, default=3.0, help="Max negatives per positive (0 disables).")
@@ -192,6 +390,34 @@ def main() -> None:
     ap.add_argument("--model-out", required=True, help="Output path for fitted model (.pkl).")
     ap.add_argument("--metrics-json", default=None, help="Where to write metrics JSON.")
     ap.add_argument("--coefs-csv", default=None, help="Where to write coefficient table CSV.")
+    ap.add_argument(
+        "--task-kind",
+        default="auto",
+        choices=["auto", "lead", "coincident"],
+        help="Task kind metadata for metrics (auto infers from label/data).",
+    )
+    ap.add_argument(
+        "--diagnostics-out-dir",
+        default="results/diagnostics",
+        help="Directory for diagnostics JSON outputs.",
+    )
+    ap.add_argument(
+        "--diagnostic-shuffle-labels",
+        action="store_true",
+        help="Train/eval with shuffled labels and fail if skill does not collapse.",
+    )
+    ap.add_argument(
+        "--key-cols",
+        default="time,ilat,ilon",
+        help="Comma-separated key columns to persist for overlap checks.",
+    )
+    ap.add_argument("--train-keys-out", default=None, help="Optional path to write train keys table.")
+    ap.add_argument("--val-keys-out", default=None, help="Optional path to write val keys table.")
+    ap.add_argument(
+        "--allow-overlap",
+        action="store_true",
+        help="Allow train/val key overlap (not recommended).",
+    )
     ap.add_argument("--model-dir", default=None, help="Base directory for versioned model outputs.")
     ap.add_argument("--run-name", default=None, help="Run name for versioned model subdir.")
     ap.add_argument("--run-id", default=None, help="Explicit version subdir name under model-dir.")
@@ -220,6 +446,8 @@ def main() -> None:
     # normalize features: allow comma-separated single arg or space list
     if len(args.features) == 1 and "," in args.features[0]:
         args.features = [f.strip() for f in args.features[0].split(",") if f.strip()]
+    key_cols = _parse_csv_list(args.key_cols)
+    block_patterns = BLOCKLIST_DEFAULT + _parse_csv_list(args.blocklist)
 
     # Agent: optional versioned outputs/provenance; training math unchanged.
     versioned = None
@@ -243,6 +471,10 @@ def main() -> None:
     else:
         df = _load_table(args.train)
 
+    missing_keys = [c for c in key_cols if c not in df.columns]
+    if missing_keys:
+        raise SystemExit(f"Missing key columns in training data: {missing_keys}")
+
     # Optional lead filtering to create horizon-specific models
     df = _filter_by_lead(df, args.min_lead, args.max_lead)
 
@@ -251,6 +483,16 @@ def main() -> None:
 
     df_fit = _subsample(df, args.target, args.neg_pos_ratio, args.sample_frac, args.seed, args.max_train_rows)
     print(f"[train] using {len(df_fit):,} rows after subsample (features={args.features})")
+
+    features = [f for f in args.features]
+    blocked = _blocked_features(features, block_patterns)
+    if blocked:
+        raise SystemExit(f"Blocked columns in training features: {blocked}")
+    features = [f for f in features if f not in key_cols]
+    if not features:
+        raise SystemExit("No feature columns selected after removing key columns.")
+    print(f"[train] feature list -> {features}")
+    _enforce_feature_manifest(features, args.features_manifest, args.require_feature_metadata)
 
     # Ensure we have both classes after subsampling; otherwise fall back to full data
     cls_counts = df_fit[args.target].value_counts(dropna=False)
@@ -270,19 +512,111 @@ def main() -> None:
             )
         print(f"[train] retry succeeded; using {len(df_fit):,} rows with class counts {cls_counts.to_dict()}")
 
-    X, y = _prepare_xy(df_fit, args.features, args.target)
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=args.test_size, random_state=args.seed, stratify=y)
+    task_kind = _infer_task_kind(args.task_kind, args.target, df_fit)
+    if task_kind == "lead" and "coincident" in str(args.target).lower():
+        raise SystemExit("Target column looks coincident but task_kind=lead; check training label selection.")
+    y_vals = pd.to_numeric(df_fit[args.target], errors="coerce").fillna(0).astype(int)
+    y_nunique = int(y_vals.nunique(dropna=True))
+    if y_nunique < 2:
+        raise SystemExit(f"Target '{args.target}' is constant after sampling; check upstream labels.")
+    feature_set_id = _hash_feature_list(features)
+    table_fingerprint = _table_fingerprint(df_fit, list(features) + [args.target] + list(key_cols), key_cols)
+    lead_summary = _lead_summary(df_fit, "lead_h")
+    label_entry = {
+        "model_kind": "train-viability",
+        "label_col": args.target,
+        "task_kind": task_kind,
+        "y_mean": float(y_vals.mean()),
+        "y_sum": int(y_vals.sum()),
+        "y_nunique": y_nunique,
+        "n_rows": int(len(df_fit)),
+        "feature_count": int(len(features)),
+        "features": list(features),
+        "key_cols": list(key_cols),
+        "lead_h": lead_summary,
+        "feature_set_id": feature_set_id,
+        "table_fingerprint": table_fingerprint,
+        "label_sample": _label_sample(df_fit, key_cols, args.target),
+    }
+    diag_dir = Path(args.diagnostics_out_dir)
+    _append_json_list(diag_dir / "train_label_summary.json", label_entry)
+    feat_preview = ", ".join(list(features)[:20])
+    if len(features) > 20:
+        feat_preview += ", ..."
+    print(f"[train] label={args.target} mean={label_entry['y_mean']:.4f} sum={label_entry['y_sum']} "
+          f"nunique={label_entry['y_nunique']}")
+    print(f"[train] features ({len(features)}): {feat_preview}")
+
+    X, y = _prepare_xy(df_fit, features, args.target)
+    idx_train, idx_val = train_test_split(
+        df_fit.index, test_size=args.test_size, random_state=args.seed, stratify=y
+    )
+    df_train = df_fit.loc[idx_train]
+    df_val = df_fit.loc[idx_val]
+
+    if key_cols:
+        for c in key_cols:
+            if c not in df_fit.columns:
+                raise SystemExit(f"Key column '{c}' not found in training data.")
+        train_keys_out, val_keys_out = _resolve_key_paths(args.model_out, args.train_keys_out, args.val_keys_out)
+        train_keys = df_train[list(key_cols)].copy()
+        val_keys = df_val[list(key_cols)].copy()
+        overlap = _count_overlap(train_keys, val_keys, key_cols)
+        _write_keys(train_keys, key_cols, train_keys_out)
+        _write_keys(val_keys, key_cols, val_keys_out)
+        if overlap > 0 and not args.allow_overlap:
+            raise SystemExit(f"Train/val overlap detected: {overlap} rows (keys written).")
+
+    X_train, y_train = _prepare_xy(df_train, features, args.target)
+    X_val, y_val = _prepare_xy(df_val, features, args.target)
 
     model = _fit_model(X_train, y_train, args.C, args.seed)
     train_metrics = _metrics(model, X_train, y_train)
     val_metrics = _metrics(model, X_val, y_val)
+
+    if args.diagnostic_shuffle_labels:
+        rng = np.random.default_rng(args.seed)
+        y_shuf = rng.permutation(y_train)
+        shuffle_model = _fit_model(X_train, y_shuf, args.C, args.seed)
+        shuffle_metrics = _metrics(shuffle_model, X_val, y_val)
+        base_rate = float(np.mean(y_val)) if len(y_val) else float("nan")
+        shuffle_entry = {
+            "model_kind": "train-viability",
+            "label_col": args.target,
+            "task_kind": task_kind,
+            "feature_set_id": feature_set_id,
+            "table_fingerprint": table_fingerprint,
+            "lead_h": lead_summary,
+            "base_rate": base_rate,
+            "shuffle_roc_auc": shuffle_metrics.get("roc_auc"),
+            "shuffle_avg_precision": shuffle_metrics.get("avg_precision"),
+        }
+        _append_json_list(Path(args.diagnostics_out_dir) / "shuffle_test_metrics.json", shuffle_entry)
+        auc = shuffle_metrics.get("roc_auc")
+        prauc = shuffle_metrics.get("avg_precision")
+        auc_ok = (auc is None) or (not np.isfinite(auc)) or (auc <= 0.6)
+        pr_ok = (prauc is None) or (not np.isfinite(prauc)) or (abs(float(prauc) - base_rate) <= 0.05)
+        if not (auc_ok and pr_ok):
+            raise SystemExit(
+                f"Shuffled-label test did not collapse (auc={auc}, prauc={prauc}, base_rate={base_rate})."
+            )
 
     out_model = Path(args.model_out)
     out_model.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, out_model)
     print(f"[save] model -> {out_model}")
 
-    metrics = {"train": train_metrics, "val": val_metrics, "features": list(args.features), "target": args.target}
+    metrics = {
+        "train": train_metrics,
+        "val": val_metrics,
+        "features": list(features),
+        "target": args.target,
+        "label_col": args.target,
+        "task_kind": task_kind,
+        "lead_h": lead_summary,
+        "feature_set_id": feature_set_id,
+        "table_fingerprint": table_fingerprint,
+    }
     if args.metrics_json:
         Path(args.metrics_json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.metrics_json).write_text(json.dumps(metrics, indent=2))
@@ -299,7 +633,7 @@ def main() -> None:
         versioned_outputs.append(version_metrics)
 
     if args.coefs_csv:
-        coef_df = _coeff_table(model, args.features)
+        coef_df = _coeff_table(model, features)
         Path(args.coefs_csv).parent.mkdir(parents=True, exist_ok=True)
         coef_path = Path(args.coefs_csv)
         if coef_path.suffix.lower() in {".parquet", ".parq", ".pq", ".pqt"}:

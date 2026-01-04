@@ -11,10 +11,12 @@ chunking with projection + sampling).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple, Optional
+from fnmatch import fnmatch
 
 HERE = Path(__file__).resolve()
 REPO_ROOT = HERE.parent.parent
@@ -39,6 +41,191 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     pa = None
     ds = None
+
+
+# ---------------------------------------------------------------------------#
+# Guardrails                                                                 #
+# ---------------------------------------------------------------------------#
+
+BLOCKLIST_DEFAULT = [
+    "storm*",
+    "track*",
+    "t_to_*",
+    "near_storm",
+    "row_id",
+    "time",
+    "time_hr",
+    "*_point",
+    "*_window",
+    "vmax*",
+    "dist*track*",
+]
+
+
+def _parse_csv_list(raw: str) -> List[str]:
+    return [p.strip() for p in str(raw).split(",") if p.strip()]
+
+
+def _blocked_features(features: Sequence[str], patterns: Sequence[str]) -> List[str]:
+    blocked: List[str] = []
+    for feat in features:
+        for pat in patterns:
+            if fnmatch(feat, pat):
+                blocked.append(feat)
+                break
+    return sorted(set(blocked))
+
+
+def _load_feature_manifest(path: str | None) -> List[Dict[str, object]]:
+    if not path:
+        return []
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"Feature manifest not found: {p}")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "features" in data:
+        return list(data["features"])
+    if isinstance(data, list):
+        return data
+    raise SystemExit(f"Invalid feature manifest format in {p}")
+
+
+def _feature_meta_for(feature: str, manifest: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    exact = [m for m in manifest if str(m.get("name")) == feature]
+    if exact:
+        return exact[0]
+    for meta in manifest:
+        name = str(meta.get("name", ""))
+        if "*" in name or "?" in name:
+            if fnmatch(feature, name):
+                return meta
+    return None
+
+
+def _enforce_feature_manifest(
+    features: Sequence[str],
+    manifest_path: str | None,
+    require_metadata: bool,
+) -> None:
+    manifest = _load_feature_manifest(manifest_path)
+    if not manifest and require_metadata:
+        raise SystemExit("Feature manifest is required but empty or missing.")
+    if not manifest:
+        return
+    missing = []
+    non_causal = []
+    for feat in features:
+        meta = _feature_meta_for(feat, manifest)
+        if meta is None:
+            missing.append(feat)
+            continue
+        if meta.get("past_only") is False:
+            non_causal.append(feat)
+    if missing and require_metadata:
+        raise SystemExit(f"Missing feature metadata for: {missing}")
+    if non_causal:
+        raise SystemExit(f"Non-causal features are blocked for training: {non_causal}")
+
+
+def _resolve_key_paths(model_out: str, train_keys_out: str | None, val_keys_out: str | None) -> Tuple[Path, Path]:
+    base = Path(model_out).with_suffix("")
+    train_path = Path(train_keys_out) if train_keys_out else base.with_name(base.name + "_train_keys.parquet")
+    val_path = Path(val_keys_out) if val_keys_out else base.with_name(base.name + "_val_keys.parquet")
+    return train_path, val_path
+
+
+def _write_keys(df: pd.DataFrame, key_cols: Sequence[str], out_path: Path) -> None:
+    if not key_cols:
+        return
+    keys = df[list(key_cols)].copy()
+    if "time" in keys.columns:
+        keys["time"] = pd.to_datetime(keys["time"], errors="coerce")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.suffix.lower() in {".parquet", ".parq", ".pq", ".pqt"}:
+        keys.to_parquet(out_path, index=False)
+    else:
+        keys.to_csv(out_path, index=False)
+
+
+def _count_overlap(train_keys: pd.DataFrame, val_keys: pd.DataFrame, key_cols: Sequence[str]) -> int:
+    merged = train_keys.merge(val_keys, on=list(key_cols), how="inner")
+    return int(len(merged))
+
+
+def _append_json_list(path: Path, entry: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: List[Dict[str, object]] = []
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                payload = loaded
+        except Exception:
+            payload = []
+    payload.append(entry)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _hash_feature_list(features: Sequence[str]) -> str:
+    raw = "\n".join(features)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _table_fingerprint(
+    df: pd.DataFrame,
+    cols: Sequence[str],
+    key_cols: Sequence[str],
+    sample_rows: int = 10_000,
+) -> str:
+    sample_cols = [c for c in cols if c in df.columns]
+    if not sample_cols:
+        return ""
+    sample = df[sample_cols].copy()
+    sort_cols = [c for c in key_cols if c in sample.columns]
+    if sort_cols:
+        sample = sample.sort_values(sort_cols)
+    if len(sample) > sample_rows:
+        sample = sample.head(sample_rows)
+    h = pd.util.hash_pandas_object(sample, index=True).values
+    return hashlib.sha256(h.tobytes()).hexdigest()
+
+
+def _lead_summary(df: pd.DataFrame, lead_col: str = "lead_h") -> Optional[object]:
+    if lead_col not in df.columns:
+        return None
+    vals = pd.to_numeric(df[lead_col], errors="coerce").dropna().unique().tolist()
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return float(vals[0])
+    if len(vals) <= 10:
+        return sorted(float(v) for v in vals)
+    return "mixed"
+
+
+def _infer_task_kind(raw: str, label: str, df: pd.DataFrame) -> str:
+    if raw and str(raw).lower() != "auto":
+        return str(raw).lower()
+    label_l = str(label).lower()
+    if "coincident" in label_l or "now" in label_l:
+        return "coincident"
+    if "lead" in label_l or "future" in label_l or "viable" in label_l:
+        return "lead"
+    if "t_to_storm_min_h" in df.columns or "lead_h" in df.columns:
+        return "lead"
+    return "coincident"
+
+
+def _label_sample(df: pd.DataFrame, key_cols: Sequence[str], label: str, n: int = 10) -> List[Dict[str, object]]:
+    cols = [c for c in key_cols if c in df.columns]
+    if label in df.columns:
+        cols.append(label)
+    if not cols:
+        return []
+    sample = df[cols].head(n).copy()
+    if "time" in sample.columns:
+        sample["time"] = sample["time"].astype(str)
+    return sample.to_dict(orient="records")
 
 
 # ---------------------------------------------------------------------------#
@@ -113,6 +300,7 @@ def _collect_data(
     features: Sequence[str],
     label: str,
     time_col: str,
+    key_cols: Sequence[str],
     chunk_rows: int | None,
     parquet_rows: int | None,
     sample_frac: float,
@@ -120,7 +308,7 @@ def _collect_data(
     neg_pos_ratio: float,
     seed: int,
 ) -> pd.DataFrame:
-    cols = list(set(features) | {label, time_col})
+    cols = list(set(features) | set(key_cols) | {label, time_col})
     parts: List[pd.DataFrame] = []
     total_seen = 0
     rng = np.random.default_rng(seed)
@@ -236,7 +424,34 @@ def parse_args():
         help="Comma-separated prefixes for auto feature selection when --features not set.",
     )
     ap.add_argument("--exclude-cols", default="", help="Comma-separated columns to drop from features.")
+    ap.add_argument(
+        "--blocklist",
+        default="",
+        help="Comma-separated glob patterns to block from training features (added to defaults).",
+    )
+    ap.add_argument(
+        "--features-manifest",
+        default=None,
+        help="Optional JSON manifest mapping features to metadata (past_only, source, window).",
+    )
+    ap.add_argument(
+        "--require-feature-metadata",
+        action="store_true",
+        help="Fail if any training feature lacks manifest metadata.",
+    )
     ap.add_argument("--time-col", default="time")
+    ap.add_argument(
+        "--key-cols",
+        default="time,ilat,ilon",
+        help="Comma-separated key columns to persist for overlap checks.",
+    )
+    ap.add_argument("--train-keys-out", default=None, help="Optional path to write train keys table.")
+    ap.add_argument("--val-keys-out", default=None, help="Optional path to write val keys table.")
+    ap.add_argument(
+        "--allow-overlap",
+        action="store_true",
+        help="Allow train/val key overlap (not recommended).",
+    )
     ap.add_argument("--train-end", default=None, help="Time boundary for train (<= train_end).")
     ap.add_argument("--val-end", default=None, help="Time boundary for validation (>train_end and <= val_end).")
     ap.add_argument("--sample-frac", type=float, default=1.0, help="Optional overall subsample fraction.")
@@ -250,6 +465,22 @@ def parse_args():
     ap.add_argument("--model-out", required=True, help="Where to write fitted model (joblib).")
     ap.add_argument("--metrics-out", default=None, help="Optional JSON metrics output.")
     ap.add_argument("--importance-out", default=None, help="Optional CSV of feature importances if available.")
+    ap.add_argument(
+        "--task-kind",
+        default="auto",
+        choices=["auto", "lead", "coincident"],
+        help="Task kind metadata for metrics (auto infers from label/data).",
+    )
+    ap.add_argument(
+        "--diagnostics-out-dir",
+        default="results/diagnostics",
+        help="Directory for diagnostics JSON outputs.",
+    )
+    ap.add_argument(
+        "--diagnostic-shuffle-labels",
+        action="store_true",
+        help="Train/eval with shuffled labels and fail if skill does not collapse.",
+    )
     ap.add_argument("--model-dir", default=None, help="Base directory for versioned model outputs.")
     ap.add_argument("--run-name", default=None, help="Run name for versioned model subdir.")
     ap.add_argument("--run-id", default=None, help="Explicit version subdir name under model-dir.")
@@ -272,6 +503,8 @@ def main():
     args = parse_args()
     prefixes = [p.strip() for p in args.include_prefixes.split(",") if p.strip()]
     exclude = {c.strip() for c in args.exclude_cols.split(",") if c.strip()}
+    key_cols = _parse_csv_list(args.key_cols)
+    block_patterns = BLOCKLIST_DEFAULT + _parse_csv_list(args.blocklist)
 
     # Agent: optional versioned outputs/provenance; training math unchanged.
     versioned = None
@@ -290,6 +523,9 @@ def main():
             "Upstream step is likely missing: ensure the labelled table (e.g., join-labels-grid) "
             "was run so storm/near_storm/pregen labels exist before training."
         )
+    missing_keys = [c for c in key_cols if c not in cols]
+    if missing_keys:
+        raise SystemExit(f"Missing key columns in training data: {missing_keys}")
 
     features = args.features
     if not features:
@@ -297,12 +533,18 @@ def main():
     features = [f for f in features if f not in exclude]
     if not features:
         raise SystemExit("No feature columns selected.")
+    blocked = _blocked_features(features, block_patterns)
+    if blocked:
+        raise SystemExit(f"Blocked columns in training features: {blocked}")
+    features = [f for f in features if f not in key_cols]
+    _enforce_feature_manifest(features, args.features_manifest, args.require_feature_metadata)
 
     df = _collect_data(
         args.train,
         features,
         args.label,
         args.time_col,
+        key_cols,
         args.chunksize,
         args.parquet_rows,
         args.sample_frac,
@@ -312,6 +554,41 @@ def main():
     )
     if df.empty:
         raise SystemExit("Training data is empty after filtering/sampling.")
+
+    task_kind = _infer_task_kind(args.task_kind, args.label, df)
+    if task_kind == "lead" and "coincident" in str(args.label).lower():
+        raise SystemExit("Label column looks coincident but task_kind=lead; check training label selection.")
+    y_vals = pd.to_numeric(df[args.label], errors="coerce").fillna(0).astype(int)
+    y_nunique = int(y_vals.nunique(dropna=True))
+    if y_nunique < 2:
+        raise SystemExit(f"Label '{args.label}' is constant after sampling; check upstream labels.")
+    feature_set_id = _hash_feature_list(features)
+    table_fingerprint = _table_fingerprint(df, list(features) + [args.label] + list(key_cols), key_cols)
+    lead_summary = _lead_summary(df, "lead_h")
+    label_entry = {
+        "model_kind": "train-base",
+        "label_col": args.label,
+        "task_kind": task_kind,
+        "y_mean": float(y_vals.mean()),
+        "y_sum": int(y_vals.sum()),
+        "y_nunique": y_nunique,
+        "n_rows": int(len(df)),
+        "feature_count": int(len(features)),
+        "features": list(features),
+        "key_cols": list(key_cols),
+        "lead_h": lead_summary,
+        "feature_set_id": feature_set_id,
+        "table_fingerprint": table_fingerprint,
+        "label_sample": _label_sample(df, key_cols, args.label),
+    }
+    diag_dir = Path(args.diagnostics_out_dir)
+    _append_json_list(diag_dir / "train_label_summary.json", label_entry)
+    feat_preview = ", ".join(list(features)[:20])
+    if len(features) > 20:
+        feat_preview += ", ..."
+    print(f"[train-base] label={args.label} mean={label_entry['y_mean']:.4f} sum={label_entry['y_sum']} "
+          f"nunique={label_entry['y_nunique']}")
+    print(f"[train-base] features ({len(features)}): {feat_preview}")
 
     time_series = pd.to_datetime(df[args.time_col], errors="coerce")
     if args.train_end:
@@ -330,6 +607,19 @@ def main():
     df_train = df.loc[train_mask]
     df_val = df.loc[val_mask]
 
+    if key_cols:
+        for c in key_cols:
+            if c not in df.columns:
+                raise SystemExit(f"Key column '{c}' not found in training data.")
+        train_keys_out, val_keys_out = _resolve_key_paths(args.model_out, args.train_keys_out, args.val_keys_out)
+        train_keys = df_train[list(key_cols)].copy()
+        val_keys = df_val[list(key_cols)].copy()
+        overlap = _count_overlap(train_keys, val_keys, key_cols)
+        _write_keys(train_keys, key_cols, train_keys_out)
+        _write_keys(val_keys, key_cols, val_keys_out)
+        if overlap > 0 and not args.allow_overlap:
+            raise SystemExit(f"Train/val overlap detected: {overlap} rows (keys written).")
+
     X_train, y_train = _prep_xy(df_train, features, args.label)
     X_val, y_val = _prep_xy(df_val, features, args.label)
 
@@ -345,6 +635,33 @@ def main():
         calibrated.fit(X_val, y_val)
         prob_cal = calibrated.predict_proba(X_val)[:, 1]
         metrics.update(_metrics(y_val, prob_cal, "calibrated"))
+
+    if args.diagnostic_shuffle_labels:
+        rng = np.random.default_rng(args.seed)
+        y_shuf = rng.permutation(y_train)
+        shuffle_model = _fit_base_model(X_train, y_shuf, args.learning_rate, args.max_depth, args.max_leaf_nodes, args.seed)
+        shuffle_prob = shuffle_model.predict_proba(X_val)[:, 1]
+        shuffle_metrics = _metrics(y_val, shuffle_prob, "shuffle")
+        base_rate = float(np.mean(y_val)) if len(y_val) else float("nan")
+        shuffle_entry = {
+            "model_kind": "train-base",
+            "label_col": args.label,
+            "task_kind": task_kind,
+            "feature_set_id": feature_set_id,
+            "table_fingerprint": table_fingerprint,
+            "lead_h": lead_summary,
+            "base_rate": base_rate,
+            **shuffle_metrics,
+        }
+        _append_json_list(Path(args.diagnostics_out_dir) / "shuffle_test_metrics.json", shuffle_entry)
+        auc = shuffle_metrics.get("shuffle_roc_auc")
+        prauc = shuffle_metrics.get("shuffle_avg_precision")
+        auc_ok = (auc is None) or (not np.isfinite(auc)) or (auc <= 0.6)
+        pr_ok = (prauc is None) or (not np.isfinite(prauc)) or (abs(float(prauc) - base_rate) <= 0.05)
+        if not (auc_ok and pr_ok):
+            raise SystemExit(
+                f"Shuffled-label test did not collapse (auc={auc}, prauc={prauc}, base_rate={base_rate})."
+            )
 
     Path(args.model_out).parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, args.model_out)
@@ -377,6 +694,12 @@ def main():
         "max_rows": args.max_rows,
     }
     metrics.update({f"meta_{k}": v for k, v in metadata.items()})
+    metrics["features"] = list(features)
+    metrics["label_col"] = args.label
+    metrics["task_kind"] = task_kind
+    metrics["lead_h"] = lead_summary
+    metrics["feature_set_id"] = feature_set_id
+    metrics["table_fingerprint"] = table_fingerprint
     if args.metrics_out:
         Path(args.metrics_out).parent.mkdir(parents=True, exist_ok=True)
         with open(args.metrics_out, "w", encoding="utf-8") as f:

@@ -58,6 +58,17 @@ Manager flags (common):
   --slowtick-alerts-dir          # Alerts directory (throttled/denoised/base).
   --slowtick-leads               # Comma list of leads (e.g., 24,48,72,120,240).
   --slowtick-out-subdir          # Subfolder under run folder for outputs (default: slowtick).
+  --slowtick-thresholds          # Optional thresholds table for per-lead flags.
+  --slowtick-threshold-col       # Threshold column to use (default: thr_Fbeta).
+  --slowtick-prob-col            # Probability column for derived per-lead flags.
+  --slowtick-cache-fallback      # Cache fallback alerts in memory for reuse.
+--diagnostics                    # Optional: run read-only diagnostics bundle.
+  --diagnostics-out              # Override output folder (default: run/diagnostics).
+  --diagnostics-train-table      # Training table for lead/hash + feature checks.
+  --diagnostics-train-keys       # Train key table for overlap checks.
+  --diagnostics-val-keys         # Val key table for overlap checks.
+  --diagnostics-metrics-json     # Metrics JSON with feature list.
+  --diagnostics-feature-meta     # Optional feature metadata JSON.
 
 
 2. Script: report_generate_summary.py
@@ -161,5 +172,23 @@ Outputs:
 
 Stdout report
 Non-zero exit if strict and issues found
+
+
+8. Script: run_diagnostics.py
+Read-only forensic checks on a completed run folder + key artifacts.
+Inputs (auto-detected where possible):
+
+--run-dir
+--run-name
+--alerts-dir
+--train-table (optional)
+--train-keys / --val-keys (optional)
+--metrics-json (optional)
+--feature-metadata (optional)
+
+Outputs:
+
+<run>/diagnostics/diagnostics.json
+<run>/diagnostics/diagnostics_summary.md
 
 

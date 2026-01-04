@@ -1253,6 +1253,14 @@ def main() -> int:
         corr_overall = _read_any(corr_overall_path)
     corr_df = _weird_correlations(tables_dir)
 
+    # Viability skill-by-lead (from report_pack)
+    skill_by_lead = pd.DataFrame()
+    skill_path = tables_dir / "skill_by_lead.parquet"
+    if not skill_path.exists():
+        skill_path = tables_dir / "skill_by_lead.csv"
+    if skill_path.exists():
+        skill_by_lead = _read_any(skill_path)
+
     # Agent: surface slow-tick diagnostics in the report without feeding any model logic.
     slowtick_summary = pd.DataFrame()
     slowtick_spectrum = pd.DataFrame()
@@ -1390,6 +1398,11 @@ def main() -> int:
             lines.append("```text")
             lines.extend(metric_lines)
             lines.append("```")
+
+    if not skill_by_lead.empty:
+        lines.append("")
+        lines.append("## Viability Skill by Lead")
+        lines.append(_markdown_table(skill_by_lead, max_rows=20))
 
     if not proto_outcomes.empty:
         lines.append("")
@@ -1703,6 +1716,7 @@ def main() -> int:
         "viability_thresholds": viability_thresholds.to_dict(orient="records") if not viability_thresholds.empty else [],
         "viability_sweep_diagnostics": viability_sweep_diag.to_dict(orient="records") if not viability_sweep_diag.empty else [],
         "viability_metrics": viability_metrics.get("raw") if viability_metrics else {},
+        "viability_skill_by_lead": skill_by_lead.to_dict(orient="records") if not skill_by_lead.empty else [],
         "proto_outcomes": proto_outcomes.to_dict(orient="records") if not proto_outcomes.empty else [],
         "slowtick_union": slowtick_union,
         "extras": extras,

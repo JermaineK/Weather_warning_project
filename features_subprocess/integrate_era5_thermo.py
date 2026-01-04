@@ -44,6 +44,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils import io_common
+from utils import join_audit
 
 pd.options.mode.copy_on_write = True
 
@@ -484,6 +485,12 @@ def parse_args():
                     help="(Currently a no-op: exact (time,lat,lon) merge is used.)")
     ap.add_argument("--nearest-maxdeg", type=float, default=0.4,
                     help="Unused placeholder for future nearest-neighbour matching.")
+    ap.add_argument("--join-audit-out", default="results/diagnostics/join_audit.json",
+                    help="Optional JSON path for join audit logging.")
+    ap.add_argument("--allow-many-to-many", action="store_true",
+                    help="Allow many-to-many joins without failing.")
+    ap.add_argument("--allow-row-explosion", action="store_true",
+                    help="Allow output row growth beyond input chunks.")
     return ap.parse_args()
 
 
@@ -541,6 +548,13 @@ def main():
     writer = _ChunkedWriter(out_path, overwrite=args.overwrite)
     col_order = None
     rows_written = 0
+    # Agent: join audit counters (no math changes).
+    audit_left_rows = 0
+    audit_out_rows = 0
+    audit_left_dupe = 0
+    audit_right_dupe_max = 0
+    audit_row_explode_chunks = 0
+    audit_chunks = 0
 
     for i, raw_chunk in enumerate(_iter_feature_chunks(feat_path, chunk_rows, parquet_rows=parquet_rows), start=1):
         if raw_chunk is None or len(raw_chunk) == 0:
@@ -566,6 +580,33 @@ def main():
             merged = chunk.copy()
         merged = _apply_thermo_columns(merged)
 
+        # Join audit per-chunk (fail fast on explosions).
+        left_dupe = int(chunk.duplicated(subset=["time", "lat", "lon"]).sum())
+        right_dupe = int(thermo_slice.duplicated(subset=["time", "lat", "lon"]).sum()) if thermo_slice is not None else 0
+        chunk_entry = join_audit.build_entry(
+            step="features.integrate-thermo",
+            keys=["time", "lat", "lon"],
+            join_type="left",
+            left_rows=len(chunk),
+            right_rows=len(thermo_slice) if thermo_slice is not None else 0,
+            out_rows=len(merged),
+            left_dupe_keys=left_dupe,
+            right_dupe_keys=right_dupe,
+            extra={"chunk": i},
+        )
+        join_audit.enforce(
+            chunk_entry,
+            allow_many_to_many=args.allow_many_to_many,
+            allow_row_explosion=args.allow_row_explosion,
+        )
+        if chunk_entry.get("row_explosion"):
+            audit_row_explode_chunks += 1
+        audit_left_dupe += left_dupe
+        audit_right_dupe_max = max(audit_right_dupe_max, right_dupe)
+        audit_left_rows += len(chunk)
+        audit_out_rows += len(merged)
+        audit_chunks += 1
+
         if col_order is None:
             col_order = list(merged.columns)
         else:
@@ -584,6 +625,23 @@ def main():
         del raw_chunk, chunk, merged, thermo_slice
 
     writer.close()
+    audit_entry = join_audit.build_entry(
+        step="features.integrate-thermo",
+        keys=["time", "lat", "lon"],
+        join_type="left",
+        left_rows=audit_left_rows,
+        right_rows=thermo_rows_total,
+        out_rows=audit_out_rows,
+        left_dupe_keys=audit_left_dupe,
+        right_dupe_keys=audit_right_dupe_max,
+        extra={
+            "chunks": audit_chunks,
+            "row_explosion_chunks": audit_row_explode_chunks,
+            "features_path": str(feat_path),
+            "out_path": str(out_path),
+        },
+    )
+    join_audit.append_entry(args.join_audit_out, audit_entry)
     print(f"[integrate] wrote {out_path} rows={rows_written:,} thermo_rows={thermo_rows_total:,}", flush=True)
 
 
