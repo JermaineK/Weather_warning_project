@@ -24,6 +24,8 @@ import hashlib
 import json
 import os
 import shutil
+import shlex
+import re
 import sys
 import subprocess
 from datetime import datetime, timezone
@@ -486,8 +488,17 @@ def _load_stage_manifest_for_autofix(run_name: str | None) -> tuple[Dict[str, An
         "pipeline_code_sha256": data.get("pipeline_code_sha256"),
         "config_sha256": data.get("config_sha256"),
         "git_commit": data.get("git_commit"),
+        "log_path": data.get("log_path"),
     }
     return (stages if isinstance(stages, dict) else {}), meta
+
+
+def _load_run_manifest(run_name: str | None) -> Dict[str, Any]:
+    if not run_name:
+        return {}
+    safe_run = _safe_run_name(run_name)
+    path = Path("results/runs") / safe_run / "manifests" / "stages.json"
+    return _load_json(path)
 
 
 def _autofix_stale_reason(
@@ -539,6 +550,207 @@ def _load_diagnostics_checks(run_name: str | None) -> List[Dict[str, Any]]:
     data = _load_json(chosen)
     checks = data.get("checks", [])
     return checks if isinstance(checks, list) else []
+
+
+def _normalize_path_str(value: str) -> str:
+    return str(value).strip().replace("\\", "/").lower()
+
+
+def _latest_log_path(run_name: str | None, manifest: Dict[str, Any]) -> Path | None:
+    if manifest.get("log_path"):
+        p = Path(str(manifest.get("log_path")))
+        if p.exists():
+            return p
+    if not run_name:
+        return None
+    safe_run = _safe_run_name(run_name)
+    log_dir = Path("results/runs") / safe_run / "logs"
+    if not log_dir.exists():
+        return None
+    candidates = [p for p in log_dir.glob("*.log") if p.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _cmd_to_section_mode(cmd_line: str) -> tuple[str, str] | None:
+    if not cmd_line:
+        return None
+    try:
+        tokens = shlex.split(cmd_line, posix=False)
+    except Exception:
+        tokens = cmd_line.split()
+    if not tokens:
+        return None
+    script_idx = None
+    for i, tok in enumerate(tokens):
+        if str(tok).lower().endswith(".py"):
+            script_idx = i
+            break
+    if script_idx is None:
+        return None
+    script = Path(tokens[script_idx]).name.lower()
+    manager_map = {
+        "features_manager.py": "features",
+        "data_stage_manager.py": "data_stage",
+        "training_manager.py": "training",
+        "alerts_logic_manager.py": "alerts_logic",
+        "sweep_manager.py": "sweep",
+        "eval_manager.py": "eval",
+        "seeds_tracks.py": "seeds",
+        "reports_and_maps_manager.py": "report",
+    }
+    section = manager_map.get(script)
+    if not section:
+        return None
+    mode = None
+    for tok in tokens[script_idx + 1:]:
+        if str(tok).startswith("-"):
+            continue
+        mode = str(tok)
+        break
+    if section == "report" and not mode:
+        mode = "bundle"
+    if not mode:
+        return None
+    return section, mode
+
+
+def _parse_run_log_errors(log_path: Path | None) -> Dict[str, Any]:
+    info = {
+        "manager_failed": set(),
+        "missing_paths": set(),
+        "trace_cmds": [],
+        "error_cmds": [],
+    }
+    if not log_path or not log_path.exists():
+        return info
+    mgr_fail = re.compile(r"\[manager\] STEP ([^\\s:]+) FAILED", re.IGNORECASE)
+    no_such = re.compile(r"No such file or directory: ['\\\"]([^'\\\"]+)['\\\"]", re.IGNORECASE)
+    missing_re = re.compile(r"missing (?:required|file|input|glob)[^:]*:?\\s*(.+)$", re.IGNORECASE)
+    cmd_re = re.compile(r"^\\$\\s+(.+)$")
+    last_cmd = None
+    with log_path.open("r", encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            line = line.rstrip()
+            m = cmd_re.match(line)
+            if m:
+                last_cmd = m.group(1)
+            m = mgr_fail.search(line)
+            if m:
+                info["manager_failed"].add(m.group(1))
+            m = no_such.search(line)
+            if m:
+                info["missing_paths"].add(m.group(1))
+            if "missing" in line.lower():
+                m = missing_re.search(line)
+                if m:
+                    cand = m.group(1).strip().strip("'\"")
+                    if any(sep in cand for sep in ("\\", "/")):
+                        info["missing_paths"].add(cand)
+                if line.rstrip().endswith(")"):
+                    m = re.search(r"\\(([^)]+)\\)$", line)
+                    if m:
+                        cand = m.group(1).strip().strip("'\"")
+                        if any(sep in cand for sep in ("\\", "/")):
+                            info["missing_paths"].add(cand)
+            if "Traceback" in line and last_cmd:
+                info["trace_cmds"].append(last_cmd)
+            low = line.lower()
+            if (("error:" in low) or ("exception" in low)) and last_cmd:
+                info["error_cmds"].append(last_cmd)
+    return info
+
+
+def _stage_output_index(stages: Dict[str, Any]) -> Dict[str, set[str]]:
+    index: Dict[str, set[str]] = {}
+    for key, entry in stages.items():
+        if not isinstance(entry, dict):
+            continue
+        for out in entry.get("outputs", []) or []:
+            if not isinstance(out, dict):
+                continue
+            path = out.get("path")
+            if not path:
+                continue
+            norm = _normalize_path_str(path)
+            index.setdefault(norm, set()).add(key)
+    return index
+
+
+def _match_stage_outputs(output_index: Dict[str, set[str]], missing_path: str) -> List[str]:
+    norm = _normalize_path_str(missing_path)
+    matches: set[str] = set()
+    if norm in output_index:
+        matches.update(output_index[norm])
+    for out_norm, keys in output_index.items():
+        if norm.endswith(out_norm) or out_norm.endswith(norm):
+            matches.update(keys)
+        elif norm.startswith(out_norm) or out_norm.startswith(norm):
+            matches.update(keys)
+    return sorted(matches)
+
+
+def _expand_upstream_deps(section: str, mode: str) -> List[str]:
+    deps: set[str] = set()
+    stack = [mode]
+    while stack:
+        curr = stack.pop()
+        contract = contract_for(section, curr)
+        if not contract or not contract.dependencies:
+            continue
+        for dep in contract.dependencies:
+            if dep in deps:
+                continue
+            deps.add(dep)
+            stack.append(dep)
+    return sorted(deps)
+
+
+def _collect_last_run_error_reasons(
+    cfg: Dict[str, Any],
+    run_name: str | None,
+    stages_manifest: Dict[str, Any],
+) -> Dict[Tuple[str, str], set[str]]:
+    reasons: Dict[Tuple[str, str], set[str]] = {}
+    def _add(section: str, mode: str, reason: str) -> None:
+        reasons.setdefault((section, mode), set()).add(reason)
+
+    for key, entry in stages_manifest.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("health_ok") is False:
+            if "." in key:
+                section, mode = key.split(".", 1)
+                _add(section, mode, "last_run_health_failed")
+
+    manifest = _load_run_manifest(run_name)
+    log_path = _latest_log_path(run_name, manifest)
+    log_info = _parse_run_log_errors(log_path)
+    if log_info.get("manager_failed"):
+        if _find_step_ref(cfg, "report", "bundle") is not None:
+            _add("report", "bundle", "last_run_report_failure")
+
+    output_index = _stage_output_index(stages_manifest)
+    for path in sorted(log_info.get("missing_paths", [])):
+        for key in _match_stage_outputs(output_index, path):
+            if "." not in key:
+                continue
+            section, mode = key.split(".", 1)
+            _add(section, mode, f"last_run_missing_input:{path}")
+
+    for cmd in log_info.get("trace_cmds", []):
+        mapped = _cmd_to_section_mode(cmd)
+        if mapped:
+            section, mode = mapped
+            _add(section, mode, "last_run_traceback")
+    for cmd in log_info.get("error_cmds", []):
+        mapped = _cmd_to_section_mode(cmd)
+        if mapped:
+            section, mode = mapped
+            _add(section, mode, "last_run_error")
+
+    return reasons
 
 
 def _diagnostics_overwrite_targets(issue: str) -> List[Tuple[str, str]]:
@@ -1371,6 +1583,7 @@ def _autofix_config(
     diag_checks = _load_diagnostics_checks(run_name)
     if diag_checks:
         diag_fails = [c for c in diag_checks if str(c.get("status")).lower() == "fail"]
+        diag_add_overwrite = add_overwrite or bool(diag_fails)
         for chk in diag_fails:
             issue = str(chk.get("issue") or "").strip()
             if not issue:
@@ -1382,7 +1595,22 @@ def _autofix_config(
                     mode,
                     f"diagnostics: {issue}",
                     changes,
-                    add_overwrite,
+                    diag_add_overwrite,
+                )
+
+    last_run_reasons = _collect_last_run_error_reasons(cfg, run_name, stages_manifest)
+    if last_run_reasons:
+        for (section, mode), reasons in sorted(last_run_reasons.items()):
+            reason = "last_run_error: " + ", ".join(sorted(reasons))
+            _mark_overwrite(cfg, section, mode, reason, changes, True)
+            for dep in _expand_upstream_deps(section, mode):
+                _mark_overwrite(
+                    cfg,
+                    section,
+                    dep,
+                    f"upstream of {section}.{mode} ({reason})",
+                    changes,
+                    True,
                 )
     pre_add_ids_stale = False
     pre_add_sections = {"fetch", "features"}
