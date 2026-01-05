@@ -739,6 +739,9 @@ def _time_shift_test(
     if df.empty:
         return {"status": "skip", "reason": "empty sample"}
 
+    dup_cols = df.columns[df.columns.duplicated()].unique().tolist()
+    if dup_cols:
+        df = df.loc[:, ~df.columns.duplicated()].copy()
     df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
     df = df.dropna(subset=[time_col])
     y = (pd.to_numeric(df[label_col], errors="coerce").fillna(0) > 0).astype(int).to_numpy()
@@ -761,8 +764,13 @@ def _time_shift_test(
 
     base_metrics = _fit_eval(df)
     results = {"baseline": base_metrics, "shifts": {}}
+    if dup_cols:
+        results["dropped_duplicate_columns"] = dup_cols
 
-    keys = [c for c in key_cols if c in df.columns] + [time_col]
+    keys = [c for c in key_cols if c in df.columns]
+    if time_col not in keys:
+        keys.append(time_col)
+    keys = list(dict.fromkeys(keys))
     if not keys:
         return {"status": "skip", "reason": "no join keys for shift test"}
 

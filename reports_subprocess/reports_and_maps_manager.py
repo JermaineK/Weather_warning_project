@@ -1510,13 +1510,25 @@ def main() -> int:
                 storm_dir.mkdir(parents=True, exist_ok=True)
                 frame_files = list(frames_dir.glob("seed_track_map_hourly_storm_*_*.png"))
                 storm_ids = set()
-                pattern = re.compile(r"seed_track_map_hourly_storm_(.+)_[0-9]{10}\\.png$")
+                pattern = re.compile(r"seed_track_map_hourly_storm_(.+)_[0-9]{10}\.png$")
                 for fp in frame_files:
                     m = pattern.search(fp.name)
                     if m:
                         storm_ids.add(m.group(1))
+                if not storm_ids and frame_files:
+                    prefix = "seed_track_map_hourly_storm_"
+                    for fp in frame_files:
+                        stem = fp.stem
+                        if not stem.startswith(prefix):
+                            continue
+                        tail = stem[len(prefix):]
+                        parts = tail.rsplit("_", 1)
+                        if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 10:
+                            storm_ids.add(parts[0])
                 if not storm_ids:
                     print("[manager] seed-track per-storm GIFs: no frames found.")
+                else:
+                    print(f"[manager] seed-track per-storm GIFs: {len(storm_ids)} storms from {len(frame_files)} frames.")
                 for sid in sorted(storm_ids):
                     anim_out = storm_dir / f"seed_track_map_hourly_storm_{sid}.{args.animate_format}"
                     frame_glob = str(frames_dir / f"seed_track_map_hourly_storm_{sid}_*.png")
