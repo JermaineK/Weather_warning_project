@@ -112,6 +112,15 @@ def _predict_chunk(df: pd.DataFrame, features: Sequence[str], model, calibrator)
 
 
 def predict(path: str, args) -> None:
+    out_path = Path(args.outfile)
+    if out_path.exists() and not args.overwrite:
+        print(f"[predict] output exists; skipping (use --overwrite): {out_path}")
+        return
+    if out_path.exists() and args.overwrite:
+        try:
+            out_path.unlink()
+        except Exception:
+            pass
     cols_all = _peek_columns(path)
     prefixes = [p.strip() for p in args.feature_prefixes.split(",") if p.strip()]
     label_cols = {args.time_col, "lat", "lon", args.label_col}
@@ -217,6 +226,7 @@ def parse_args():
         default=200_000,
         help="Parquet batch size.",
     )
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite output if it already exists.")
     return ap.parse_args()
 
 
