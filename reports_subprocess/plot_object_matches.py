@@ -62,6 +62,54 @@ def _pick_track_cols(df: pd.DataFrame, overrides: Dict[str, Optional[str]]) -> D
     return {"time": time_col, "lat": lat_col, "lon": lon_col, "id": id_col or "storm_id"}
 
 
+def _stable_sample(df: pd.DataFrame, n: int, cols: list[str]) -> pd.DataFrame:
+    if n <= 0 or len(df) <= n:
+        return df
+    use_cols = [c for c in cols if c in df.columns]
+    if not use_cols:
+        return df.head(n)
+    key = df[use_cols].copy()
+    for c in use_cols:
+        if np.issubdtype(key[c].dtype, np.datetime64):
+            key[c] = key[c].view("int64")
+    hashes = pd.util.hash_pandas_object(key, index=False)
+    return df.loc[hashes.sort_values().head(n).index]
+
+
+def _sample_rows(df: pd.DataFrame, n: int, cols: list[str], mode: str, seed: int) -> pd.DataFrame:
+    if n <= 0 or len(df) <= n:
+        return df
+    if mode == "stable":
+        return _stable_sample(df, n, cols)
+    return df.sample(int(n), random_state=seed)
+
+
+def _thin_points(
+    df: pd.DataFrame,
+    time_col: str,
+    max_per_hour: int,
+    max_total: int,
+    mode: str,
+    seed: int,
+    key_cols: list[str],
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df
+    if max_per_hour and max_per_hour > 0 and time_col in out.columns:
+        tvals = pd.to_datetime(out[time_col], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
+        if tvals.notna().any():
+            keep_idx = []
+            for _, sub in out.groupby(tvals, sort=False):
+                if len(sub) > max_per_hour:
+                    sub = _sample_rows(sub, max_per_hour, key_cols, mode, seed)
+                keep_idx.extend(sub.index.tolist())
+            out = out.loc[keep_idx]
+    if max_total and max_total > 0 and len(out) > max_total:
+        out = _sample_rows(out, max_total, key_cols, mode, seed)
+    return out.reset_index(drop=True)
+
+
 def _plot_one(
     ax,
     tracks: pd.DataFrame,
@@ -167,6 +215,10 @@ def main() -> int:
     ap.add_argument("--objects-min-score", type=float, default=None, help="Minimum object score to plot.")
     ap.add_argument("--objects-top-quantile", type=float, default=None, help="Per-hour score quantile to plot.")
     ap.add_argument("--objects-pad-deg", type=float, default=5.0, help="Padding around track bbox for objects.")
+    ap.add_argument("--objects-max-per-hour", type=int, default=0, help="Cap background objects per hour (0 disables).")
+    ap.add_argument("--objects-max-total", type=int, default=0, help="Cap total background objects (0 disables).")
+    ap.add_argument("--objects-sample-mode", choices=["random", "stable"], default="stable", help="Sampling mode for background objects.")
+    ap.add_argument("--objects-sample-seed", type=int, default=42, help="Random seed for background sampling.")
     ap.add_argument("--per-hour", action="store_true", help="Emit one map per hour in the window.")
     ap.add_argument("--hour-step", type=int, default=1, help="Step between hours (e.g., 2 = every 2nd hour).")
     ap.add_argument("--show-arrows", action="store_true", help="Overlay motion direction arrows.")
@@ -271,6 +323,19 @@ def main() -> int:
                             kept.append(sub.loc[svals >= thr])
                     objs = pd.concat(kept, ignore_index=True) if kept else objs.head(0)
                     objs = objs.drop(columns=["__score__"], errors="ignore")
+            if objs is not None and not objs.empty:
+                key_cols = [c for c in ["obj_centroid_lat", "obj_centroid_lon", "object_id", "time"] if c in objs.columns]
+                objs = _thin_points(
+                    objs,
+                    "time",
+                    args.objects_max_per_hour,
+                    args.objects_max_total,
+                    args.objects_sample_mode,
+                    args.objects_sample_seed,
+                    key_cols,
+                )
+                if objs.empty:
+                    objs = None
 
         hours = sorted(m["object_time"].dt.floor("h").unique().tolist())
         if not args.per_hour:

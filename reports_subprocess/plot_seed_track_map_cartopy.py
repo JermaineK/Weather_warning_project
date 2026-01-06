@@ -36,7 +36,35 @@ def pick_col(df, names):
             return n
     return None
 
-def _thin_points(df: pd.DataFrame, time_col: Optional[str], max_per_hour: int, max_total: int) -> pd.DataFrame:
+def _stable_sample(df: pd.DataFrame, n: int, cols: list[str]) -> pd.DataFrame:
+    if n <= 0 or len(df) <= n:
+        return df
+    use_cols = [c for c in cols if c in df.columns]
+    if not use_cols:
+        return df.head(n)
+    key = df[use_cols].copy()
+    for c in use_cols:
+        if np.issubdtype(key[c].dtype, np.datetime64):
+            key[c] = key[c].view("int64")
+    hashes = pd.util.hash_pandas_object(key, index=False)
+    return df.loc[hashes.sort_values().head(n).index]
+
+def _sample_rows(df: pd.DataFrame, n: int, cols: list[str], mode: str, seed: int) -> pd.DataFrame:
+    if n <= 0 or len(df) <= n:
+        return df
+    if mode == "stable":
+        return _stable_sample(df, n, cols)
+    return df.sample(int(n), random_state=seed)
+
+def _thin_points(
+    df: pd.DataFrame,
+    time_col: Optional[str],
+    max_per_hour: int,
+    max_total: int,
+    mode: str,
+    seed: int,
+    key_cols: list[str],
+) -> pd.DataFrame:
     # Agent: thin dense seed layers to avoid blob-like maps.
     if df.empty:
         return df
@@ -47,11 +75,11 @@ def _thin_points(df: pd.DataFrame, time_col: Optional[str], max_per_hour: int, m
             keep_idx = []
             for _, sub in out.groupby(tvals, sort=False):
                 if len(sub) > max_per_hour:
-                    sub = sub.sample(int(max_per_hour), random_state=42)
+                    sub = _sample_rows(sub, max_per_hour, key_cols, mode, seed)
                 keep_idx.extend(sub.index.tolist())
             out = out.loc[keep_idx]
     if max_total and max_total > 0 and len(out) > max_total:
-        out = out.sample(int(max_total), random_state=42)
+        out = _sample_rows(out, max_total, key_cols, mode, seed)
     return out.reset_index(drop=True)
 
 def _time_color_vals(df: pd.DataFrame, time_col: Optional[str]) -> tuple[Optional[np.ndarray], Optional[str]]:
@@ -75,7 +103,13 @@ def _safe_storm_id(value: object) -> str:
 def _pick_direction_col(df: pd.DataFrame, override: Optional[str]) -> Optional[str]:
     if override and override in df.columns:
         return override
-    for cand in ("track_bearing_deg", "obj_motion_bearing_deg", "obj_flow_bearing_deg", "bearing_deg"):
+    for cand in (
+        "track_bearing_deg",
+        "obj_motion_bearing_deg",
+        "obj_flow_bearing_deg",
+        "obj_axis_bearing_deg",
+        "bearing_deg",
+    ):
         if cand in df.columns:
             return cand
     return None
@@ -94,6 +128,11 @@ def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         return float("nan")
     return (math.degrees(math.atan2(dlon, dlat)) + 360.0) % 360.0
 
+def _read_any(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() in (".parquet", ".pq", ".pqt"):
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
 
 def main():
     ap = argparse.ArgumentParser(description="Plot seed-track matches on a map.")
@@ -110,6 +149,8 @@ def main():
     ap.add_argument("--dpi", type=int, default=200)
     ap.add_argument("--max-points-per-hour", type=int, default=0, help="Cap points per hour (0 disables).")
     ap.add_argument("--max-points-total", type=int, default=0, help="Cap total points after sampling (0 disables).")
+    ap.add_argument("--sample-mode", choices=["random", "stable"], default="stable", help="Sampling mode for thinning.")
+    ap.add_argument("--sample-seed", type=int, default=42, help="Random seed for sampling.")
     ap.add_argument("--color-by-time", action="store_true", help="Color seeds by time (hours since first seed).")
     ap.add_argument("--time-col", default=None, help="Optional time column override for coloring.")
     ap.add_argument("--time-cmap", default="viridis", help="Colormap for time coloring.")
@@ -121,14 +162,29 @@ def main():
     ap.add_argument("--per-hour", action="store_true", help="Emit one map per hour when time is available.")
     ap.add_argument("--hour-step", type=int, default=1, help="Step between hours (e.g., 2 = every 2nd hour).")
     ap.add_argument("--max-frames", type=int, default=0, help="Limit frames (0 disables).")
+    ap.add_argument("--trail-hours", type=int, default=0, help="Include prior hours in per-hour frames.")
+    ap.add_argument("--background", default=None, help="Optional background CSV/Parquet (objects/alerts).")
+    ap.add_argument("--background-lat-col", default=None, help="Background latitude column override.")
+    ap.add_argument("--background-lon-col", default=None, help="Background longitude column override.")
+    ap.add_argument("--background-time-col", default=None, help="Background time column override.")
+    ap.add_argument("--background-value-col", default=None, help="Background numeric column for filtering.")
+    ap.add_argument("--background-min-value", type=float, default=None, help="Min background value to keep.")
+    ap.add_argument("--background-top-quantile", type=float, default=None, help="Per-hour background quantile filter.")
+    ap.add_argument("--background-max-points-per-hour", type=int, default=0, help="Cap background points per hour.")
+    ap.add_argument("--background-max-points-total", type=int, default=0, help="Cap total background points.")
+    ap.add_argument("--background-color", default="#9aa0a6", help="Background point color.")
+    ap.add_argument("--background-alpha", type=float, default=0.25, help="Background point alpha.")
+    ap.add_argument("--background-size", type=float, default=10.0, help="Background point size.")
+    ap.add_argument("--background-color-by-time", action="store_true", help="Color background points by time.")
+    ap.add_argument("--background-time-cmap", default="viridis", help="Colormap for background time coloring.")
     args = ap.parse_args()
 
     p = Path(args.matches)
     df = pd.read_parquet(p) if p.suffix.lower() in (".parquet", ".pq") else pd.read_csv(p)
 
     # Pick columns flexibly
-    lat_c = pick_col(df, ["lat_cen", "seed_lat", "lat"])
-    lon_c = pick_col(df, ["lon_cen", "seed_lon", "lon"])
+    lat_c = pick_col(df, ["lat_cen", "seed_lat", "obj_centroid_lat", "obj_core_lat", "lat"])
+    lon_c = pick_col(df, ["lon_cen", "seed_lon", "obj_centroid_lon", "obj_core_lon", "lon"])
     lat_t = pick_col(df, ["storm_lat", "track_lat", "tc_lat"])
     lon_t = pick_col(df, ["storm_lon", "track_lon", "tc_lon"])
 
@@ -163,13 +219,22 @@ def main():
     df = df.dropna(subset=[lat_c, lon_c]).reset_index(drop=True)
     time_col = args.time_col
     if time_col is None:
-        for cand in ("time", "time_h", "seed_time"):
+        for cand in ("time", "time_h", "seed_time", "object_time"):
             if cand in df.columns:
                 time_col = cand
                 break
+    key_cols = [c for c in [lat_c, lon_c, time_col, "patch_id", "object_id"] if c]
     if len(df):
         before = len(df)
-        df = _thin_points(df, time_col, args.max_points_per_hour, args.max_points_total)
+        df = _thin_points(
+            df,
+            time_col,
+            args.max_points_per_hour,
+            args.max_points_total,
+            args.sample_mode,
+            args.sample_seed,
+            key_cols,
+        )
         if len(df) != before:
             print(f"[map] thinned points: {before:,} -> {len(df):,}")
     if len(df) == 0:
@@ -207,6 +272,69 @@ def main():
         df[dir_col] = pd.to_numeric(df[dir_col], errors="coerce")
         print(f"[map] direction arrows from {dir_col}")
 
+    bg_df = None
+    bg_lat = None
+    bg_lon = None
+    bg_time_col = None
+    if args.background:
+        bg_path = Path(args.background)
+        if not bg_path.exists():
+            print(f"[map] background file not found: {bg_path}")
+        else:
+            bg_df = _read_any(bg_path)
+            if not bg_df.empty:
+                bg_lat = args.background_lat_col or pick_col(
+                    bg_df,
+                    ["obj_centroid_lat", "lat_cen", "seed_lat", "lat"],
+                )
+                bg_lon = args.background_lon_col or pick_col(
+                    bg_df,
+                    ["obj_centroid_lon", "lon_cen", "seed_lon", "lon"],
+                )
+                bg_time_col = args.background_time_col or pick_col(
+                    bg_df,
+                    ["time", "time_h", "object_time", "seed_time"],
+                )
+                if not bg_lat or not bg_lon:
+                    print("[map] background missing lat/lon columns; skipping background overlay.")
+                    bg_df = None
+                else:
+                    bg_df[bg_lat] = pd.to_numeric(bg_df[bg_lat], errors="coerce")
+                    bg_df[bg_lon] = pd.to_numeric(bg_df[bg_lon], errors="coerce")
+                    bg_df = bg_df.dropna(subset=[bg_lat, bg_lon]).reset_index(drop=True)
+            if bg_df is not None and not bg_df.empty:
+                if bg_time_col and bg_time_col in bg_df.columns:
+                    tvals = pd.to_datetime(bg_df[bg_time_col], utc=True, errors="coerce").dt.tz_convert(None)
+                    bg_df = bg_df.assign(_bg_time_h=tvals.dt.floor("h"))
+                if args.background_value_col and args.background_value_col in bg_df.columns:
+                    vals = pd.to_numeric(bg_df[args.background_value_col], errors="coerce")
+                    if args.background_min_value is not None:
+                        bg_df = bg_df.loc[vals >= float(args.background_min_value)]
+                    if args.background_top_quantile is not None:
+                        if "_bg_time_h" in bg_df.columns:
+                            keep_idx = []
+                            for _, sub in bg_df.groupby("_bg_time_h", sort=False):
+                                svals = pd.to_numeric(sub[args.background_value_col], errors="coerce")
+                                if svals.notna().any():
+                                    cutoff = svals.quantile(float(args.background_top_quantile))
+                                    keep_idx.extend(sub.index[svals >= cutoff].tolist())
+                            bg_df = bg_df.loc[keep_idx]
+                        else:
+                            cutoff = vals.quantile(float(args.background_top_quantile))
+                            bg_df = bg_df.loc[vals >= cutoff]
+                bg_key_cols = [c for c in [bg_lat, bg_lon, bg_time_col, "object_id"] if c]
+                bg_df = _thin_points(
+                    bg_df,
+                    bg_time_col if bg_time_col in (bg_df.columns if bg_df is not None else []) else None,
+                    args.background_max_points_per_hour,
+                    args.background_max_points_total,
+                    args.sample_mode,
+                    args.sample_seed,
+                    bg_key_cols,
+                )
+                if bg_df is not None and bg_df.empty:
+                    bg_df = None
+
     # Extent
     if args.lon_range and args.lat_range:
         lon_min, lon_max = args.lon_range
@@ -214,15 +342,51 @@ def main():
     else:
         lon_min, lon_max = float(df[lon_c].min()) - 1, float(df[lon_c].max()) + 1
         lat_min, lat_max = float(df[lat_c].min()) - 1, float(df[lat_c].max()) + 1
+        if bg_df is not None and bg_lat and bg_lon and not bg_df.empty:
+            lon_min = min(lon_min, float(bg_df[bg_lon].min()) - 1)
+            lon_max = max(lon_max, float(bg_df[bg_lon].max()) + 1)
+            lat_min = min(lat_min, float(bg_df[bg_lat].min()) - 1)
+            lat_max = max(lat_max, float(bg_df[bg_lat].max()) + 1)
 
     # --- Plot ---
     use_cartopy = CARTOPY_AVAILABLE
     if not use_cartopy:
         print("[warn] Cartopy not available - falling back to plain scatter.")
 
-    def render(ddf: pd.DataFrame, out_path: str, title: str):
+    def render(ddf: pd.DataFrame, out_path: str, title: str, bg: Optional[pd.DataFrame] = None):
         if not use_cartopy:
             plt.figure(figsize=(8,6))
+            if bg is not None and bg_lat and bg_lon and not bg.empty:
+                if args.background_color_by_time and bg_time_col and bg_time_col in bg.columns:
+                    bt, _ = _time_color_vals(bg, bg_time_col)
+                    if bt is not None:
+                        plt.scatter(
+                            bg[bg_lon],
+                            bg[bg_lat],
+                            s=args.background_size,
+                            c=bt,
+                            cmap=args.background_time_cmap,
+                            alpha=args.background_alpha,
+                            label=None,
+                        )
+                    else:
+                        plt.scatter(
+                            bg[bg_lon],
+                            bg[bg_lat],
+                            s=args.background_size,
+                            color=args.background_color,
+                            alpha=args.background_alpha,
+                            label=None,
+                        )
+                else:
+                    plt.scatter(
+                        bg[bg_lon],
+                        bg[bg_lat],
+                        s=args.background_size,
+                        color=args.background_color,
+                        alpha=args.background_alpha,
+                        label=None,
+                    )
             tvals, tlabel = _time_color_vals(ddf, time_col) if args.color_by_time else (None, None)
             if tvals is not None:
                 sc = plt.scatter(ddf[lon_c], ddf[lat_c], s=12, c=tvals, cmap=args.time_cmap, alpha=0.6, label="Seeds")
@@ -284,6 +448,41 @@ def main():
 
         ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
 
+        if bg is not None and bg_lat and bg_lon and not bg.empty:
+            if args.background_color_by_time and bg_time_col and bg_time_col in bg.columns:
+                bt, _ = _time_color_vals(bg, bg_time_col)
+                if bt is not None:
+                    ax.scatter(
+                        bg[bg_lon],
+                        bg[bg_lat],
+                        s=args.background_size,
+                        c=bt,
+                        cmap=args.background_time_cmap,
+                        transform=ccrs.PlateCarree(),
+                        alpha=args.background_alpha,
+                        label=None,
+                    )
+                else:
+                    ax.scatter(
+                        bg[bg_lon],
+                        bg[bg_lat],
+                        s=args.background_size,
+                        color=args.background_color,
+                        transform=ccrs.PlateCarree(),
+                        alpha=args.background_alpha,
+                        label=None,
+                    )
+            else:
+                ax.scatter(
+                    bg[bg_lon],
+                    bg[bg_lat],
+                    s=args.background_size,
+                    color=args.background_color,
+                    transform=ccrs.PlateCarree(),
+                    alpha=args.background_alpha,
+                    label=None,
+                )
+
         tvals, tlabel = _time_color_vals(ddf, time_col) if args.color_by_time else (None, None)
         if tvals is not None:
             sc = ax.scatter(ddf[lon_c], ddf[lat_c], s=18, c=tvals, cmap=args.time_cmap,
@@ -336,6 +535,18 @@ def main():
         plt.close()
         print(f"[map] saved -> {out_path}")
 
+    def _subset_for_hour(
+        ddf: Optional[pd.DataFrame],
+        hour: pd.Timestamp,
+        time_h_col: str,
+    ) -> Optional[pd.DataFrame]:
+        if ddf is None or ddf.empty or time_h_col not in ddf.columns:
+            return ddf
+        if args.trail_hours and args.trail_hours > 0:
+            start = hour - pd.Timedelta(hours=int(args.trail_hours))
+            return ddf.loc[(ddf[time_h_col] >= start) & (ddf[time_h_col] <= hour)]
+        return ddf.loc[ddf[time_h_col] == hour]
+
     # per-hour maps (optionally per-storm)
     if args.per_hour:
         if time_col is None or time_col not in df.columns:
@@ -366,23 +577,26 @@ def main():
                         for sid, grp in df.groupby(sid_col):
                             sid_safe = _safe_storm_id(sid)
                             for h in hours:
-                                sub = grp.loc[grp["_time_h"] == h]
+                                sub = _subset_for_hour(grp, pd.Timestamp(h), "_time_h")
                                 if sub.empty:
                                     continue
+                                bg_sub = _subset_for_hour(bg_df, pd.Timestamp(h), "_bg_time_h") if bg_df is not None else None
                                 stamp = pd.Timestamp(h).strftime("%Y%m%d%H")
                                 render(
                                     sub,
                                     f"{out_base}_storm_{sid_safe}_{stamp}{ext}",
                                     f"Seed-Track Matches - {sid} {stamp}",
+                                    bg_sub,
                                 )
                         return
                     print("[seed-track-map] --per-storm requested but no storm id column found.")
                 for h in hours:
-                    sub = df.loc[df["_time_h"] == h]
+                    sub = _subset_for_hour(df, pd.Timestamp(h), "_time_h")
                     if sub.empty:
                         continue
+                    bg_sub = _subset_for_hour(bg_df, pd.Timestamp(h), "_bg_time_h") if bg_df is not None else None
                     stamp = pd.Timestamp(h).strftime("%Y%m%d%H")
-                    render(sub, f"{out_base}_{stamp}{ext}", f"Seed-Track Matches {stamp}")
+                    render(sub, f"{out_base}_{stamp}{ext}", f"Seed-Track Matches {stamp}", bg_sub)
                 return
 
     # per-storm if requested
@@ -398,11 +612,11 @@ def main():
             ext = Path(args.out).suffix or ".png"
             for sid, grp in df.groupby(sid_col):
                 sid_safe = _safe_storm_id(sid)
-                render(grp, f"{out_base}_storm_{sid_safe}{ext}", f"Seed-Track Matches - {sid}")
+                render(grp, f"{out_base}_storm_{sid_safe}{ext}", f"Seed-Track Matches - {sid}", bg_df)
             return
 
     # single map
-    render(df, args.out, "Seed–Track Matches")
+    render(df, args.out, "Seed-Track Matches", bg_df)
 
 
 if __name__ == "__main__":

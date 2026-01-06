@@ -125,22 +125,50 @@ def _resolve_seed_coords(df: pd.DataFrame) -> pd.DataFrame:
         return df.rename(columns=rename_map)
     raise ValueError("Need seed lat/lon columns (seed_lat/seed_lon, seed_lat_deg/seed_lon_deg, lat_cen/lon_cen, or lat/lon).")
 
-def _thin_points(df: pd.DataFrame, time_col: Optional[str], max_per_hour: int, max_total: int) -> pd.DataFrame:
+def _stable_sample(df: pd.DataFrame, n: int, cols: list[str]) -> pd.DataFrame:
+    if n <= 0 or len(df) <= n:
+        return df
+    use_cols = [c for c in cols if c in df.columns]
+    if not use_cols:
+        return df.head(n)
+    key = df[use_cols].copy()
+    for c in use_cols:
+        if np.issubdtype(key[c].dtype, np.datetime64):
+            key[c] = key[c].view("int64")
+    hashes = pd.util.hash_pandas_object(key, index=False)
+    return df.loc[hashes.sort_values().head(n).index]
+
+def _sample_rows(df: pd.DataFrame, n: int, cols: list[str], mode: str, seed: int) -> pd.DataFrame:
+    if n <= 0 or len(df) <= n:
+        return df
+    if mode == "stable":
+        return _stable_sample(df, n, cols)
+    return df.sample(int(n), random_state=seed)
+
+def _thin_points(
+    df: pd.DataFrame,
+    time_col: Optional[str],
+    max_per_hour: int,
+    max_total: int,
+    mode: str,
+    seed: int,
+) -> pd.DataFrame:
     # Agent: thin dense seed layers to avoid blob-like maps.
     if df.empty:
         return df
     out = df
+    key_cols = [c for c in ["lat", "lon", time_col] if c and c in out.columns]
     if max_per_hour and max_per_hour > 0 and time_col and time_col in out.columns:
         tvals = pd.to_datetime(out[time_col], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
         if tvals.notna().any():
             keep_idx = []
             for _, sub in out.groupby(tvals, sort=False):
                 if len(sub) > max_per_hour:
-                    sub = sub.sample(int(max_per_hour), random_state=42)
+                    sub = _sample_rows(sub, max_per_hour, key_cols, mode, seed)
                 keep_idx.extend(sub.index.tolist())
             out = out.loc[keep_idx]
     if max_total and max_total > 0 and len(out) > max_total:
-        out = out.sample(int(max_total), random_state=42)
+        out = _sample_rows(out, max_total, key_cols, mode, seed)
     return out.reset_index(drop=True)
 
 def build_time_from_parts(df, parts):
@@ -187,12 +215,15 @@ def main():
     ap.add_argument("--dpi", type=int, default=180)
     ap.add_argument("--max-points-per-hour", type=int, default=0, help="Cap seeds per hour (0 disables).")
     ap.add_argument("--max-points-total", type=int, default=0, help="Cap total seeds after sampling (0 disables).")
+    ap.add_argument("--sample-mode", choices=["random", "stable"], default="stable", help="Sampling mode for thinning.")
+    ap.add_argument("--sample-seed", type=int, default=42, help="Random seed for sampling.")
     ap.add_argument("--color-by-time", action="store_true", help="Color seeds by time (hours since first seed).")
     ap.add_argument("--time-col", default=None, help="Optional seed time column override.")
     ap.add_argument("--time-cmap", default="viridis", help="Colormap for time coloring.")
     ap.add_argument("--per-hour", action="store_true", help="Emit one map per hour when seed time is available.")
     ap.add_argument("--hour-step", type=int, default=1, help="Step between hours (e.g., 2 = every 2nd hour).")
     ap.add_argument("--max-frames", type=int, default=0, help="Limit frames (0 disables).")
+    ap.add_argument("--trail-hours", type=int, default=0, help="Include prior hours in per-hour frames.")
     argv = []
     skip = False
     raw = sys.argv[1:]
@@ -306,7 +337,7 @@ def main():
             seeds = crop_aoi(seeds, aoi, "lat", "lon")
     if seeds is not None and len(seeds):
         before = len(seeds)
-        seeds = _thin_points(seeds, "time", args.max_points_per_hour, args.max_points_total)
+        seeds = _thin_points(seeds, "time", args.max_points_per_hour, args.max_points_total, args.sample_mode, args.sample_seed)
         if len(seeds) != before:
             print(f"[map] thinned seeds: {before:,} -> {len(seeds):,}")
 
@@ -430,8 +461,12 @@ def main():
         base = Path(args.out_png).with_suffix("")
         ext = Path(args.out_png).suffix or ".png"
         for h in hours:
-            sub = seeds.loc[tvals == h].copy()
-            sub = _thin_points(sub, "time", args.max_points_per_hour, args.max_points_total)
+            if args.trail_hours and args.trail_hours > 0:
+                start = pd.Timestamp(h) - pd.Timedelta(hours=int(args.trail_hours))
+                sub = seeds.loc[(seeds["time"] >= start) & (seeds["time"] <= h)].copy()
+            else:
+                sub = seeds.loc[tvals == h].copy()
+            sub = _thin_points(sub, "time", args.max_points_per_hour, args.max_points_total, args.sample_mode, args.sample_seed)
             if sub.empty:
                 continue
             stamp = pd.Timestamp(h).strftime("%Y%m%d%H")

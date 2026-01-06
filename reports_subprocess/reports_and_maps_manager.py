@@ -759,6 +759,11 @@ def main() -> int:
         help="Emit per-hour frames for the union seed map.",
     )
     ap.add_argument(
+        "--seed-union-per-storm-gifs",
+        action="store_true",
+        help="Emit per-storm hourly GIFs for the union seed map.",
+    )
+    ap.add_argument(
         "--seeds-ibtracs-per-hour",
         action="store_true",
         help="Emit per-hour frames for seeds-with-IBTrACS maps.",
@@ -790,6 +795,70 @@ def main() -> int:
         default=150,
         help="Limit per-hour frame count (0 disables).",
     )
+    ap.add_argument(
+        "--map-trail-hours",
+        type=int,
+        default=6,
+        help="Include prior hours in per-hour map frames (0 disables).",
+    )
+    ap.add_argument(
+        "--map-sample-mode",
+        choices=["random", "stable"],
+        default="stable",
+        help="Sampling mode for map thinning.",
+    )
+    ap.add_argument(
+        "--map-sample-seed",
+        type=int,
+        default=42,
+        help="Random seed for map sampling.",
+    )
+    ap.add_argument(
+        "--seed-map-max-per-hour",
+        type=int,
+        default=1200,
+        help="Cap seed-map points per hour (0 disables).",
+    )
+    ap.add_argument(
+        "--seed-map-max-total",
+        type=int,
+        default=20000,
+        help="Cap total seed-map points after sampling (0 disables).",
+    )
+    ap.add_argument(
+        "--seed-map-color-by-time",
+        action="store_true",
+        default=True,
+        help="Color seed maps by time (hours since first seed).",
+    )
+    ap.add_argument(
+        "--seed-map-no-color-by-time",
+        action="store_false",
+        dest="seed_map_color_by_time",
+        help="Disable time coloring for seed maps.",
+    )
+    ap.add_argument(
+        "--seed-track-background",
+        default=None,
+        help="Optional background table for seed-track maps (e.g., objects_by_hour).",
+    )
+    ap.add_argument("--seed-track-background-lat-col", default=None, help="Background latitude column override.")
+    ap.add_argument("--seed-track-background-lon-col", default=None, help="Background longitude column override.")
+    ap.add_argument("--seed-track-background-time-col", default=None, help="Background time column override.")
+    ap.add_argument("--seed-track-background-value-col", default="obj_score_topk_mean", help="Background value column for filtering.")
+    ap.add_argument("--seed-track-background-min-value", type=float, default=None, help="Background min value filter.")
+    ap.add_argument("--seed-track-background-top-quantile", type=float, default=0.8, help="Background top-quantile filter.")
+    ap.add_argument("--seed-track-background-max-per-hour", type=int, default=250, help="Background points per hour.")
+    ap.add_argument("--seed-track-background-max-total", type=int, default=0, help="Background points total.")
+    ap.add_argument("--seed-track-background-color", default="#9aa0a6", help="Background point color.")
+    ap.add_argument("--seed-track-background-alpha", type=float, default=0.25, help="Background point alpha.")
+    ap.add_argument("--seed-track-background-size", type=float, default=10.0, help="Background point size.")
+    ap.add_argument(
+        "--seed-track-background-color-by-time",
+        action="store_true",
+        help="Color background points by time.",
+    )
+    ap.add_argument("--seed-track-background-time-cmap", default="viridis", help="Background time colormap.")
     ap.add_argument(
         "--animate",
         action="store_true",
@@ -1003,6 +1072,17 @@ def main() -> int:
     ap.add_argument("--object-maps-per-hour", action="store_true", help="Emit one map per hour in the window.")
     ap.add_argument("--object-maps-arrows", action="store_true", help="Overlay motion direction arrows.")
     ap.add_argument("--object-maps-flow-arrows", action="store_true", help="Overlay flow-direction arrows.")
+    ap.add_argument("--object-maps-min-score", type=float, default=None, help="Min object score for map background.")
+    ap.add_argument("--object-maps-top-quantile", type=float, default=None, help="Per-hour score quantile for map background.")
+    ap.add_argument("--object-maps-max-per-hour", type=int, default=200, help="Max background objects per hour in maps.")
+    ap.add_argument("--object-maps-max-total", type=int, default=0, help="Max background objects total in maps.")
+    ap.add_argument(
+        "--object-maps-sample-mode",
+        choices=["random", "stable"],
+        default="stable",
+        help="Sampling mode for object-map backgrounds.",
+    )
+    ap.add_argument("--object-maps-sample-seed", type=int, default=42, help="Random seed for object-map sampling.")
     ap.add_argument("--object-hours-before", type=float, default=72.0, help="Hours before genesis for maps.")
     ap.add_argument("--object-hours-after", type=float, default=24.0, help="Hours after genesis for maps.")
     ap.add_argument("--report-pack-config", default=None, help="Optional pipeline YAML for run_health checks.")
@@ -1069,6 +1149,36 @@ def main() -> int:
             step_args += ["--direction-color", args.seed_track_direction_color]
         if args.seed_track_max_direction_arrows:
             step_args += ["--max-direction-arrows", str(args.seed_track_max_direction_arrows)]
+        step_args += ["--sample-mode", args.map_sample_mode, "--sample-seed", str(args.map_sample_seed)]
+        step_args += ["--trail-hours", str(args.map_trail_hours)]
+        if seed_track_background:
+            step_args += ["--background", seed_track_background]
+        if args.seed_track_background_lat_col:
+            step_args += ["--background-lat-col", args.seed_track_background_lat_col]
+        if args.seed_track_background_lon_col:
+            step_args += ["--background-lon-col", args.seed_track_background_lon_col]
+        if args.seed_track_background_time_col:
+            step_args += ["--background-time-col", args.seed_track_background_time_col]
+        if args.seed_track_background_value_col:
+            step_args += ["--background-value-col", args.seed_track_background_value_col]
+        if args.seed_track_background_min_value is not None:
+            step_args += ["--background-min-value", str(args.seed_track_background_min_value)]
+        if args.seed_track_background_top_quantile is not None:
+            step_args += ["--background-top-quantile", str(args.seed_track_background_top_quantile)]
+        if args.seed_track_background_max_per_hour:
+            step_args += ["--background-max-points-per-hour", str(args.seed_track_background_max_per_hour)]
+        if args.seed_track_background_max_total:
+            step_args += ["--background-max-points-total", str(args.seed_track_background_max_total)]
+        if args.seed_track_background_color:
+            step_args += ["--background-color", args.seed_track_background_color]
+        if args.seed_track_background_alpha is not None:
+            step_args += ["--background-alpha", str(args.seed_track_background_alpha)]
+        if args.seed_track_background_size:
+            step_args += ["--background-size", str(args.seed_track_background_size)]
+        if args.seed_track_background_color_by_time:
+            step_args.append("--background-color-by-time")
+        if args.seed_track_background_time_cmap:
+            step_args += ["--background-time-cmap", args.seed_track_background_time_cmap]
 
     union_csv = or_default(args.union_csv, "results/seedmaps/{run}_union_byhour.csv")
     patches_csv = or_default(args.patches_csv, "results/seedmaps/{run}_seed_patches.csv")
@@ -1097,6 +1207,13 @@ def main() -> int:
     objects_rejects_out = args.objects_rejects_out
     if objects_rejects_out is None:
         objects_rejects_out = str(Path(args.objects_out).with_name("objects_rejects_by_hour.parquet"))
+    seed_track_background = args.seed_track_background
+    if seed_track_background:
+        lower = str(seed_track_background).strip().lower()
+        if lower in {"none", "null", "false", "0"}:
+            seed_track_background = None
+    elif args.objects_out:
+        seed_track_background = str(Path(args.objects_out))
     safe_run = args.run_name.strip().replace(" ", "_")
     report_pack_out = Path(args.report_pack_out_dir) if args.report_pack_out_dir else (run_dir / f"{safe_run}_tables")
     report_pack_config = args.report_pack_config
@@ -1264,6 +1381,20 @@ def main() -> int:
             "--objects", args.objects_out,
             "--match-top-n", str(args.objects_match_top_n),
         ]
+        if args.objects_score_col:
+            step_args += ["--objects-score-col", args.objects_score_col]
+        if args.object_maps_min_score is not None:
+            step_args += ["--objects-min-score", str(args.object_maps_min_score)]
+        if args.object_maps_top_quantile is not None:
+            step_args += ["--objects-top-quantile", str(args.object_maps_top_quantile)]
+        if args.object_maps_max_per_hour:
+            step_args += ["--objects-max-per-hour", str(args.object_maps_max_per_hour)]
+        if args.object_maps_max_total:
+            step_args += ["--objects-max-total", str(args.object_maps_max_total)]
+        step_args += [
+            "--objects-sample-mode", args.object_maps_sample_mode,
+            "--objects-sample-seed", str(args.object_maps_sample_seed),
+        ]
         if args.object_maps_per_hour:
             step_args.append("--per-hour")
         if args.object_maps_arrows:
@@ -1289,7 +1420,7 @@ def main() -> int:
             "--color-by-time-band",
             "--top-quantile", "0.9",
         ]
-        step_args += ["--max-points-per-hour", "2000"]
+        step_args += ["--max-points-per-hour", str(args.seed_map_max_per_hour)]
         if objects_in:
             step_args += ["--prob-path", objects_in]
         if args.objects_out:
@@ -1309,7 +1440,10 @@ def main() -> int:
             "--value-col", "prob_max",
             "--min-prob", "0.9",
             "--top-quantile", "0.9",
-            "--max-points-per-hour", "2000",
+            "--max-points-per-hour", str(args.seed_map_max_per_hour),
+            "--max-points-total", str(args.seed_map_max_total),
+            "--sample-mode", args.map_sample_mode,
+            "--sample-seed", str(args.map_sample_seed),
             "--title", f"Seeds (union by hour) - {args.run_name}",
         ]
         if ibtracs_path:
@@ -1332,13 +1466,19 @@ def main() -> int:
                 "--value-col", "prob_max",
                 "--min-prob", "0.9",
                 "--top-quantile", "0.9",
-                "--max-points-per-hour", "2000",
+                "--max-points-per-hour", str(args.seed_map_max_per_hour),
+                "--max-points-total", str(args.seed_map_max_total),
+                "--sample-mode", args.map_sample_mode,
+                "--sample-seed", str(args.map_sample_seed),
+                "--trail-hours", str(args.map_trail_hours),
                 "--title", f"Seeds (union by hour) - {args.run_name}",
                 "--per-hour",
                 "--time-col", "time",
                 "--hour-step", str(args.per_hour_step),
                 "--max-frames", str(args.per_hour_max_frames),
             ]
+            if args.seed_map_color_by_time:
+                step_args.append("--color-by-time")
             ok, code = run_step("seed-map-cartopy-hourly", script, step_args)
             if not ok and args.strict:
                 return code
@@ -1349,6 +1489,70 @@ def main() -> int:
                 if not ok and args.strict:
                     return code
 
+        if args.seed_union_per_storm_gifs:
+            if ibtracs_path is None:
+                print("[manager] seed-union per-storm GIFs require --ibtracs; skipping.")
+            else:
+                frames_dir.mkdir(parents=True, exist_ok=True)
+                out_png = frames_dir / "seeds_union_hourly_storm.png"
+                step_args = [
+                    "--seeds", union_csv,
+                    "--out-png", str(out_png),
+                    "--value-col", "prob_max",
+                    "--min-prob", "0.9",
+                    "--top-quantile", "0.9",
+                    "--max-points-per-hour", str(args.seed_map_max_per_hour),
+                    "--max-points-total", str(args.seed_map_max_total),
+                    "--sample-mode", args.map_sample_mode,
+                    "--sample-seed", str(args.map_sample_seed),
+                    "--trail-hours", str(args.map_trail_hours),
+                    "--title", f"Seeds (union by hour) - {args.run_name}",
+                    "--per-hour",
+                    "--per-storm",
+                    "--time-col", "time",
+                    "--hour-step", str(args.per_hour_step),
+                    "--max-frames", str(args.per_hour_max_frames),
+                    "--tracks", ibtracs_path,
+                    "--storm-window-before-h", "240",
+                    "--storm-window-after-h", "72",
+                    "--storm-radius-deg", "5.0",
+                ]
+                if args.seed_map_color_by_time:
+                    step_args.append("--color-by-time")
+                ok, code = run_step("seed-map-cartopy-hourly-storm", script, step_args)
+                if not ok and args.strict:
+                    return code
+                if ok:
+                    storm_dir = maps_dir / "storm_gifs"
+                    storm_dir.mkdir(parents=True, exist_ok=True)
+                    frame_files = list(frames_dir.glob("seeds_union_hourly_storm_*_*.png"))
+                    storm_ids = set()
+                    pattern = re.compile(r"seeds_union_hourly_storm_(.+)_[0-9]{10}\.png$")
+                    for fp in frame_files:
+                        m = pattern.search(fp.name)
+                        if m:
+                            storm_ids.add(m.group(1))
+                    if not storm_ids and frame_files:
+                        prefix = "seeds_union_hourly_storm_"
+                        for fp in frame_files:
+                            stem = fp.stem
+                            if not stem.startswith(prefix):
+                                continue
+                            tail = stem[len(prefix):]
+                            parts = tail.rsplit("_", 1)
+                            if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 10:
+                                storm_ids.add(parts[0])
+                    if not storm_ids:
+                        print("[manager] seed-union per-storm GIFs: no frames found.")
+                    else:
+                        print(f"[manager] seed-union per-storm GIFs: {len(storm_ids)} storms from {len(frame_files)} frames.")
+                    for sid in sorted(storm_ids):
+                        anim_out = storm_dir / f"seeds_union_hourly_storm_{sid}.{args.animate_format}"
+                        frame_glob = str(frames_dir / f"seeds_union_hourly_storm_{sid}_*.png")
+                        ok, code = run_animation(f"seed-union-storm-{sid}", frame_glob, anim_out)
+                        if not ok and args.strict:
+                            return code
+
     # --- STEP 3: IBTrACS + seeds overlay ---
     if (ibtracs_path is not None) and (not args.skip_ibtracs_maps):
         script = HERE / "plot_seeds_with_ibtracs.py"
@@ -1358,6 +1562,8 @@ def main() -> int:
             "--out-png", str(out_png),
             "--max-points-per-hour", "2000",
             "--max-points-total", "20000",
+            "--sample-mode", args.map_sample_mode,
+            "--sample-seed", str(args.map_sample_seed),
         ]
         # prefer matches if present; otherwise union seeds
         matches_path = Path(matches_csv)
@@ -1384,6 +1590,8 @@ def main() -> int:
             "--max-points-per-hour", "2000",
             "--max-points-total", "20000",
             "--color-by-time",
+            "--sample-mode", args.map_sample_mode,
+            "--sample-seed", str(args.map_sample_seed),
         ]
         # prefer matches if present; otherwise union seeds
         if matches_path.exists():
@@ -1409,7 +1617,12 @@ def main() -> int:
                 "--per-hour",
                 "--hour-step", str(args.per_hour_step),
                 "--max-frames", str(args.per_hour_max_frames),
+                "--sample-mode", args.map_sample_mode,
+                "--sample-seed", str(args.map_sample_seed),
+                "--trail-hours", str(args.map_trail_hours),
             ]
+            if args.seed_map_color_by_time:
+                step_args.append("--color-by-time")
             if matches_path.exists():
                 step_args += ["--matches", str(matches_path)]
             else:
@@ -1545,6 +1758,7 @@ def main() -> int:
             "--matches", matches_csv,
             "--out-csv", str(out_csv),
             "--out-png", str(out_png),
+            "--plot-kind", "timeline",
         ]
         ok, code = run_step("storm-hourly-counts", script, step_args)
         if not ok and args.strict:

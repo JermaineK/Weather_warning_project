@@ -64,6 +64,41 @@ def _heatmap(pivot: pd.DataFrame, out_png: Path, title: str, vmax: Optional[floa
     plt.close(fig)
 
 
+def _timeline(counts: pd.DataFrame, out_png: Path, title: str, top_storms: int, min_total: int) -> None:
+    import matplotlib.pyplot as plt  # local import to avoid hard dependency in non-plot runs
+
+    totals = counts.groupby("storm_id")["points"].sum().sort_values(ascending=False)
+    keep = totals.loc[totals >= int(min_total)].head(int(top_storms)).index.tolist()
+    subset = counts.loc[counts["storm_id"].isin(keep)]
+    if subset.empty:
+        print("[storm-hourly] no storms meet min-total for timeline; skipping plot.")
+        return
+
+    storms = keep
+    n = len(storms)
+    fig_h = max(4.0, min(18.0, 1.4 * n))
+    fig, axes = plt.subplots(nrows=n, ncols=1, figsize=(12, fig_h), sharex=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, sid in zip(axes, storms):
+        sub = subset.loc[subset["storm_id"] == sid]
+        ax.plot(sub["time_h"], sub["points"], color="#1f77b4", lw=1.2, marker="o", ms=3)
+        ax.set_ylabel(str(sid), rotation=0, labelpad=40, fontsize=8)
+        ax.set_ylim(bottom=0)
+        ax.grid(axis="y", alpha=0.3, linestyle="--")
+
+    axes[-1].set_xlabel("Hour (UTC)")
+    if title:
+        fig.suptitle(title, fontsize=12)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+    else:
+        fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=160)
+    plt.close(fig)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Per-storm hourly point counts and heatmap.")
     ap.add_argument("--matches", required=True, help="CSV/Parquet with storm_id + time columns.")
@@ -75,6 +110,7 @@ def main() -> int:
     ap.add_argument("--min-total", type=int, default=1, help="Min total points to include in heatmap.")
     ap.add_argument("--title", default=None, help="Optional plot title.")
     ap.add_argument("--vmax", type=float, default=None, help="Optional heatmap vmax.")
+    ap.add_argument("--plot-kind", choices=["heatmap", "timeline"], default="heatmap", help="Plot style for PNG output.")
     args = ap.parse_args()
 
     df = _read_any(args.matches)
@@ -104,19 +140,23 @@ def main() -> int:
     print(f"[storm-hourly] wrote {len(counts):,} rows -> {out_csv}")
 
     if args.out_png:
-        totals = counts.groupby("storm_id")["points"].sum().sort_values(ascending=False)
-        keep = totals.loc[totals >= int(args.min_total)].head(int(args.top_storms)).index
-        subset = counts.loc[counts["storm_id"].isin(keep)]
-        if subset.empty:
-            print("[storm-hourly] no storms meet min-total for heatmap; skipping plot.")
-            return 0
-        pivot = subset.pivot_table(index="storm_id", columns="time_h", values="points", fill_value=0)
-        # order by total points desc
-        order = pivot.sum(axis=1).sort_values(ascending=False).index
-        pivot = pivot.loc[order]
         title = args.title or "Storm hourly point counts"
-        _heatmap(pivot, Path(args.out_png), title, args.vmax)
-        print(f"[storm-hourly] wrote heatmap -> {args.out_png}")
+        if args.plot_kind == "timeline":
+            _timeline(counts, Path(args.out_png), title, args.top_storms, args.min_total)
+            print(f"[storm-hourly] wrote timeline -> {args.out_png}")
+        else:
+            totals = counts.groupby("storm_id")["points"].sum().sort_values(ascending=False)
+            keep = totals.loc[totals >= int(args.min_total)].head(int(args.top_storms)).index
+            subset = counts.loc[counts["storm_id"].isin(keep)]
+            if subset.empty:
+                print("[storm-hourly] no storms meet min-total for heatmap; skipping plot.")
+                return 0
+            pivot = subset.pivot_table(index="storm_id", columns="time_h", values="points", fill_value=0)
+            # order by total points desc
+            order = pivot.sum(axis=1).sort_values(ascending=False).index
+            pivot = pivot.loc[order]
+            _heatmap(pivot, Path(args.out_png), title, args.vmax)
+            print(f"[storm-hourly] wrote heatmap -> {args.out_png}")
 
     return 0
 

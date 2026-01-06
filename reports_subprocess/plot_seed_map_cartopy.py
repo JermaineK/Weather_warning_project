@@ -3,6 +3,7 @@
 
 import argparse
 from pathlib import Path
+import re
 import numpy as np
 import pandas as pd
 
@@ -13,6 +14,70 @@ def _norm_lon(x, mode):
     if mode == "-180..180":
         return ((x + 180) % 360) - 180
     return x
+
+def _safe_storm_id(value: object) -> str:
+    raw = str(value)
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_")
+    return safe or "storm"
+
+def _stable_sample(df: pd.DataFrame, n: int, cols: list[str]) -> pd.DataFrame:
+    if n <= 0 or len(df) <= n:
+        return df
+    use_cols = [c for c in cols if c in df.columns]
+    if not use_cols:
+        return df.head(n)
+    key = df[use_cols].copy()
+    for c in use_cols:
+        if np.issubdtype(key[c].dtype, np.datetime64):
+            key[c] = key[c].view("int64")
+    hashes = pd.util.hash_pandas_object(key, index=False)
+    return df.loc[hashes.sort_values().head(n).index]
+
+def _sample_rows(
+    df: pd.DataFrame,
+    n: int,
+    cols: list[str],
+    mode: str,
+    seed: int,
+) -> pd.DataFrame:
+    if n <= 0 or len(df) <= n:
+        return df
+    if mode == "stable":
+        return _stable_sample(df, n, cols)
+    return df.sample(int(n), random_state=seed)
+
+def _time_color_vals(df: pd.DataFrame, time_col: str) -> tuple[np.ndarray | None, str | None]:
+    if time_col not in df.columns:
+        return None, None
+    t = pd.to_datetime(df[time_col], utc=True, errors="coerce").dt.tz_convert(None)
+    if t.notna().sum() == 0:
+        return None, None
+    t0 = t.min()
+    hours = (t - t0).dt.total_seconds() / 3600.0
+    label = f"hours since {t0.strftime('%Y-%m-%d %H:%M')} UTC"
+    return hours.to_numpy(), label
+
+def _apply_sampling(
+    df: pd.DataFrame,
+    time_h_col: str | None,
+    max_per_hour: int,
+    max_total: int,
+    sample_mode: str,
+    sample_seed: int,
+    key_cols: list[str],
+) -> pd.DataFrame:
+    # Agent: stable thinning to avoid GIF jitter while keeping per-hour balance.
+    out = df
+    if max_per_hour and max_per_hour > 0 and time_h_col and time_h_col in out.columns:
+        keep_idx = []
+        for _, sub in out.groupby(time_h_col, sort=False):
+            if len(sub) > max_per_hour:
+                sub = _sample_rows(sub, max_per_hour, key_cols, sample_mode, sample_seed)
+            keep_idx.extend(sub.index.tolist())
+        out = out.loc[keep_idx]
+    if max_total and max_total > 0 and len(out) > max_total:
+        out = _sample_rows(out, max_total, key_cols, sample_mode, sample_seed)
+    return out.reset_index(drop=True)
 
 def _parse_area(aoi):
     if not aoi:
@@ -76,6 +141,12 @@ def main():
     ap.add_argument("--title", default=None, help="Figure title")
     ap.add_argument("--dpi", type=int, default=180)
     ap.add_argument("--max-points-per-hour", type=int, default=2000, help="Cap points per hour for scatter maps.")
+    ap.add_argument("--max-points-total", type=int, default=20000, help="Cap total points after sampling (0 disables).")
+    ap.add_argument("--sample-mode", choices=["random", "stable"], default="stable", help="Sampling mode for thinning.")
+    ap.add_argument("--sample-seed", type=int, default=42, help="Random seed for sampling.")
+    ap.add_argument("--color-by-time", action="store_true", help="Color seeds by time (hours since first seed).")
+    ap.add_argument("--time-cmap", default="viridis", help="Colormap for time coloring.")
+    ap.add_argument("--trail-hours", type=int, default=0, help="Include prior hours in per-hour frames.")
     args = ap.parse_args()
 
     # Load data
@@ -118,22 +189,6 @@ def main():
         except Exception as e:
             print(f"[map] warning: failed to load tracks {args.tracks}: {e}")
     df = df.dropna(subset=["lat","lon"]).reset_index(drop=True)
-    if args.max_points_per_hour:
-        tcol = None
-        if args.time_col and args.time_col in df.columns:
-            tcol = args.time_col
-        elif "time" in df.columns:
-            tcol = "time"
-        if tcol:
-            tvals = pd.to_datetime(df[tcol], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
-            keep_idx = []
-            for _, sub in df.groupby(tvals, sort=False):
-                if len(sub) > args.max_points_per_hour:
-                    sub = sub.sample(args.max_points_per_hour, random_state=42)
-                keep_idx.extend(sub.index.tolist())
-            df = df.loc[keep_idx].reset_index(drop=True)
-    if len(df) > 20000:
-        df = df.sample(20000, random_state=42)
 
     if args.area:
         latN, lonW, latS, lonE = _parse_area(args.area)
@@ -162,6 +217,18 @@ def main():
     elif args.per_hour:
         print("[map] --per-hour given but time column missing; producing single map.", flush=True)
 
+    key_cols = [c for c in ["patch_id", "lat", "lon", tcol_name] if c]
+    if not (args.per_storm and tracks_df is not None):
+        df = _apply_sampling(
+            df,
+            "_time_h" if "_time_h" in df.columns else None,
+            args.max_points_per_hour,
+            args.max_points_total,
+            args.sample_mode,
+            args.sample_seed,
+            key_cols,
+        )
+
     # Cartopy import
     ccrs, cfeature = _load_cartopy()
     import matplotlib.pyplot as plt
@@ -189,7 +256,20 @@ def main():
                 ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=proj)
 
         # Scatter points
-        if val is not None:
+        tvals, tlabel = _time_color_vals(ddf, tcol_name) if args.color_by_time and tcol_name else (None, None)
+        if tvals is not None:
+            sc = ax.scatter(
+                ddf["lon"],
+                ddf["lat"],
+                c=tvals,
+                s=14,
+                cmap=args.time_cmap,
+                alpha=0.85,
+                transform=proj,
+            )
+            cb = plt.colorbar(sc, ax=ax, orientation="vertical", shrink=0.8, pad=0.02)
+            cb.set_label(tlabel or "hours since first seed")
+        elif val is not None:
             vv = pd.to_numeric(ddf[args.value_col], errors="coerce")
             s = 6 + 24 * (vv - vv.min()) / (vv.max() - vv.min() + 1e-12)
             sc = ax.scatter(ddf["lon"], ddf["lat"], c=vv, s=s, cmap="viridis", alpha=0.85, transform=proj)
@@ -232,7 +312,7 @@ def main():
 
     # Utility to filter seeds to track window/bbox
     def filter_to_tracks(seeds_df: pd.DataFrame, tr: pd.DataFrame) -> pd.DataFrame:
-        tcol = args.time_col if args.time_col and args.time_col in seeds_df.columns else ("time" if "time" in seeds_df.columns else None)
+        tcol = tcol_name if tcol_name and tcol_name in seeds_df.columns else ("time" if "time" in seeds_df.columns else None)
         if tcol is None:
             return seeds_df
         tseeds = pd.to_datetime(seeds_df[tcol], utc=True, errors="coerce").dt.tz_convert(None)
@@ -247,6 +327,12 @@ def main():
             & seeds_df["lat"].between(lat_min, lat_max)
             & seeds_df["lon"].between(lon_min, lon_max)
         ]
+
+    def _subset_for_hour(ddf: pd.DataFrame, hour: pd.Timestamp) -> pd.DataFrame:
+        if args.trail_hours and args.trail_hours > 0:
+            start = hour - pd.Timedelta(hours=int(args.trail_hours))
+            return ddf.loc[(ddf["_time_h"] >= start) & (ddf["_time_h"] <= hour)]
+        return ddf.loc[ddf["_time_h"] == hour]
 
     # Single map, per-hour, or per-storm
     if args.per_storm and tracks_df is not None:
@@ -263,11 +349,36 @@ def main():
                 seeds_sub = filter_to_tracks(df, tr_grp)
                 if seeds_sub.empty:
                     continue
+                seeds_sub = _apply_sampling(
+                    seeds_sub,
+                    "_time_h" if "_time_h" in seeds_sub.columns else None,
+                    args.max_points_per_hour,
+                    args.max_points_total,
+                    args.sample_mode,
+                    args.sample_seed,
+                    key_cols,
+                )
                 ttl = f"{args.title or 'Seeds'} - storm {sid}"
                 base = Path(args.out_png).with_suffix("")
                 ext = Path(args.out_png).suffix or ".png"
-                out = f"{base}_storm_{sid}{ext}"
-                _render(seeds_sub, out, ttl, tr_grp)
+                sid_safe = _safe_storm_id(sid)
+                if args.per_hour and "_time_h" in seeds_sub.columns:
+                    hours = sorted(seeds_sub["_time_h"].dropna().unique().tolist())
+                    step = max(1, int(args.hour_step))
+                    if step > 1:
+                        hours = hours[::step]
+                    if args.max_frames and args.max_frames > 0:
+                        hours = hours[: int(args.max_frames)]
+                    for th in hours:
+                        grp = _subset_for_hour(seeds_sub, pd.Timestamp(th))
+                        if grp.empty:
+                            continue
+                        suffix = f"_{pd.Timestamp(th):%Y%m%d_%H%M}"
+                        out = f"{base}_storm_{sid_safe}{suffix}{ext}"
+                        _render(grp, out, f"{ttl} - {pd.Timestamp(th):%Y-%m-%d %H:00}", tr_grp)
+                else:
+                    out = f"{base}_storm_{sid_safe}{ext}"
+                    _render(seeds_sub, out, ttl, tr_grp)
             return
 
     if args.per_hour and "_time_h" in df.columns:
@@ -279,13 +390,13 @@ def main():
             hours = hours[: int(args.max_frames)]
         base, ext = (Path(args.out_png).with_suffix("").as_posix(), Path(args.out_png).suffix or ".png")
         for th in hours:
-            grp = df.loc[df["_time_h"] == th]
+            grp = _subset_for_hour(df, pd.Timestamp(th))
             if grp.empty:
                 continue
-            suffix = f"_{th:%Y%m%d_%H%M}"
+            suffix = f"_{pd.Timestamp(th):%Y%m%d_%H%M}"
             out = f"{base}{suffix}{ext}"
             ttl = args.title or "Seeds"
-            _render(grp, out, f"{ttl} - {th:%Y-%m-%d %H:00}")
+            _render(grp, out, f"{ttl} - {pd.Timestamp(th):%Y-%m-%d %H:00}")
     else:
         _render(df, args.out_png, args.title or "Seeds", tracks_df)
 
