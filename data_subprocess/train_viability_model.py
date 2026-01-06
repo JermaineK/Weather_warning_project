@@ -372,6 +372,9 @@ def _coeff_table(model: Pipeline, feature_names: Sequence[str]) -> pd.DataFrame:
         "abs_coef", ascending=False
     )
 
+def _existing_outputs(paths: Sequence[Path]) -> List[Path]:
+    return [p for p in paths if p and p.exists()]
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(
@@ -462,6 +465,7 @@ def main() -> None:
         default=None,
         help="Optional chunk size for streaming train input (0/None = load whole file).",
     )
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite outputs if they already exist.")
     args = ap.parse_args()
 
     # normalize features: allow comma-separated single arg or space list
@@ -469,6 +473,11 @@ def main() -> None:
         args.features = [f.strip() for f in args.features[0].split(",") if f.strip()]
     key_cols = _parse_csv_list(args.key_cols)
     block_patterns = BLOCKLIST_DEFAULT + _parse_csv_list(args.blocklist)
+    train_keys_out = None
+    val_keys_out = None
+    if key_cols:
+        if train_keys_out is None or val_keys_out is None:
+            train_keys_out, val_keys_out = _resolve_key_paths(args.model_out, args.train_keys_out, args.val_keys_out)
 
     # Agent: optional versioned outputs/provenance; training math unchanged.
     versioned = None
@@ -477,8 +486,25 @@ def main() -> None:
             Path(args.model_dir),
             run_name=args.run_name,
             run_id=args.run_id,
-            allow_existing=args.allow_existing_version,
+            allow_existing=args.allow_existing_version or args.overwrite,
         )
+
+    outputs = [Path(args.model_out)]
+    if args.metrics_json:
+        outputs.append(Path(args.metrics_json))
+    if args.coefs_csv:
+        outputs.append(Path(args.coefs_csv))
+    if train_keys_out:
+        outputs.append(train_keys_out)
+    if val_keys_out:
+        outputs.append(val_keys_out)
+    if args.provenance_out:
+        outputs.append(Path(args.provenance_out))
+    existing = _existing_outputs(outputs)
+    if existing and not args.overwrite:
+        joined = ", ".join(str(p) for p in existing)
+        print(f"[train-viability] outputs exist; skipping (use --overwrite): {joined}")
+        return
 
     if args.chunksize and args.chunksize > 0:
         chunk_rows = int(args.chunksize)
@@ -579,7 +605,8 @@ def main() -> None:
         for c in key_cols:
             if c not in df_fit.columns:
                 raise SystemExit(f"Key column '{c}' not found in training data.")
-        train_keys_out, val_keys_out = _resolve_key_paths(args.model_out, args.train_keys_out, args.val_keys_out)
+        if train_keys_out is None or val_keys_out is None:
+            train_keys_out, val_keys_out = _resolve_key_paths(args.model_out, args.train_keys_out, args.val_keys_out)
         train_keys = df_train[list(key_cols)].copy()
         val_keys = df_val[list(key_cols)].copy()
         overlap = _count_overlap(train_keys, val_keys, key_cols)

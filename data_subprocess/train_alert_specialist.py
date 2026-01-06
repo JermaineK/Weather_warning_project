@@ -190,6 +190,9 @@ def _hash_feature_list(features: Sequence[str]) -> str:
     raw = "\n".join(features)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+def _existing_outputs(paths: Sequence[Path]) -> List[Path]:
+    return [p for p in paths if p and p.exists()]
+
 
 def _table_fingerprint(
     df: pd.DataFrame,
@@ -575,6 +578,7 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--chunksize", "--chunk-rows", type=int, default=None)
     ap.add_argument("--parquet-rows", type=int, default=None)
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite outputs if they already exist.")
     return ap.parse_args()
 
 
@@ -585,6 +589,11 @@ def main():
     alerts = _load_alert_ids(args.alerts)
     key_cols = _parse_csv_list(args.key_cols)
     block_patterns = BLOCKLIST_DEFAULT + _parse_csv_list(args.blocklist)
+    train_keys_out = None
+    val_keys_out = None
+    if key_cols:
+        if train_keys_out is None or val_keys_out is None:
+            train_keys_out, val_keys_out = _resolve_key_paths(args.model_out, args.train_keys_out, args.val_keys_out)
 
     # Agent: optional versioned outputs/provenance; training math unchanged.
     versioned = None
@@ -593,8 +602,25 @@ def main():
             Path(args.model_dir),
             run_name=args.run_name,
             run_id=args.run_id,
-            allow_existing=args.allow_existing_version,
+            allow_existing=args.allow_existing_version or args.overwrite,
         )
+
+    outputs = [Path(args.model_out)]
+    if args.calibrate and args.calibration_out:
+        outputs.append(Path(args.calibration_out))
+    if args.metrics_out:
+        outputs.append(Path(args.metrics_out))
+    if train_keys_out:
+        outputs.append(train_keys_out)
+    if val_keys_out:
+        outputs.append(val_keys_out)
+    if args.provenance_out:
+        outputs.append(Path(args.provenance_out))
+    existing = _existing_outputs(outputs)
+    if existing and not args.overwrite:
+        joined = ", ".join(str(p) for p in existing)
+        print(f"[train-specialist] outputs exist; skipping (use --overwrite): {joined}")
+        return
 
     cols = _peek_columns(args.train)
     missing_keys = [c for c in key_cols if c not in cols]
@@ -689,7 +715,8 @@ def main():
         for c in key_cols:
             if c not in df.columns:
                 raise SystemExit(f"Key column '{c}' not found in training data.")
-        train_keys_out, val_keys_out = _resolve_key_paths(args.model_out, args.train_keys_out, args.val_keys_out)
+        if train_keys_out is None or val_keys_out is None:
+            train_keys_out, val_keys_out = _resolve_key_paths(args.model_out, args.train_keys_out, args.val_keys_out)
         train_keys = df_train[list(key_cols)].copy()
         val_keys = df_val[list(key_cols)].copy()
         overlap = _count_overlap(train_keys, val_keys, key_cols)
