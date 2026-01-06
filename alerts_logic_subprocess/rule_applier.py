@@ -11,6 +11,7 @@ import argparse, sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from utils import join_audit
 from sklearn.metrics import (
     precision_recall_fscore_support,
     roc_auc_score,
@@ -237,12 +238,40 @@ def main():
         key_feat = cols["feature"]
         key_sign = cols.get("sign") or cols.get("direction")
         key_thr  = cols.get("thr") or cols.get("threshold")
+        right_df = raw[[key_lead, key_feat, key_sign, key_thr, f1_col]].copy()
+        left_df = rules
         rules = rules.merge(
-            raw[[key_lead, key_feat, key_sign, key_thr, f1_col]],
+            right_df,
             left_on=["lead_h", "feature", "sign", "thr"],
             right_on=[key_lead, key_feat, key_sign, key_thr],
             how="left",
         )
+        left_dupe = int(left_df.duplicated(subset=["lead_h", "feature", "sign", "thr"]).sum())
+        right_dupe = int(right_df.duplicated(subset=[key_lead, key_feat, key_sign, key_thr]).sum())
+        right_keys = right_df.rename(columns={
+            key_lead: "lead_h",
+            key_feat: "feature",
+            key_sign: "sign",
+            key_thr: "thr",
+        })
+        unmatched = join_audit.estimate_unmatched_keys(left_df, right_keys, ["lead_h", "feature", "sign", "thr"])
+        entry = join_audit.build_entry(
+            step="alerts.rule-applier.f1-merge",
+            keys=["lead_h", "feature", "sign", "thr"],
+            join_type="left",
+            left_rows=len(left_df),
+            right_rows=len(right_df),
+            out_rows=len(rules),
+            left_dupe_keys=left_dupe,
+            right_dupe_keys=right_dupe,
+            left_key_count=unmatched.get("left_key_count"),
+            right_key_count=unmatched.get("right_key_count"),
+            left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+            right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+            unmatched_sampled=unmatched.get("unmatched_sampled"),
+            extra={"rules_path": str(rules_path)},
+        )
+        join_audit.append_entry(join_audit.default_path(), entry)
         rules = rules[rules[f1_col] >= args.min_f1].copy()
 
     # Optional top-N per lead by F1 (if present)

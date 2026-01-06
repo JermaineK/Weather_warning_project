@@ -33,6 +33,7 @@ from typing import Optional, Iterable
 
 import numpy as np
 import pandas as pd
+from utils import join_audit
 
 # -------------------- helpers --------------------
 
@@ -268,7 +269,28 @@ def main():
                 args.slowtick_panel, columns=["time", "lat", "lon", *slow_cols]
             )
             before = len(agg)
+            left_df = agg
             agg = agg.merge(slow, on=["time", "lat", "lon"], how="left")
+            left_dupe = int(left_df.duplicated(subset=["time", "lat", "lon"]).sum())
+            right_dupe = int(slow.duplicated(subset=["time", "lat", "lon"]).sum())
+            unmatched = join_audit.estimate_unmatched_keys(left_df, slow, ["time", "lat", "lon"])
+            entry = join_audit.build_entry(
+                step="seeds.from-alerts.slowtick-merge",
+                keys=["time", "lat", "lon"],
+                join_type="left",
+                left_rows=len(left_df),
+                right_rows=len(slow),
+                out_rows=len(agg),
+                left_dupe_keys=left_dupe,
+                right_dupe_keys=right_dupe,
+                left_key_count=unmatched.get("left_key_count"),
+                right_key_count=unmatched.get("right_key_count"),
+                left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+                right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+                unmatched_sampled=unmatched.get("unmatched_sampled"),
+                extra={"slowtick_panel": str(args.slowtick_panel)},
+            )
+            join_audit.append_entry(join_audit.default_path(), entry)
             print(f"[slowtick] joined {len(agg)} rows (from {before}) using {args.slowtick_panel}")
         except Exception as e:
             print(f"[warn] failed to join slowtick panel {args.slowtick_panel}: {e}")

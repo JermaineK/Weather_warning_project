@@ -97,6 +97,26 @@ def _num(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
+def _parse_list_spec(spec: str | None) -> list[int]:
+    if not spec:
+        return []
+    parts = [p.strip() for p in str(spec).split(",") if p.strip()]
+    vals = sorted({int(p) for p in parts if p.strip()})
+    return vals
+
+
+def _lead_bucket(lead_vals: pd.Series, edges: list[int]) -> pd.Series:
+    clean = pd.to_numeric(lead_vals, errors="coerce")
+    if not edges or len(edges) < 2:
+        return pd.Series(np.nan, index=lead_vals.index)
+    bins = sorted({int(x) for x in edges})
+    if bins[0] != 0:
+        bins = [0] + bins
+    labels = [int(x) for x in bins[1:]]
+    out = pd.cut(clean, bins=bins, labels=labels, include_lowest=True, right=True)
+    return pd.to_numeric(out.astype(str), errors="coerce")
+
+
 def _estimate_g_min(path: str, g_col: str, quantile: float, chunksize: Optional[int], seed: int) -> float:
     rng = np.random.default_rng(seed)
     sample_limit = 1_000_000
@@ -130,7 +150,7 @@ def _add_targets(
     chunk: pd.DataFrame, args: argparse.Namespace, g_min: float, lead_sign: str, lead_h_val: float
 ) -> pd.DataFrame:
     df = chunk.copy()
-    lead = _num(df[args.lead_col]) if args.lead_col in df else np.nan
+    lead = _num(df[args.lead_col]) if args.lead_col in df else pd.Series(np.nan, index=df.index)
     g = _num(df[args.g_col]) if args.g_col in df else np.nan
 
     if lead_sign == "negative":
@@ -141,7 +161,9 @@ def _add_targets(
     geom_ok = g >= g_min
     df["y_viable"] = (viable_window & geom_ok).astype("int8")
     if "lead_h" not in df.columns:
-        df["lead_h"] = float(lead_h_val)
+        df["lead_h"] = lead if args.lead_col in df else float(lead_h_val)
+    if "lead_h_bucket" not in df.columns:
+        df["lead_h_bucket"] = _lead_bucket(lead, args.lead_bins_list)
 
     # Add lead-derived helper features for downstream model scoring if not present.
     horizon = float(args.horizon_max)
@@ -170,6 +192,18 @@ def main() -> None:
     ap.add_argument("--g-min-quantile", type=float, default=0.7, help="Quantile for G threshold when g-min not set.")
     ap.add_argument("--lead-h", type=float, default=None, help="Optional constant lead_h to add (default: horizon-max).")
     ap.add_argument(
+        "--lead-hours",
+        type=str,
+        default="24,48,72,120,240",
+        help="Comma-separated leads for label summary (hours).",
+    )
+    ap.add_argument(
+        "--lead-bins",
+        type=str,
+        default="0,24,48,72,120,240",
+        help="Comma-separated lead-hour bin edges for lead_h_bucket.",
+    )
+    ap.add_argument(
         "--chunksize",
         "--chunk-rows",
         "--chunk_rows",
@@ -182,6 +216,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-threshold-json", default=None, help="Optional path to save g_min metadata.")
     args = ap.parse_args()
+
+    args.lead_bins_list = _parse_list_spec(args.lead_bins)
+    lead_hours = [h for h in _parse_list_spec(args.lead_hours) if h > 0]
 
     # Pre-scan lead to detect sign convention for pre-storm window
     lead_all = []
@@ -238,6 +275,8 @@ def main() -> None:
     lead_h_val = float(args.lead_h) if args.lead_h is not None else float(args.horizon_max)
     total_rows = 0
     total_pos = 0
+    lead_counts = {h: 0 for h in lead_hours}
+    lead_totals = {h: 0 for h in lead_hours}
     # track whether we had any positives; if not, we will relax threshold at end
     fallback_used = False
     for i, chunk in enumerate(_iter_file(args.panel, args.chunksize), start=1):
@@ -246,6 +285,16 @@ def main() -> None:
         out_chunk = _add_targets(chunk, args, g_min, lead_sign, lead_h_val)
         pos_here = int(out_chunk["y_viable"].sum())
         total_pos += pos_here
+        if lead_hours and args.lead_col in out_chunk:
+            lead_vals = _num(out_chunk[args.lead_col])
+            y_vals = pd.to_numeric(out_chunk["y_viable"], errors="coerce").fillna(0).astype(int)
+            for h in lead_hours:
+                if lead_sign == "negative":
+                    mask = (lead_vals < 0.0) & (lead_vals >= -float(h))
+                else:
+                    mask = (lead_vals > 0.0) & (lead_vals <= float(h))
+                lead_totals[h] += int(mask.sum())
+                lead_counts[h] += int((mask & (y_vals == 1)).sum())
         writer.write(out_chunk)
         total_rows += len(out_chunk)
         print(f"[targets] chunk {i}: wrote {len(out_chunk):,} rows (cum={total_rows:,})  pos={pos_here:,}")
@@ -253,11 +302,25 @@ def main() -> None:
     writer.close()
     print(f"[done] wrote {total_rows:,} rows -> {args.out} | positives={total_pos:,}")
 
+    if lead_hours and lead_totals:
+        rows = []
+        for h in sorted(lead_totals):
+            tot = lead_totals[h]
+            pos = lead_counts.get(h, 0)
+            frac = (pos / tot) if tot else np.nan
+            rows.append({"lead_h": h, "rows_in_window": tot, "pos_count": pos, "pos_frac": frac})
+        summary = pd.DataFrame(rows)
+        print("[diag] per-lead label summary (from t_to_storm_min_h):")
+        try:
+            print(summary.to_string(index=False))
+        except Exception:
+            print(summary)
+
     if total_pos == 0:
         # Fallback: relax quantile until we get positives; read once, rewrite.
         print("[warn] y_viable has zero positives; relaxing G threshold.")
         df_all = pd.concat(_iter_file(args.panel, args.chunksize), ignore_index=True)
-        lead = _num(df_all[args.lead_col]) if args.lead_col in df_all else np.nan
+        lead = _num(df_all[args.lead_col]) if args.lead_col in df_all else pd.Series(np.nan, index=df_all.index)
         if lead_sign == "negative":
             funnel_mask = (lead < 0.0) & (lead >= -float(args.horizon_max))
         else:
@@ -279,7 +342,8 @@ def main() -> None:
                 df_all["lead_norm"] = 1.0 - (lead_clip / horizon)
                 df_all["lead_inv"] = 1.0 / (1.0 + lead_clip)
                 df_all["G_lead_norm"] = _num(df_all[args.g_col]) * df_all["lead_norm"]
-                df_all["lead_h"] = lead_h_val
+                df_all["lead_h"] = lead if args.lead_col in df_all else float(lead_h_val)
+                df_all["lead_h_bucket"] = _lead_bucket(lead, args.lead_bins_list)
                 df_all.to_parquet(args.out, index=False) if _is_parquet(args.out) else df_all.to_csv(
                     args.out, index=False
                 )
@@ -294,7 +358,8 @@ def main() -> None:
                 df_all["lead_norm"] = 1.0 - (lead_clip / horizon)
                 df_all["lead_inv"] = 1.0 / (1.0 + lead_clip)
                 df_all["G_lead_norm"] = _num(df_all[args.g_col]) * df_all["lead_norm"]
-                df_all["lead_h"] = lead_h_val
+                df_all["lead_h"] = lead if args.lead_col in df_all else float(lead_h_val)
+                df_all["lead_h_bucket"] = _lead_bucket(lead, args.lead_bins_list)
                 df_all.to_parquet(args.out, index=False) if _is_parquet(args.out) else df_all.to_csv(
                     args.out, index=False
                 )

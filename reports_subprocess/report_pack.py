@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from utils import join_audit
 from pandas.util import hash_pandas_object
 
 try:
@@ -659,7 +660,28 @@ def _correlation_sweep(
             .rename(columns={"std": "spearman_lead_std", "min": "spearman_lead_min", "max": "spearman_lead_max"})
             .reset_index()
         )
+        left_df = overall
         overall = overall.merge(stab, on="feature", how="left")
+        left_dupe = int(left_df.duplicated(subset=["feature"]).sum())
+        right_dupe = int(stab.duplicated(subset=["feature"]).sum())
+        unmatched = join_audit.estimate_unmatched_keys(left_df, stab, ["feature"])
+        entry = join_audit.build_entry(
+            step="reports.report-pack.lead-stability-merge",
+            keys=["feature"],
+            join_type="left",
+            left_rows=len(left_df),
+            right_rows=len(stab),
+            out_rows=len(overall),
+            left_dupe_keys=left_dupe,
+            right_dupe_keys=right_dupe,
+            left_key_count=unmatched.get("left_key_count"),
+            right_key_count=unmatched.get("right_key_count"),
+            left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+            right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+            unmatched_sampled=unmatched.get("unmatched_sampled"),
+            extra={},
+        )
+        join_audit.append_entry(join_audit.default_path(), entry)
 
     by_lat = pd.DataFrame(by_lat_rows)
     return overall, by_lead, by_lat
@@ -871,12 +893,34 @@ def _directionality(matches: pd.DataFrame, tracks: pd.DataFrame) -> pd.DataFrame
     tracks = tracks.sort_values(["storm_id", "time"])
     tracks["vmax_next"] = tracks.groupby("storm_id")["vmax"].shift(-1)
     tracks["dvmax"] = tracks["vmax_next"] - tracks["vmax"]
+    right_df = tracks[["storm_id", "time", "dvmax"]].copy()
+    right_keys = right_df.rename(columns={"time": "track_time"})
     m = matches.merge(
-        tracks[["storm_id", "time", "dvmax"]],
+        right_df,
         left_on=["storm_id", "track_time"],
         right_on=["storm_id", "time"],
         how="left",
     )
+    left_dupe = int(matches.duplicated(subset=["storm_id", "track_time"]).sum())
+    right_dupe = int(right_keys.duplicated(subset=["storm_id", "track_time"]).sum())
+    unmatched = join_audit.estimate_unmatched_keys(matches, right_keys, ["storm_id", "track_time"])
+    entry = join_audit.build_entry(
+        step="reports.report-pack.directionality-merge",
+        keys=["storm_id", "track_time"],
+        join_type="left",
+        left_rows=len(matches),
+        right_rows=len(right_df),
+        out_rows=len(m),
+        left_dupe_keys=left_dupe,
+        right_dupe_keys=right_dupe,
+        left_key_count=unmatched.get("left_key_count"),
+        right_key_count=unmatched.get("right_key_count"),
+        left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+        right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+        unmatched_sampled=unmatched.get("unmatched_sampled"),
+        extra={},
+    )
+    join_audit.append_entry(join_audit.default_path(), entry)
     out = []
     for col in ["obj_axis_align_motion", "obj_corepull_align_motion"]:
         if col not in m.columns:

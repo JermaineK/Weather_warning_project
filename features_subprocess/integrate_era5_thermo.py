@@ -583,6 +583,9 @@ def main():
         # Join audit per-chunk (fail fast on explosions).
         left_dupe = int(chunk.duplicated(subset=["time", "lat", "lon"]).sum())
         right_dupe = int(thermo_slice.duplicated(subset=["time", "lat", "lon"]).sum()) if thermo_slice is not None else 0
+        unmatched = {}
+        if thermo_slice is not None and not thermo_slice.empty:
+            unmatched = join_audit.estimate_unmatched_keys(chunk, thermo_slice, ["time", "lat", "lon"])
         chunk_entry = join_audit.build_entry(
             step="features.integrate-thermo",
             keys=["time", "lat", "lon"],
@@ -592,6 +595,11 @@ def main():
             out_rows=len(merged),
             left_dupe_keys=left_dupe,
             right_dupe_keys=right_dupe,
+            left_key_count=unmatched.get("left_key_count"),
+            right_key_count=unmatched.get("right_key_count"),
+            left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+            right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+            unmatched_sampled=unmatched.get("unmatched_sampled"),
             extra={"chunk": i},
         )
         join_audit.enforce(

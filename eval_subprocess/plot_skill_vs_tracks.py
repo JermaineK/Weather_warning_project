@@ -16,6 +16,7 @@ import argparse, os
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from utils import join_audit
 
 import matplotlib
 matplotlib.use("Agg")
@@ -139,7 +140,28 @@ def load_metrics(metrics_file: str | None,
             "issue_hour": to_utc_naive(c[chcol]).dt.floor("h"),
             "coverage": pd.to_numeric(c[ccov], errors="coerce")
         }).dropna(subset=["issue_hour"])
+        left_df = out
         out = out.merge(cover, on="issue_hour", how="left", suffixes=("", "_cfile"))
+        left_dupe = int(left_df.duplicated(subset=["issue_hour"]).sum())
+        right_dupe = int(cover.duplicated(subset=["issue_hour"]).sum())
+        unmatched = join_audit.estimate_unmatched_keys(left_df, cover, ["issue_hour"])
+        entry = join_audit.build_entry(
+            step="eval.skill-vs-tracks.coverage-merge",
+            keys=["issue_hour"],
+            join_type="left",
+            left_rows=len(left_df),
+            right_rows=len(cover),
+            out_rows=len(out),
+            left_dupe_keys=left_dupe,
+            right_dupe_keys=right_dupe,
+            left_key_count=unmatched.get("left_key_count"),
+            right_key_count=unmatched.get("right_key_count"),
+            left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+            right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+            unmatched_sampled=unmatched.get("unmatched_sampled"),
+            extra={"coverage_file": str(coverage_file)},
+        )
+        join_audit.append_entry(join_audit.default_path(), entry)
         if "coverage_cfile" in out:
             out["coverage"] = out["coverage_cfile"].fillna(out.get("coverage"))
             out.drop(columns=["coverage_cfile"], inplace=True)

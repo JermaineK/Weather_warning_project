@@ -37,6 +37,15 @@ def _is_parquet(path: str | Path) -> bool:
     return low.endswith((".parquet", ".parq", ".pq"))
 
 
+def _peek_columns(path: str | Path) -> List[str]:
+    p = Path(path)
+    if _is_parquet(p):
+        if pq is None:
+            return list(pd.read_parquet(p, nrows=1).columns)
+        return list(pq.ParquetFile(p).schema.names)
+    return list(pd.read_csv(p, nrows=1, low_memory=False).columns)
+
+
 def _iter_batches(path: str | Path, columns: Sequence[str], chunk_rows: int, parquet_rows: int) -> Iterable[pd.DataFrame]:
     if _is_parquet(path):
         if pq is None or pa is None:
@@ -169,6 +178,64 @@ def _prepare_keys(df: pd.DataFrame, ilat_col: str, ilon_col: str, lat_col: str, 
     return lat_codes.astype(np.int64), lon_codes.astype(np.int64)
 
 
+def _select_mask_column(path: str | Path, args, chunk_rows: int, parquet_rows: int) -> Tuple[str, float]:
+    candidates = [args.mask_col]
+    if args.fallback_mask_cols:
+        extras = [c.strip() for c in str(args.fallback_mask_cols).split(",") if c.strip()]
+        candidates.extend(extras)
+    candidates = [c for i, c in enumerate(candidates) if c and c not in candidates[:i]]
+    cols_available = set(_peek_columns(path))
+    candidates = [c for c in candidates if c in cols_available]
+    if not candidates:
+        raise SystemExit(
+            f"[track] no usable mask columns found. Available columns: {sorted(cols_available)[:20]}"
+        )
+
+    sample_cols = list({args.time_col, args.lat_col, args.lon_col, args.ilat_col, args.ilon_col, *candidates})
+    stats: Dict[str, Dict[str, float]] = {}
+    values_cache: Dict[str, np.ndarray] = {}
+    for chunk in _iter_batches(path, sample_cols, chunk_rows or 200_000, parquet_rows or 200_000):
+        if chunk.empty:
+            continue
+        for col in candidates:
+            if col not in chunk.columns:
+                continue
+            vals = pd.to_numeric(chunk[col], errors="coerce").to_numpy()
+            finite = vals[np.isfinite(vals)]
+            if finite.size == 0:
+                continue
+            stats[col] = {
+                "pos": float((finite >= float(args.threshold)).sum()),
+                "max": float(np.nanmax(finite)),
+                "mean": float(np.nanmean(finite)),
+            }
+            values_cache[col] = finite
+        break
+
+    if not stats:
+        return args.mask_col, float(args.threshold)
+
+    best = max(stats.items(), key=lambda kv: kv[1]["pos"])
+    best_col, best_stats = best
+    if best_stats["pos"] > 0:
+        return best_col, float(args.threshold)
+
+    # No positives at the provided threshold; fall back to a quantile threshold if possible.
+    vals = values_cache.get(best_col, np.array([], dtype=float))
+    if vals.size == 0 or not np.isfinite(best_stats["max"]):
+        return best_col, float(args.threshold)
+    q = float(getattr(args, "fallback_quantile", 0.99))
+    q = min(max(q, 0.5), 0.999)
+    thr = float(np.nanquantile(vals, q))
+    if not np.isfinite(thr):
+        thr = float(best_stats["max"])
+    print(
+        f"[track] mask '{best_col}' has no positives at thr={args.threshold}; "
+        f"using fallback threshold={thr:.4f} (q={q})."
+    )
+    return best_col, thr
+
+
 # ---------------------------------------------------------------------------#
 # Streaming per-time processor                                               #
 # ---------------------------------------------------------------------------#
@@ -196,6 +263,13 @@ def _iter_time_groups(path: str, columns: Sequence[str], chunk_rows: int, parque
 
 
 def track_objects(path: str, args) -> None:
+    chunk_rows = args.chunk_rows or getattr(args, "chunksize", 0) or 0
+    parquet_rows = args.parquet_rows or chunk_rows
+    mask_col, threshold = _select_mask_column(path, args, chunk_rows, parquet_rows)
+    if mask_col != args.mask_col:
+        print(f"[track] using mask column '{mask_col}' (requested '{args.mask_col}')")
+    args.mask_col = mask_col
+    args.threshold = float(threshold)
     cols = {
         args.time_col,
         args.lat_col,
@@ -204,8 +278,6 @@ def track_objects(path: str, args) -> None:
         args.ilon_col,
         args.mask_col,
     }
-    chunk_rows = args.chunk_rows or getattr(args, "chunksize", 0) or 0
-    parquet_rows = args.parquet_rows or chunk_rows
     batches = _iter_time_groups(path, list(cols), chunk_rows, parquet_rows, args.time_col)
 
     prev_components: List[Dict] = []
@@ -216,7 +288,7 @@ def track_objects(path: str, args) -> None:
 
     for t_val, df_t in batches:
         scores = pd.to_numeric(df_t[args.mask_col], errors="coerce").fillna(0.0)
-        keep_mask = scores >= args.threshold
+        keep_mask = scores >= float(args.threshold)
         if not keep_mask.any():
             prev_components = []
             continue
@@ -332,6 +404,17 @@ def parse_args():
     ap.add_argument("--infile", required=True, help="Input table with per-cell scores.")
     ap.add_argument("--mask-col", default="P_final", help="Column to threshold for object mask.")
     ap.add_argument("--threshold", type=float, default=0.6, help="Threshold for mask_col.")
+    ap.add_argument(
+        "--fallback-mask-cols",
+        default="alert_mask,alert_final,alert_base,alert_throttled,alert,P_final,P_base,prob_viable,prob",
+        help="Fallback mask columns (comma-separated) if mask_col is missing or empty.",
+    )
+    ap.add_argument(
+        "--fallback-quantile",
+        type=float,
+        default=0.99,
+        help="Quantile for fallback threshold when no positives are found.",
+    )
     ap.add_argument("--objects-out", default="results/objects.parquet", help="Object-level output table.")
     ap.add_argument("--join-out", default=None, help="Optional per-cell table with object_id + object stats.")
     ap.add_argument("--connectivity", type=int, default=8, choices=[4, 8], help="Grid connectivity for components.")

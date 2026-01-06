@@ -376,6 +376,7 @@ def main():
                                     f"Seed-Track Matches - {sid} {stamp}",
                                 )
                         return
+                    print("[seed-track-map] --per-storm requested but no storm id column found.")
                 for h in hours:
                     sub = df.loc[df["_time_h"] == h]
                     if sub.empty:

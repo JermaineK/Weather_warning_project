@@ -172,6 +172,14 @@ def parse_hours_spec(spec: str | None) -> list[int]:
     return [v for v in vals if v > 0]
 
 
+def parse_bins_spec(spec: str | None) -> list[int]:
+    if not spec:
+        return []
+    parts = [p.strip() for p in str(spec).split(",") if p.strip()]
+    vals = sorted({int(p) for p in parts if p.strip()})
+    return vals
+
+
 def _apply_step(hours: list[int], step: int) -> list[int]:
     if step is None or step <= 1:
         return sorted(hours)
@@ -190,6 +198,18 @@ def _by_hour_stats(name, y, t):
         f"min={int(s.min()) if len(s) else 0} max={int(s.max()) if len(s) else 0}",
         flush=True,
     )
+
+
+def _lead_bucket(lead_vals: pd.Series, edges: list[int]) -> pd.Series:
+    clean = pd.to_numeric(lead_vals, errors="coerce")
+    if not edges or len(edges) < 2:
+        return pd.Series(np.nan, index=lead_vals.index)
+    bins = sorted({int(x) for x in edges})
+    if bins[0] != 0:
+        bins = [0] + bins
+    labels = [int(x) for x in bins[1:]]
+    out = pd.cut(clean, bins=bins, labels=labels, include_lowest=True, right=True)
+    return pd.to_numeric(out.astype(str), errors="coerce")
 
 
 # ---------------- column detection ----------------
@@ -491,6 +511,12 @@ def parse_args():
         help='Multi-horizon per-hour labels, e.g., "1..240" or "6,12,18".',
     )
     ap.add_argument("--pregen-step", type=int, default=1)
+    ap.add_argument(
+        "--lead-bins",
+        type=str,
+        default="0,24,48,72,120,240",
+        help="Comma-separated lead-hour bin edges for lead_h_bucket.",
+    )
 
     # Lon / chunking
     # Accept any string, trim inside, to tolerate YAML values like ' -180..180'
@@ -602,6 +628,7 @@ def main():
     if pregen_hours:
         pregen_hours = _apply_step(pregen_hours, int(args.pregen_step or 1))
     legacy_pregen_h = float(args.pregen_future_h) if (not pregen_hours) else None
+    lead_bins = parse_bins_spec(args.lead_bins)
 
     lab.sort_values("time", kind="mergesort", inplace=True, ignore_index=True)
 
@@ -622,7 +649,7 @@ def main():
     label_cols = ["storm_point", "storm_window", "storm", "near_storm"]
     if pregen_hours:
         label_cols += [f"pregen_h{h}" for h in sorted(pregen_hours)]
-    label_cols += ["pregen", "t_to_storm_min_h"]
+    label_cols += ["pregen", "t_to_storm_min_h", "lead_h", "lead_h_bucket"]
 
     step = pd.Timedelta(hours=max(1, int(args.chunk_hours)))
 
@@ -712,6 +739,13 @@ def main():
                     pregen_hours,
                     legacy_pregen_h,
                 )
+
+            if "t_to_storm_min_h" in labeled.columns:
+                lead_vals = pd.to_numeric(labeled["t_to_storm_min_h"], errors="coerce")
+                if "lead_h" not in labeled.columns:
+                    labeled["lead_h"] = np.where(np.isfinite(lead_vals), np.ceil(lead_vals), np.nan)
+                if "lead_h_bucket" not in labeled.columns:
+                    labeled["lead_h_bucket"] = _lead_bucket(lead_vals, lead_bins)
 
             labeled = labeled.reindex(columns=final_order)
 

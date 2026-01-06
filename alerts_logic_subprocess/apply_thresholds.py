@@ -343,6 +343,9 @@ def main():
         out[args.flag_col] = (out[args.prob_col] >= thr).astype(int)
         if args.lead_hours is not None and "lead_h" not in out.columns:
             out["lead_h"] = int(args.lead_hours)
+        elif "lead_h" not in out.columns and "t_to_storm_min_h" in out.columns:
+            lead_vals = pd.to_numeric(out["t_to_storm_min_h"], errors="coerce")
+            out["lead_h"] = np.where(np.isfinite(lead_vals), np.ceil(lead_vals), np.nan)
 
         # drop invalid meta
         out["time"] = parse_time(out["time"], args.time_format)

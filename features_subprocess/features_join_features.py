@@ -149,6 +149,7 @@ def main():
     # Agent: join audit guardrails (no math changes).
     left_dupe = int(left.duplicated(subset=keys).sum()) if keys else 0
     right_dupe = int(right.duplicated(subset=keys).sum()) if keys else 0
+    unmatched = join_audit.estimate_unmatched_keys(left, right, keys)
     entry = join_audit.build_entry(
         step="features.join-features",
         keys=keys,
@@ -158,6 +159,11 @@ def main():
         out_rows=len(out),
         left_dupe_keys=left_dupe,
         right_dupe_keys=right_dupe,
+        left_key_count=unmatched.get("left_key_count"),
+        right_key_count=unmatched.get("right_key_count"),
+        left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+        right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+        unmatched_sampled=unmatched.get("unmatched_sampled"),
         extra={"left_path": str(args.left), "right_path": str(args.right), "out_path": str(args.out)},
     )
     join_audit.append_entry(args.join_audit_out, entry)

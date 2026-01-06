@@ -163,6 +163,9 @@ def predict(path: str, args) -> None:
         else:
             chunk["P_final"] = chunk["P_base"]
         chunk["alert_mask"] = chunk["P_final"] >= args.alert_thr
+        if "lead_h" not in chunk.columns and "t_to_storm_min_h" in chunk.columns:
+            lead_vals = pd.to_numeric(chunk["t_to_storm_min_h"], errors="coerce")
+            chunk["lead_h"] = np.where(np.isfinite(lead_vals), np.ceil(lead_vals), np.nan)
         writer, first = _write_stream(args.outfile, chunk, writer, first)
         total_rows += len(chunk)
 

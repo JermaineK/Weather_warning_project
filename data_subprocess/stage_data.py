@@ -44,6 +44,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 from pandas.util import hash_pandas_object
+from utils import join_audit
 
 try:
     import pyarrow as pa  # type: ignore
@@ -671,6 +672,29 @@ def build_ids_from_csv(
                             how="left",
                             sort=False,
                         )
+                        # Agent: join audit for extra merge (no math changes).
+                        left_dupe = int(base_keys.duplicated(subset=["time", "lat", "lon"]).sum())
+                        right_dupe = int(extra_join.duplicated(subset=["time", "lat", "lon"]).sum())
+                        unmatched = join_audit.estimate_unmatched_keys(
+                            base_keys, extra_join, ["time", "lat", "lon"]
+                        )
+                        entry = join_audit.build_entry(
+                            step="data_stage.add-ids.extra-merge",
+                            keys=["time", "lat", "lon"],
+                            join_type="left",
+                            left_rows=len(base_keys),
+                            right_rows=len(extra_join),
+                            out_rows=len(merged),
+                            left_dupe_keys=left_dupe,
+                            right_dupe_keys=right_dupe,
+                            left_key_count=unmatched.get("left_key_count"),
+                            right_key_count=unmatched.get("right_key_count"),
+                            left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+                            right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+                            unmatched_sampled=unmatched.get("unmatched_sampled"),
+                            extra={"extra_path": str(extra_src) if extra_src else None},
+                        )
+                        join_audit.append_entry(join_audit.default_path(), entry)
 
                         # sanity: must remain one row per base row
                         if len(merged) != len(chunk):

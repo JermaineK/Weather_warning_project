@@ -16,6 +16,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from pandas.util import hash_pandas_object
+from utils import join_audit
 
 
 def _is_parquet(path: str | Path) -> bool:
@@ -385,7 +386,29 @@ def main() -> int:
         obj["obj_track_len_h"] = pd.to_numeric(obj["obj_track_len_h"], errors="coerce")
     elif "obj_track_id" in obj.columns and args.time_col in obj.columns:
         track_len = obj.groupby("obj_track_id")[args.time_col].nunique().rename("obj_track_len_h")
+        left_df = obj
+        track_len_df = track_len.reset_index()
         obj = obj.merge(track_len, left_on="obj_track_id", right_index=True, how="left")
+        left_dupe = int(left_df.duplicated(subset=["obj_track_id"]).sum())
+        right_dupe = int(track_len_df.duplicated(subset=["obj_track_id"]).sum())
+        unmatched = join_audit.estimate_unmatched_keys(left_df, track_len_df, ["obj_track_id"])
+        entry = join_audit.build_entry(
+            step="reports.match-objects.tracklen-merge",
+            keys=["obj_track_id"],
+            join_type="left",
+            left_rows=len(left_df),
+            right_rows=len(track_len_df),
+            out_rows=len(obj),
+            left_dupe_keys=left_dupe,
+            right_dupe_keys=right_dupe,
+            left_key_count=unmatched.get("left_key_count"),
+            right_key_count=unmatched.get("right_key_count"),
+            left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+            right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+            unmatched_sampled=unmatched.get("unmatched_sampled"),
+            extra={},
+        )
+        join_audit.append_entry(join_audit.default_path(), entry)
         if "obj_track_len_h" not in obj.columns:
             for cand in ("obj_track_len_h_x", "obj_track_len_h_y"):
                 if cand in obj.columns:

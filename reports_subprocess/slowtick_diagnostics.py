@@ -550,12 +550,27 @@ def main():
             print(f"[slowtick] lead={L}: no usable alerts file; skipping.")
             continue
 
-        cov = _coverage_by_hour(df, eff_flag)
+        flag_vals = pd.to_numeric(df[eff_flag], errors="coerce").fillna(0.0)
+        flag_mean = float(flag_vals.mean()) if len(flag_vals) else float("nan")
+        flag_std = float(flag_vals.std(ddof=0)) if len(flag_vals) else float("nan")
+        flag_nonzero = float((flag_vals > 0).mean()) if len(flag_vals) else float("nan")
+        flag_const = bool((np.isfinite(flag_std) and flag_std == 0.0) or flag_nonzero in (0.0, 1.0))
+
+        coverage_col = eff_flag
+        if flag_const and args.prob_col in df.columns:
+            coverage_col = args.prob_col
+            df[coverage_col] = pd.to_numeric(df[coverage_col], errors="coerce")
+            print(
+                f"[slowtick] lead={L}: flag '{eff_flag}' is constant "
+                f"(mean={flag_mean:.4f}, frac>0={flag_nonzero:.4f}); using '{coverage_col}' for coverage."
+            )
+
+        cov = _coverage_by_hour(df, coverage_col)
         if cov.notna().sum() < max(4, args.min_hours_per_lead):
             print(f"[slowtick] lead={L}: too few hourly points ({cov.notna().sum()}); skipping.")
             continue
 
-        hemi = _coverage_by_hour_hemi(df, eff_flag)
+        hemi = _coverage_by_hour_hemi(df, coverage_col)
         cov_time[L] = cov.sort_index()
         cov_hemi_time[L] = hemi.sort_index()
 
@@ -566,12 +581,20 @@ def main():
                 mean_cov=float(np.nanmean(cov.values)),
                 file=Path(path).name if path else "",
                 flag_col=eff_flag,
+                coverage_col=coverage_col,
+                flag_mean=flag_mean,
+                flag_std=flag_std,
+                flag_nonzero_frac=flag_nonzero,
+                flag_const=int(flag_const),
             )
         )
 
     if not rows:
         print("[slowtick] no lead summaries produced; skipping diagnostics.")
-        (out_dir / "slowtick_summary.csv").write_text("lead_h,hours,mean_cov,file,flag_col\n", encoding="utf-8")
+        (out_dir / "slowtick_summary.csv").write_text(
+            "lead_h,hours,mean_cov,file,flag_col,coverage_col,flag_mean,flag_std,flag_nonzero_frac,flag_const\n",
+            encoding="utf-8",
+        )
         return 0
     summary = pd.DataFrame(rows).sort_values("lead_h")
     summary.to_csv(out_dir / "slowtick_summary.csv", index=False)

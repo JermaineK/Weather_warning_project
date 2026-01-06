@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import re
+import shutil
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1405,6 +1406,14 @@ def main() -> int:
 
     # Join audit check
     join_audit_path = project_dir / "join_audit.json"
+    fallback_join_audit = Path("results/diagnostics/join_audit.json")
+    if not join_audit_path.exists() and fallback_join_audit.exists():
+        join_audit_path = fallback_join_audit
+        try:
+            (project_dir / "join_audit.json").parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(fallback_join_audit, project_dir / "join_audit.json")
+        except Exception:
+            pass
     join_fail = None
     join_note = "join audit missing"
     if join_audit_path.exists():

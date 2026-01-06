@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 import joblib
 import numpy as np
 import pandas as pd
+from utils import join_audit
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
@@ -149,6 +150,26 @@ def _write_keys(df: pd.DataFrame, key_cols: Sequence[str], out_path: Path) -> No
 
 def _count_overlap(train_keys: pd.DataFrame, val_keys: pd.DataFrame, key_cols: Sequence[str]) -> int:
     merged = train_keys.merge(val_keys, on=list(key_cols), how="inner")
+    left_dupe = int(train_keys.duplicated(subset=list(key_cols)).sum())
+    right_dupe = int(val_keys.duplicated(subset=list(key_cols)).sum())
+    unmatched = join_audit.estimate_unmatched_keys(train_keys, val_keys, list(key_cols))
+    entry = join_audit.build_entry(
+        step="training.train-calibrate.overlap-merge",
+        keys=list(key_cols),
+        join_type="inner",
+        left_rows=len(train_keys),
+        right_rows=len(val_keys),
+        out_rows=len(merged),
+        left_dupe_keys=left_dupe,
+        right_dupe_keys=right_dupe,
+        left_key_count=unmatched.get("left_key_count"),
+        right_key_count=unmatched.get("right_key_count"),
+        left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+        right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+        unmatched_sampled=unmatched.get("unmatched_sampled"),
+        extra={},
+    )
+    join_audit.append_entry(join_audit.default_path(), entry)
     return int(len(merged))
 
 

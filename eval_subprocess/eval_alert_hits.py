@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from utils import join_audit
 
 
 def read_any(p, usecols=None):
@@ -162,6 +163,26 @@ def main():
         validate="one_to_one",
         suffixes=("_al", "_lab"),
     )
+    left_dupe = int(al_eval.duplicated(subset=key).sum())
+    right_dupe = int(lab.duplicated(subset=key).sum())
+    unmatched = join_audit.estimate_unmatched_keys(al_eval, lab, key)
+    entry = join_audit.build_entry(
+        step="eval.alert-hits.join",
+        keys=key,
+        join_type="inner",
+        left_rows=len(al_eval),
+        right_rows=len(lab),
+        out_rows=len(df),
+        left_dupe_keys=left_dupe,
+        right_dupe_keys=right_dupe,
+        left_key_count=unmatched.get("left_key_count"),
+        right_key_count=unmatched.get("right_key_count"),
+        left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+        right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+        unmatched_sampled=unmatched.get("unmatched_sampled"),
+        extra={"lead_h": int(lead_h)},
+    )
+    join_audit.append_entry(join_audit.default_path(), entry)
 
     default_out = (
         f"results/metrics/{a.run_name}_alert_hits_lead{lead_h}.csv"

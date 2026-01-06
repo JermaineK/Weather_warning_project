@@ -25,6 +25,7 @@ from typing import Optional, Tuple, Dict, List
 
 import numpy as np
 import pandas as pd
+from utils import join_audit
 
 # Optional speedup for storm matching + neighbor counts
 try:
@@ -621,7 +622,28 @@ def main():
         cape_cols = pick_cape_cols(f)
         keep = ["time","lat","lon"] + list(cape_cols.values())
         f = f[keep].copy()
+        left_df = s
         s = s.merge(f, on=["time","lat","lon"], how="left", validate="m:1")
+        left_dupe = int(left_df.duplicated(subset=["time", "lat", "lon"]).sum())
+        right_dupe = int(f.duplicated(subset=["time", "lat", "lon"]).sum())
+        unmatched = join_audit.estimate_unmatched_keys(left_df, f, ["time", "lat", "lon"])
+        entry = join_audit.build_entry(
+            step="seeds.proto-outcomes.features-merge",
+            keys=["time", "lat", "lon"],
+            join_type="left",
+            left_rows=len(left_df),
+            right_rows=len(f),
+            out_rows=len(s),
+            left_dupe_keys=left_dupe,
+            right_dupe_keys=right_dupe,
+            left_key_count=unmatched.get("left_key_count"),
+            right_key_count=unmatched.get("right_key_count"),
+            left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+            right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+            unmatched_sampled=unmatched.get("unmatched_sampled"),
+            extra={"features_path": str(args.features)},
+        )
+        join_audit.append_entry(join_audit.default_path(), entry)
         # unify names if present
         rev = {v:k for k,v in cape_cols.items()}
         s = s.rename(columns=rev)
@@ -675,7 +697,28 @@ def main():
                                    storm_radius_km=args.storm_radius_km,
                                    lookahead_hours=args.lookahead_hours)
 
+    left_tracks = agg
     tracks = agg.merge(outcomes, on="track_id", how="left")
+    left_dupe = int(left_tracks.duplicated(subset=["track_id"]).sum())
+    right_dupe = int(outcomes.duplicated(subset=["track_id"]).sum())
+    unmatched = join_audit.estimate_unmatched_keys(left_tracks, outcomes, ["track_id"])
+    entry = join_audit.build_entry(
+        step="seeds.proto-outcomes.track-merge",
+        keys=["track_id"],
+        join_type="left",
+        left_rows=len(left_tracks),
+        right_rows=len(outcomes),
+        out_rows=len(tracks),
+        left_dupe_keys=left_dupe,
+        right_dupe_keys=right_dupe,
+        left_key_count=unmatched.get("left_key_count"),
+        right_key_count=unmatched.get("right_key_count"),
+        left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+        right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+        unmatched_sampled=unmatched.get("unmatched_sampled"),
+        extra={},
+    )
+    join_audit.append_entry(join_audit.default_path(), entry)
 
     # ---- aggregate conversion & conditional severity (correct conditioning)
     conv_rows = []

@@ -25,6 +25,7 @@ from typing import Iterable, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+from utils import join_audit
 
 try:
     import pyarrow.parquet as pq  # type: ignore
@@ -419,9 +420,51 @@ def main() -> None:
             storm_radius_km=args.storm_radius_km,
             lookahead_hours=args.lookahead_hours,
         )
+        left_tracks = agg
         agg = agg.merge(outcomes, on="track_id", how="left")
+        left_dupe = int(left_tracks.duplicated(subset=["track_id"]).sum())
+        right_dupe = int(outcomes.duplicated(subset=["track_id"]).sum())
+        unmatched = join_audit.estimate_unmatched_keys(left_tracks, outcomes, ["track_id"])
+        entry = join_audit.build_entry(
+            step="seeds.gse-tracks.outcomes-merge",
+            keys=["track_id"],
+            join_type="left",
+            left_rows=len(left_tracks),
+            right_rows=len(outcomes),
+            out_rows=len(agg),
+            left_dupe_keys=left_dupe,
+            right_dupe_keys=right_dupe,
+            left_key_count=unmatched.get("left_key_count"),
+            right_key_count=unmatched.get("right_key_count"),
+            left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+            right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+            unmatched_sampled=unmatched.get("unmatched_sampled"),
+            extra={"ibtracs_path": str(args.ibtracs)},
+        )
+        join_audit.append_entry(join_audit.default_path(), entry)
         agg["is_builder"] = agg["matched"].fillna(False)
+        left_linked = linked
         linked = linked.merge(agg[["track_id", "is_builder"]], on="track_id", how="left")
+        left_dupe = int(left_linked.duplicated(subset=["track_id"]).sum())
+        right_dupe = int(agg[["track_id", "is_builder"]].duplicated(subset=["track_id"]).sum())
+        unmatched = join_audit.estimate_unmatched_keys(left_linked, agg[["track_id", "is_builder"]], ["track_id"])
+        entry = join_audit.build_entry(
+            step="seeds.gse-tracks.builder-merge",
+            keys=["track_id"],
+            join_type="left",
+            left_rows=len(left_linked),
+            right_rows=len(agg[["track_id", "is_builder"]]),
+            out_rows=len(linked),
+            left_dupe_keys=left_dupe,
+            right_dupe_keys=right_dupe,
+            left_key_count=unmatched.get("left_key_count"),
+            right_key_count=unmatched.get("right_key_count"),
+            left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+            right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+            unmatched_sampled=unmatched.get("unmatched_sampled"),
+            extra={},
+        )
+        join_audit.append_entry(join_audit.default_path(), entry)
     else:
         agg["is_builder"] = False
         linked["is_builder"] = False

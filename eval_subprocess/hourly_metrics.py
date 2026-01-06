@@ -16,6 +16,7 @@ import argparse, glob, math, sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from utils import join_audit
 
 # -------------------- helpers --------------------
 
@@ -261,8 +262,52 @@ def main():
         act = df.loc[df[args.flag_col] > 0, ["_hour", args.prob_col]].copy()
         prob_mean = act.groupby("_hour")[args.prob_col].mean().rename("mean_prob_active")
         prob_max  = df.groupby("_hour")[args.prob_col].max().rename("max_prob_hour")
-        base = base.merge(prob_mean, on="_hour", how="left")
-        base = base.merge(prob_max,  on="_hour", how="left")
+        left_df = base
+        prob_mean_df = prob_mean.reset_index()
+        base = base.merge(prob_mean_df, on="_hour", how="left")
+        left_dupe = int(left_df.duplicated(subset=["_hour"]).sum())
+        right_dupe = int(prob_mean_df.duplicated(subset=["_hour"]).sum())
+        unmatched = join_audit.estimate_unmatched_keys(left_df, prob_mean_df, ["_hour"])
+        entry = join_audit.build_entry(
+            step="eval.hourly-metrics.prob-mean-merge",
+            keys=["_hour"],
+            join_type="left",
+            left_rows=len(left_df),
+            right_rows=len(prob_mean_df),
+            out_rows=len(base),
+            left_dupe_keys=left_dupe,
+            right_dupe_keys=right_dupe,
+            left_key_count=unmatched.get("left_key_count"),
+            right_key_count=unmatched.get("right_key_count"),
+            left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+            right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+            unmatched_sampled=unmatched.get("unmatched_sampled"),
+            extra={},
+        )
+        join_audit.append_entry(join_audit.default_path(), entry)
+        left_df = base
+        prob_max_df = prob_max.reset_index()
+        base = base.merge(prob_max_df,  on="_hour", how="left")
+        left_dupe = int(left_df.duplicated(subset=["_hour"]).sum())
+        right_dupe = int(prob_max_df.duplicated(subset=["_hour"]).sum())
+        unmatched = join_audit.estimate_unmatched_keys(left_df, prob_max_df, ["_hour"])
+        entry = join_audit.build_entry(
+            step="eval.hourly-metrics.prob-max-merge",
+            keys=["_hour"],
+            join_type="left",
+            left_rows=len(left_df),
+            right_rows=len(prob_max_df),
+            out_rows=len(base),
+            left_dupe_keys=left_dupe,
+            right_dupe_keys=right_dupe,
+            left_key_count=unmatched.get("left_key_count"),
+            right_key_count=unmatched.get("right_key_count"),
+            left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+            right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+            unmatched_sampled=unmatched.get("unmatched_sampled"),
+            extra={},
+        )
+        join_audit.append_entry(join_audit.default_path(), entry)
     else:
         base["mean_prob_active"] = np.nan
         base["max_prob_hour"]    = np.nan
@@ -284,7 +329,28 @@ def main():
                          "median_cluster_area_km2": med_a})
     clus = pd.DataFrame(clusters)
 
+    left_df = base
     out = base.merge(clus, on=["_hour","_tag"], how="left")
+    left_dupe = int(left_df.duplicated(subset=["_hour", "_tag"]).sum())
+    right_dupe = int(clus.duplicated(subset=["_hour", "_tag"]).sum())
+    unmatched = join_audit.estimate_unmatched_keys(left_df, clus, ["_hour", "_tag"])
+    entry = join_audit.build_entry(
+        step="eval.hourly-metrics.cluster-merge",
+        keys=["_hour", "_tag"],
+        join_type="left",
+        left_rows=len(left_df),
+        right_rows=len(clus),
+        out_rows=len(out),
+        left_dupe_keys=left_dupe,
+        right_dupe_keys=right_dupe,
+        left_key_count=unmatched.get("left_key_count"),
+        right_key_count=unmatched.get("right_key_count"),
+        left_unmatched_keys=unmatched.get("left_unmatched_keys"),
+        right_unmatched_keys=unmatched.get("right_unmatched_keys"),
+        unmatched_sampled=unmatched.get("unmatched_sampled"),
+        extra={},
+    )
+    join_audit.append_entry(join_audit.default_path(), entry)
     out["hour_start"] = out["_hour"].dt.strftime("%Y-%m-%d %H:00:00")
 
     cols = ["_hour","_tag","rows","active","coverage",
