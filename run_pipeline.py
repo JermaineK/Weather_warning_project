@@ -847,6 +847,22 @@ def _sha256_file(path: Path) -> str | None:
 
 
 def _pipeline_code_sha256(root: Path) -> str | None:
+    uniq = _pipeline_code_paths(root)
+    if not uniq:
+        return None
+    h = hashlib.sha256()
+    for p in uniq:
+        h.update(str(p).encode("utf-8"))
+        try:
+            with p.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+        except Exception:
+            continue
+    return h.hexdigest()
+
+
+def _pipeline_code_paths(root: Path) -> List[Path]:
     targets: List[Path] = [root / "run_pipeline.py", root / "pipeline_contracts.py"]
     for folder in [
         "fetch_subprocess",
@@ -868,19 +884,19 @@ def _pipeline_code_sha256(root: Path) -> str | None:
             if p.name.endswith(".bak"):
                 continue
             targets.append(p)
-    uniq = sorted({p.resolve() for p in targets if p.exists()})
-    if not uniq:
-        return None
-    h = hashlib.sha256()
-    for p in uniq:
-        h.update(str(p).encode("utf-8"))
+    return sorted({p.resolve() for p in targets if p.exists()})
+
+
+def _pipeline_code_mtime(root: Path) -> float | None:
+    latest = None
+    for p in _pipeline_code_paths(root):
         try:
-            with p.open("rb") as fh:
-                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                    h.update(chunk)
+            mtime = p.stat().st_mtime
         except Exception:
             continue
-    return h.hexdigest()
+        if latest is None or mtime > latest:
+            latest = mtime
+    return latest
 
 
 def _cache_enabled(section: str, mode: str, step: Dict[str, Any]) -> bool:
@@ -943,6 +959,65 @@ def _path_signature(path: Path) -> Dict[str, Any]:
     if path.is_file():
         entry["sha256"] = _sha256_file(path)
     return entry
+
+
+def _path_max_mtime(path: Path, max_children: int = 2000) -> float | None:
+    try:
+        max_mtime = path.stat().st_mtime
+    except Exception:
+        return None
+    if path.is_dir():
+        count = 0
+        try:
+            for child in path.rglob("*"):
+                if not child.is_file():
+                    continue
+                count += 1
+                if count > max_children:
+                    break
+                try:
+                    mtime = child.stat().st_mtime
+                except Exception:
+                    continue
+                if mtime > max_mtime:
+                    max_mtime = mtime
+        except Exception:
+            pass
+    return max_mtime
+
+
+def _outputs_max_mtime(paths: List[Path]) -> float | None:
+    latest = None
+    for p in paths:
+        if not p.exists():
+            continue
+        mtime = _path_max_mtime(p)
+        if mtime is None:
+            continue
+        if latest is None or mtime > latest:
+            latest = mtime
+    return latest
+
+
+def _autofix_step_outputs(
+    section: str,
+    mode: str,
+    step: Dict[str, Any],
+    stages_manifest: Dict[str, Any],
+) -> List[Path]:
+    outputs = _output_paths(step)
+    if outputs:
+        return outputs
+    entry = stages_manifest.get(f"{section}.{mode}") if stages_manifest else None
+    if isinstance(entry, dict):
+        for out in entry.get("outputs", []) or []:
+            if isinstance(out, dict) and out.get("path"):
+                outputs.append(Path(str(out.get("path"))))
+    return outputs
+
+
+def _format_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
 def _step_fingerprint(section: str, mode: str, step: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]]]:
@@ -1540,12 +1615,24 @@ def _mark_overwrite(
     reason: str,
     changes: List[str],
     add_overwrite: bool,
+    stages_manifest: Dict[str, Any] | None = None,
+    ref_mtime: float | None = None,
+    guard_freshness: bool = False,
 ) -> bool:
     target = _find_step_ref(cfg, section, mode)
     if target is None:
         return False
     if target.get("enabled") is False:
         return False
+    if guard_freshness and ref_mtime is not None:
+        outputs = _autofix_step_outputs(section, mode, target, stages_manifest or {})
+        out_mtime = _outputs_max_mtime(outputs)
+        if out_mtime is not None and out_mtime >= ref_mtime:
+            print(
+                f"[autofix] skip overwrite {section}.{mode}: outputs newer than "
+                f"{_format_ts(ref_mtime)} (outputs {_format_ts(out_mtime)})."
+            )
+            return False
     has_overwrite = "overwrite" in target
     if not has_overwrite and not add_overwrite:
         print(
@@ -1569,6 +1656,15 @@ def _autofix_config(
     changes: List[str] = []
     run_name = cfg.get("run_name") or RUN_NAME
     stages_manifest, stages_meta = _load_stage_manifest_for_autofix(run_name)
+    manifest = _load_run_manifest(run_name)
+    log_path = _latest_log_path(run_name, manifest)
+    log_mtime = log_path.stat().st_mtime if log_path and log_path.exists() else None
+    code_mtime = _pipeline_code_mtime(HERE)
+    ref_mtime = None
+    for ts in (log_mtime, code_mtime):
+        if ts is None:
+            continue
+        ref_mtime = ts if ref_mtime is None else max(ref_mtime, ts)
     code_changed = bool(stages_meta.get("pipeline_code_sha256")) and bool(PIPELINE_CODE_SHA256) and (
         stages_meta.get("pipeline_code_sha256") != PIPELINE_CODE_SHA256
     )
@@ -1596,13 +1692,16 @@ def _autofix_config(
                     f"diagnostics: {issue}",
                     changes,
                     diag_add_overwrite,
+                    stages_manifest,
+                    ref_mtime,
+                    True,
                 )
 
     last_run_reasons = _collect_last_run_error_reasons(cfg, run_name, stages_manifest)
     if last_run_reasons:
         for (section, mode), reasons in sorted(last_run_reasons.items()):
             reason = "last_run_error: " + ", ".join(sorted(reasons))
-            _mark_overwrite(cfg, section, mode, reason, changes, True)
+            _mark_overwrite(cfg, section, mode, reason, changes, True, stages_manifest, ref_mtime, True)
             for dep in _expand_upstream_deps(section, mode):
                 _mark_overwrite(
                     cfg,
@@ -1611,8 +1710,12 @@ def _autofix_config(
                     f"upstream of {section}.{mode} ({reason})",
                     changes,
                     True,
+                    stages_manifest,
+                    ref_mtime,
+                    True,
                 )
     pre_add_ids_stale = False
+    pre_add_ids_stale_due_to_issue = False
     pre_add_sections = {"fetch", "features"}
 
     for section in sections:
@@ -1680,7 +1783,9 @@ def _autofix_config(
                     stale_reason = "output_health_failed"
             if (section in pre_add_sections or (section == "data_stage" and mode == "add-ids")) and (pref.errors or pref.input_issues):
                 pre_add_ids_stale = True
+                pre_add_ids_stale_due_to_issue = True
             if stale_reason:
+                guard_freshness = stale_reason != "output_health_failed"
                 _mark_overwrite(
                     cfg,
                     section,
@@ -1688,9 +1793,14 @@ def _autofix_config(
                     f"stale: {stale_reason}",
                     changes,
                     add_overwrite,
+                    stages_manifest,
+                    ref_mtime,
+                    guard_freshness,
                 )
                 if section in pre_add_sections or (section == "data_stage" and mode == "add-ids"):
                     pre_add_ids_stale = True
+                    if stale_reason == "output_health_failed":
+                        pre_add_ids_stale_due_to_issue = True
             if (code_changed or config_changed) and (section in pre_add_sections or (section == "data_stage" and mode == "add-ids")):
                 pre_add_ids_stale = True
             for issue in pref.input_issues:
@@ -1711,6 +1821,7 @@ def _autofix_config(
                             changes.append(f"overwrite {prod_section}.{prod_mode}=true")
 
     if pre_add_ids_stale:
+        guard_freshness = not pre_add_ids_stale_due_to_issue
         _mark_overwrite(
             cfg,
             "features",
@@ -1718,6 +1829,9 @@ def _autofix_config(
             "upstream stale before add-ids",
             changes,
             add_overwrite,
+            stages_manifest,
+            ref_mtime,
+            guard_freshness,
         )
         _mark_overwrite(
             cfg,
@@ -1726,6 +1840,9 @@ def _autofix_config(
             "upstream stale before add-ids",
             changes,
             add_overwrite,
+            stages_manifest,
+            ref_mtime,
+            guard_freshness,
         )
 
     if not changes:
