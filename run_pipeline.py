@@ -78,6 +78,7 @@ CONFIG_SHA256: str | None = None
 GIT_COMMIT: str | None = None
 RUN_NAME: str | None = None
 RUN_MANIFEST_PATH: Path | None = None
+CONFIG_PATH: Path | None = None
 CACHE_CFG: Dict[str, Any] = {}
 LOG_PATH: Path | None = None
 LOG_FH = None
@@ -531,13 +532,15 @@ def _autofix_stale_reason(
     return None
 
 
-def _load_diagnostics_checks(run_name: str | None) -> List[Dict[str, Any]]:
+def _load_diagnostics_checks(
+    run_name: str | None,
+) -> tuple[List[Dict[str, Any]], Path | None, float | None]:
     reports_dir = Path("results/reports")
     if not reports_dir.exists():
-        return []
+        return [], None, None
     candidates = list(reports_dir.glob("*/diagnostics/diagnostics.json"))
     if not candidates:
-        return []
+        return [], None, None
     chosen = None
     if run_name:
         for p in candidates:
@@ -549,7 +552,11 @@ def _load_diagnostics_checks(run_name: str | None) -> List[Dict[str, Any]]:
         chosen = max(candidates, key=lambda p: p.stat().st_mtime)
     data = _load_json(chosen)
     checks = data.get("checks", [])
-    return checks if isinstance(checks, list) else []
+    try:
+        diag_mtime = chosen.stat().st_mtime
+    except Exception:
+        diag_mtime = None
+    return (checks if isinstance(checks, list) else []), chosen, diag_mtime
 
 
 def _normalize_path_str(value: str) -> str:
@@ -1660,11 +1667,17 @@ def _autofix_config(
     log_path = _latest_log_path(run_name, manifest)
     log_mtime = log_path.stat().st_mtime if log_path and log_path.exists() else None
     code_mtime = _pipeline_code_mtime(HERE)
-    ref_mtime = None
-    for ts in (log_mtime, code_mtime):
+    config_mtime = None
+    if CONFIG_PATH and CONFIG_PATH.exists():
+        try:
+            config_mtime = CONFIG_PATH.stat().st_mtime
+        except Exception:
+            config_mtime = None
+    code_or_config_mtime = None
+    for ts in (code_mtime, config_mtime):
         if ts is None:
             continue
-        ref_mtime = ts if ref_mtime is None else max(ref_mtime, ts)
+        code_or_config_mtime = ts if code_or_config_mtime is None else max(code_or_config_mtime, ts)
     code_changed = bool(stages_meta.get("pipeline_code_sha256")) and bool(PIPELINE_CODE_SHA256) and (
         stages_meta.get("pipeline_code_sha256") != PIPELINE_CODE_SHA256
     )
@@ -1676,10 +1689,12 @@ def _autofix_config(
             f"[autofix] upstream change detected: "
             f"code_changed={code_changed} config_changed={config_changed}"
         )
-    diag_checks = _load_diagnostics_checks(run_name)
+    diag_checks, diag_path, diag_mtime = _load_diagnostics_checks(run_name)
     if diag_checks:
         diag_fails = [c for c in diag_checks if str(c.get("status")).lower() == "fail"]
         diag_add_overwrite = add_overwrite or bool(diag_fails)
+        if diag_fails and diag_path:
+            print(f"[autofix] diagnostics source: {diag_path}")
         for chk in diag_fails:
             issue = str(chk.get("issue") or "").strip()
             if not issue:
@@ -1693,7 +1708,7 @@ def _autofix_config(
                     changes,
                     diag_add_overwrite,
                     stages_manifest,
-                    ref_mtime,
+                    diag_mtime,
                     True,
                 )
 
@@ -1701,7 +1716,7 @@ def _autofix_config(
     if last_run_reasons:
         for (section, mode), reasons in sorted(last_run_reasons.items()):
             reason = "last_run_error: " + ", ".join(sorted(reasons))
-            _mark_overwrite(cfg, section, mode, reason, changes, True, stages_manifest, ref_mtime, True)
+            _mark_overwrite(cfg, section, mode, reason, changes, True, stages_manifest, log_mtime, True)
             for dep in _expand_upstream_deps(section, mode):
                 _mark_overwrite(
                     cfg,
@@ -1711,7 +1726,7 @@ def _autofix_config(
                     changes,
                     True,
                     stages_manifest,
-                    ref_mtime,
+                    log_mtime,
                     True,
                 )
     pre_add_ids_stale = False
@@ -1785,6 +1800,9 @@ def _autofix_config(
                 pre_add_ids_stale = True
                 pre_add_ids_stale_due_to_issue = True
             if stale_reason:
+                stale_ref = None
+                if stale_reason in {"pipeline_code_changed", "config_changed", "pipeline_code_or_config_changed"}:
+                    stale_ref = code_or_config_mtime
                 guard_freshness = stale_reason != "output_health_failed"
                 _mark_overwrite(
                     cfg,
@@ -1794,7 +1812,7 @@ def _autofix_config(
                     changes,
                     add_overwrite,
                     stages_manifest,
-                    ref_mtime,
+                    stale_ref,
                     guard_freshness,
                 )
                 if section in pre_add_sections or (section == "data_stage" and mode == "add-ids"):
@@ -1830,7 +1848,7 @@ def _autofix_config(
             changes,
             add_overwrite,
             stages_manifest,
-            ref_mtime,
+            code_or_config_mtime,
             guard_freshness,
         )
         _mark_overwrite(
@@ -1841,7 +1859,7 @@ def _autofix_config(
             changes,
             add_overwrite,
             stages_manifest,
-            ref_mtime,
+            code_or_config_mtime,
             guard_freshness,
         )
 
@@ -2972,6 +2990,8 @@ def main() -> int:
     ns = ap.parse_args()
 
     cfg_path = Path(ns.config).resolve()
+    global CONFIG_PATH
+    CONFIG_PATH = cfg_path
     cfg_text = cfg_path.read_text(encoding="utf-8")
     cfg = yaml.safe_load(cfg_text) or {}
     _init_logging(cfg.get("run_name"), ns.log_file)
