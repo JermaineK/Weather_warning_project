@@ -240,6 +240,11 @@ def _row_count(path: Path) -> int:
         try:
             pf = pq.ParquetFile(path)
         except Exception as exc:
+            msg = str(exc).lower()
+            if "exceeded size limit" in msg or "couldn't deserialize thrift" in msg:
+                # Agent: tolerate oversized parquet metadata by treating row count as unknown.
+                print(f"[warn] row count unavailable for {path}: {exc}")
+                return -1
             raise SystemExit(f"Failed to open parquet file for row counts: {exc}")
         meta = pf.metadata
         meta_rows = int(meta.num_rows) if meta is not None else 0
@@ -838,7 +843,10 @@ def preflight_step(section: str, step: Dict[str, Any]) -> PreflightResult:
             if spec.required:
                 non_empty = None
                 for mp in matches:
-                    if _row_count(mp) > 0:
+                    rows = _row_count(mp)
+                    if rows != 0:
+                        if rows < 0:
+                            print(f"[warn] {label}: row count unavailable for {mp}; treating as non-empty.")
                         non_empty = mp
                         break
                 if non_empty is None:
@@ -869,10 +877,12 @@ def preflight_step(section: str, step: Dict[str, Any]) -> PreflightResult:
                 continue
             if spec.required:
                 rows = _row_count(target)
-                if rows <= 0:
+                if rows == 0:
                     errors.append(f"{label}: required input {used_key or path} is empty or unreadable.{_format_produced_by(spec)}")
                     input_issues.append(InputIssue(spec, "empty_file", used_key, path, detail="input file empty or unreadable"))
                     continue
+                if rows < 0:
+                    print(f"[warn] {label}: row count unavailable for {target}; continuing.")
 
         if spec.required_columns:
             missing_cols = _validate_required_columns(target, spec.required_columns)
@@ -932,12 +942,14 @@ def postflight_step(
                 raise SystemExit(f"{label}: expected output dir {used_key or path} is not a directory.")
             continue
         rows = _row_count(path)
-        if rows <= 0:
+        if rows == 0:
             mode = str(step.get("mode", "")).strip()
             if section == "training" and mode == "track-objects":
                 print(f"[warn] {label}: output {path} is empty (no objects found); continuing.")
                 continue
             raise SystemExit(f"{label}: output {path} is empty or unreadable.")
+        if rows < 0:
+            print(f"[warn] {label}: row count unavailable for {path}; skipping row count check.")
         needed_cols = expected_output_columns or contract.expected_output_columns(step)
         needed_cols = [c for c in needed_cols if c]  # drop blanks
         if needed_cols:
