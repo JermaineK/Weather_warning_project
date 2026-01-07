@@ -428,11 +428,22 @@ def parse_args():
     ap.add_argument("--chunk-rows", type=int, default=200_000, help="Chunk size for CSV streaming.")
     ap.add_argument("--chunksize", type=int, default=200_000, help="Alias for --chunk-rows.")
     ap.add_argument("--parquet-rows", type=int, default=200_000, help="Batch size for parquet streaming.")
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite outputs if they already exist.")
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.objects_out:
+        obj_path = Path(args.objects_out)
+        if obj_path.exists() and not args.overwrite:
+            print(f"[track] objects_out exists; skipping (use --overwrite): {obj_path}")
+            return
+    if args.join_out:
+        join_path = Path(args.join_out)
+        if join_path.exists() and not args.overwrite:
+            print(f"[track] join_out exists; skipping (use --overwrite): {join_path}")
+            return
     track_objects(args.infile, args)
 
 
