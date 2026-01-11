@@ -23,6 +23,11 @@ import argparse, os, math, sys
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 
+HERE = Path(__file__).resolve()
+REPO_ROOT = HERE.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import numpy as np
 import pandas as pd
 from utils import join_audit
