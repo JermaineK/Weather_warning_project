@@ -13,9 +13,14 @@ import gzip
 import json
 import math
 import re
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+HERE = Path(__file__).resolve()
+REPO_ROOT = HERE.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import pandas as pd
@@ -26,11 +31,6 @@ try:
     import pyarrow.parquet as pq  # type: ignore
 except Exception:  # pragma: no cover
     pq = None  # type: ignore
-
-HERE = Path(__file__).resolve()
-REPO_ROOT = HERE.parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from utils import config_normalize
 from utils.run_naming import make_run_dir
