@@ -4,7 +4,7 @@
 """
 train_viability_model.py
 
-Fit a simple viability model P(y_viable | G, S, E, ...).
+Fit a simple viability/commitment model P(y_commit | G, S, E, ...).
 Default: logistic regression with balanced class weights.
 """
 
@@ -27,6 +27,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from utils import join_audit
+from utils import feature_guard
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
@@ -54,6 +55,27 @@ BLOCKLIST_DEFAULT = [
     "dist*track*",
 ]
 
+# Columns used to define knee/lock-style labels; block to avoid trivial leakage.
+LABEL_LEAK_FEATURES = {
+    "commit": [
+        "gka_knee_state",
+        "gka_knee_cross",
+        "gka_parity_lock",
+        "gka_SAI",
+    ],
+    "knee": [
+        "gka_knee_state",
+        "gka_knee_cross",
+        "gka_parity_lock",
+        "gka_SAI",
+    ],
+    "lock": [
+        "gka_parity_lock",
+        "gka_knee_state",
+        "gka_knee_cross",
+    ],
+}
+
 
 def _parse_csv_list(raw: str) -> List[str]:
     return [p.strip() for p in str(raw).split(",") if p.strip()]
@@ -66,6 +88,19 @@ def _blocked_features(features: Sequence[str], patterns: Sequence[str]) -> List[
             if fnmatch(feat, pat):
                 blocked.append(feat)
                 break
+    return sorted(set(blocked))
+
+
+def _label_leaks(target: str, features: Sequence[str]) -> List[str]:
+    """
+    Block same-time state/lock features when the label is derived from
+    knee/lock logic. Lagged variants remain allowed by name.
+    """
+    t = str(target).lower()
+    blocked: List[str] = []
+    for key, names in LABEL_LEAK_FEATURES.items():
+        if key in t:
+            blocked.extend([f for f in features if f in names])
     return sorted(set(blocked))
 
 
@@ -240,28 +275,36 @@ def _label_sample(df: pd.DataFrame, key_cols: Sequence[str], label: str, n: int 
         sample["time"] = sample["time"].astype(str)
     return sample.to_dict(orient="records")
 
-def _load_table(path: str) -> pd.DataFrame:
+def _load_table(path: str, columns: Optional[Sequence[str]] = None) -> pd.DataFrame:
     if path.lower().endswith((".parquet", ".parq", ".pq")):
-        return pd.read_parquet(path)
-    return pd.read_csv(path, low_memory=False)
+        return pd.read_parquet(path, columns=list(columns) if columns else None)
+    return pd.read_csv(path, low_memory=False, usecols=list(columns) if columns else None)
+
+
+def _available_columns(path: str) -> List[str]:
+    if path.lower().endswith((".parquet", ".parq", ".pq")):
+        import pyarrow.parquet as pq  # type: ignore
+
+        return list(pq.ParquetFile(path).schema.names)
+    return list(pd.read_csv(path, nrows=0).columns)
 
 
 def _add_lead_features(df: pd.DataFrame, horizon: float = 240.0) -> pd.DataFrame:
     """Add lead-derived helper columns if lead is present."""
     if "t_to_storm_min_h" not in df.columns:
         return df
-    lead = pd.to_numeric(df["t_to_storm_min_h"], errors="coerce")
-    lead_clip = lead.clip(lower=0.0, upper=horizon)
-    df = df.copy()
-    df["lead_clip"] = lead_clip
-    df["lead_norm"] = 1.0 - (lead_clip / horizon)
-    df["lead_inv"] = 1.0 / (1.0 + lead_clip)
+    # Agent: avoid full-frame copies; append minimal float32 helpers in-place.
+    lead = pd.to_numeric(df["t_to_storm_min_h"], errors="coerce").to_numpy(dtype="float32", copy=False)
+    lead_clip = np.clip(lead, 0.0, float(horizon))
+    df["lead_norm"] = (1.0 - (lead_clip / float(horizon))).astype("float32")
+    df["lead_inv"] = (1.0 / (1.0 + lead_clip)).astype("float32")
     if "G_struct" in df.columns:
-        df["G_lead_norm"] = df["G_struct"] * df["lead_norm"]
+        g_vals = pd.to_numeric(df["G_struct"], errors="coerce").to_numpy(dtype="float32", copy=False)
+        df["G_lead_norm"] = g_vals * df["lead_norm"].to_numpy(dtype="float32", copy=False)
     # coarse lead band for stratified sampling (optional downstream)
-    bins = [0, 24, 72, 120, horizon, np.inf]
+    bins = [0, 24, 72, 120, float(horizon), np.inf]
     labels = ["0-24", "24-72", "72-120", "120-240", ">240"]
-    df["lead_band"] = pd.cut(lead.fillna(horizon + 1), bins=bins, labels=labels, right=True)
+    df["lead_band"] = pd.cut(pd.Series(lead).fillna(float(horizon) + 1), bins=bins, labels=labels, right=True)
     return df
 
 
@@ -381,8 +424,8 @@ def main() -> None:
         description="Train a viability model on GSE panel features.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--train", required=True, help="Training table with y_viable.")
-    ap.add_argument("--target", default="y_viable", help="Target column.")
+    ap.add_argument("--train", required=True, help="Training table with the target label.")
+    ap.add_argument("--target", default="y_commit", help="Target column.")
     ap.add_argument(
         "--features",
         nargs="+",
@@ -506,17 +549,30 @@ def main() -> None:
         print(f"[train-viability] outputs exist; skipping (use --overwrite): {joined}")
         return
 
+    # Determine minimal columns to load to reduce memory pressure.
+    available_cols = _available_columns(args.train)
+    required_cols = set(args.features) | {args.target} | set(key_cols)
+    if (args.min_lead is not None) or (args.max_lead is not None):
+        required_cols.add("t_to_storm_min_h")
+    # Keep lead column when available for optional stratified sampling.
+    if "t_to_storm_min_h" in available_cols:
+        required_cols.add("t_to_storm_min_h")
+    missing_required = [c for c in required_cols if c not in available_cols]
+    if missing_required:
+        raise SystemExit(f"Missing required columns in training data: {missing_required}")
+    usecols = [c for c in available_cols if c in required_cols]
+
     if args.chunksize and args.chunksize > 0:
         chunk_rows = int(args.chunksize)
         if args.train.lower().endswith((".parquet", ".parq", ".pq")):
             import pyarrow.parquet as pq  # type: ignore
             pf = pq.ParquetFile(args.train)
-            dfs = [batch.to_pandas() for batch in pf.iter_batches(batch_size=chunk_rows)]
+            dfs = [batch.to_pandas() for batch in pf.iter_batches(batch_size=chunk_rows, columns=usecols)]
         else:
-            dfs = list(pd.read_csv(args.train, low_memory=False, chunksize=chunk_rows))
+            dfs = list(pd.read_csv(args.train, low_memory=False, chunksize=chunk_rows, usecols=usecols))
         df = pd.concat(dfs, ignore_index=True)
     else:
-        df = _load_table(args.train)
+        df = _load_table(args.train, columns=usecols)
 
     missing_keys = [c for c in key_cols if c not in df.columns]
     if missing_keys:
@@ -535,6 +591,18 @@ def main() -> None:
     blocked = _blocked_features(features, block_patterns)
     if blocked:
         raise SystemExit(f"Blocked columns in training features: {blocked}")
+    label_leaks = _label_leaks(args.target, features)
+    if label_leaks:
+        raise SystemExit(
+            "Label leakage: remove label-defining columns from features: "
+            f"{label_leaks}"
+        )
+    feature_guard.assert_no_forbidden_features(
+        features,
+        stage="training.train-viability",
+        path=str(args.train),
+        target=args.target,
+    )
     features = [f for f in features if f not in key_cols]
     if not features:
         raise SystemExit("No feature columns selected after removing key columns.")
@@ -554,7 +622,7 @@ def main() -> None:
             raise SystemExit(
                 "Training data contains only one class even after retry.\n"
                 f"Class counts: {cls_counts.to_dict()}\n"
-                "This usually means build_viability_targets.py produced y_viable=0 for all rows. "
+                f"This usually means build_viability_targets.py produced {target}=0 for all rows. "
                 "Check lead-window detection and g_min filtering there."
             )
         print(f"[train] retry succeeded; using {len(df_fit):,} rows with class counts {cls_counts.to_dict()}")
@@ -566,6 +634,13 @@ def main() -> None:
     y_nunique = int(y_vals.nunique(dropna=True))
     if y_nunique < 2:
         raise SystemExit(f"Target '{args.target}' is constant after sampling; check upstream labels.")
+    feature_guard.scan_leakage_auc(
+        df_fit,
+        args.target,
+        stage="training.train-viability",
+        path=str(args.train),
+        feature_cols=features,
+    )
     feature_set_id = _hash_feature_list(features)
     table_fingerprint = _table_fingerprint(df_fit, list(features) + [args.target] + list(key_cols), key_cols)
     lead_summary = _lead_summary(df_fit, "lead_h")

@@ -27,6 +27,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from utils import join_audit
+from utils import feature_guard
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
@@ -325,6 +326,7 @@ def _collect_data(
     label: str,
     time_col: str,
     key_cols: Sequence[str],
+    extra_cols: Sequence[str] | None,
     chunk_rows: int | None,
     parquet_rows: int | None,
     sample_frac: float,
@@ -332,7 +334,8 @@ def _collect_data(
     neg_pos_ratio: float,
     seed: int,
 ) -> pd.DataFrame:
-    cols = list(set(features) | set(key_cols) | {label, time_col})
+    extra_cols = list(extra_cols or [])
+    cols = list(set(features) | set(key_cols) | {label, time_col} | set(extra_cols))
     parts: List[pd.DataFrame] = []
     total_seen = 0
     rng = np.random.default_rng(seed)
@@ -574,6 +577,7 @@ def main():
     missing_keys = [c for c in key_cols if c not in cols]
     if missing_keys:
         raise SystemExit(f"Missing key columns in training data: {missing_keys}")
+    leak_candidates = feature_guard.candidate_leak_columns(cols)
 
     features = args.features
     if not features:
@@ -584,6 +588,12 @@ def main():
     blocked = _blocked_features(features, block_patterns)
     if blocked:
         raise SystemExit(f"Blocked columns in training features: {blocked}")
+    feature_guard.assert_no_forbidden_features(
+        features,
+        stage="training.train-base",
+        path=str(args.train),
+        target=args.label,
+    )
     features = [f for f in features if f not in key_cols]
     _enforce_feature_manifest(features, args.features_manifest, args.require_feature_metadata)
 
@@ -593,6 +603,7 @@ def main():
         args.label,
         args.time_col,
         key_cols,
+        leak_candidates,
         args.chunksize,
         args.parquet_rows,
         args.sample_frac,
@@ -610,6 +621,13 @@ def main():
     y_nunique = int(y_vals.nunique(dropna=True))
     if y_nunique < 2:
         raise SystemExit(f"Label '{args.label}' is constant after sampling; check upstream labels.")
+    feature_guard.scan_leakage_auc(
+        df,
+        args.label,
+        stage="training.train-base",
+        path=str(args.train),
+        feature_cols=features,
+    )
     feature_set_id = _hash_feature_list(features)
     table_fingerprint = _table_fingerprint(df, list(features) + [args.label] + list(key_cols), key_cols)
     lead_summary = _lead_summary(df, "lead_h")

@@ -1,0 +1,19 @@
+knee_targets:
+  forbid:
+    - gka_parity_lock
+    - gka_knee_state
+    - gka_SAI
+    - gka_SII
+  allow_lagged_variants:
+    - gka_parity_lock_past6h
+    - gka_knee_state_past6h
+    - gka_parity_lock_past12h
+    - gka_knee_state_past12h
+    - gka_parity_lock_past24h
+    - gka_knee_state_past24h
+commit_targets:
+  forbid:
+    - gka_parity_lock
+    - gka_knee_state
+    - gka_SAI
+    - gka_SII

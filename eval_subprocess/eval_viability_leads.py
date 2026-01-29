@@ -6,7 +6,7 @@ eval_viability_leads.py
 Lead-aware evaluation for the viability model using t_to_storm_min_h.
 
 Semantics:
-  - Coincident target: y_viable (or --target)
+  - Coincident target: y_commit (or --target)
   - Lead-L target: 1 if 0 < t_to_storm_min_h <= L (or > lead-lower)
 
 Defaults are aligned to the new pipeline layout:
@@ -30,6 +30,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
+from sklearn.feature_selection import mutual_info_classif
 
 HERE = Path(__file__).resolve()
 REPO_ROOT = HERE.parent.parent
@@ -37,6 +38,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils import io_common
+from utils import feature_guard
 
 pd.options.mode.copy_on_write = True
 
@@ -112,6 +114,80 @@ def _build_matrix(df: pd.DataFrame, features: Sequence[str]) -> np.ndarray:
     return Xdf.fillna(0.0).to_numpy(dtype=float, copy=False)
 
 
+def _shift_label_by_hours(
+    df: pd.DataFrame,
+    label: str,
+    hours: int,
+    time_col: str = "time",
+    group_cols: Sequence[str] = ("lat", "lon"),
+) -> np.ndarray:
+    if hours == 0:
+        return pd.to_numeric(df[label], errors="coerce").fillna(0).to_numpy()
+    if time_col not in df.columns:
+        raise SystemExit(f"[audit] time column '{time_col}' missing; cannot run shift audit.")
+    work = df[list(group_cols) + [time_col, label]].copy()
+    work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+    work = work.dropna(subset=[time_col])
+    work = work.sort_values(list(group_cols) + [time_col])
+    shifted = (
+        work.groupby(list(group_cols), sort=False)[label]
+        .shift(int(hours))
+        .fillna(0)
+        .to_numpy()
+    )
+    out = np.zeros(len(df), dtype=int)
+    out[work.index.to_numpy()] = (pd.to_numeric(shifted, errors="coerce") > 0).astype(int)
+    return out
+
+
+def _audit_feature_shift(
+    df: pd.DataFrame,
+    features: Sequence[str],
+    label: str,
+    shift_h: int,
+    max_rows: int,
+    max_features: int,
+) -> None:
+    try:
+        from sklearn.metrics import roc_auc_score
+    except Exception:
+        print("[audit] skipped (sklearn missing).")
+        return
+    if label not in df.columns:
+        print(f"[audit] skipped (label '{label}' missing).")
+        return
+    if len(df) > max_rows:
+        df = df.sample(n=max_rows, random_state=42)
+        print(f"[audit] sampled {len(df):,} rows for shift test.")
+    feats = list(features)[: max_features or len(features)]
+    y = _coerce_binary_series(df[label], label, "audit")
+    try:
+        y_plus = _shift_label_by_hours(df, label, abs(shift_h))
+        y_minus = _shift_label_by_hours(df, label, -abs(shift_h))
+    except SystemExit as exc:
+        print(str(exc))
+        return
+    issues = []
+    for f in feats:
+        if f not in df.columns:
+            continue
+        x = pd.to_numeric(df[f], errors="coerce").fillna(0).to_numpy()
+        if np.unique(x).size < 2:
+            continue
+        try:
+            auc0 = roc_auc_score(y, x)
+            aucp = roc_auc_score(y_plus, x)
+            aucm = roc_auc_score(y_minus, x)
+        except Exception:
+            continue
+        if (abs(auc0 - aucp) < 0.01 and abs(auc0 - aucm) < 0.01) or (auc0 > 0.98 and aucp < 0.7 and aucm < 0.7):
+            issues.append((f, auc0, aucp, aucm))
+    if issues:
+        print("[audit] potential shift-invariant or leakage-like features:")
+        for f, auc0, aucp, aucm in issues[:20]:
+            print(f"  {f}: auc={auc0:.3f} shift+{shift_h}={aucp:.3f} shift-{shift_h}={aucm:.3f}")
+
+
 def _lead_mask(dt: np.ndarray, lead_h: float, lead_lower: float) -> np.ndarray:
     """Strict future window: (lead_lower, lead_h]."""
     return np.isfinite(dt) & (dt > lead_lower) & (dt <= lead_h)
@@ -137,6 +213,99 @@ def _safe_metrics(y: np.ndarray, p: np.ndarray) -> dict[str, float]:
     except Exception:
         mets["brier"] = float("nan")
     return mets
+
+
+def _unwrap_estimator(model):
+    if hasattr(model, "steps"):
+        return model.steps[-1][1]
+    if hasattr(model, "named_steps"):
+        steps = list(model.named_steps.values())
+        return steps[-1] if steps else model
+    return model
+
+
+def _sample_df(df: pd.DataFrame, max_rows: int = 200_000) -> pd.DataFrame:
+    if len(df) <= max_rows:
+        return df
+    return df.sample(n=max_rows, random_state=42)
+
+
+def _feature_corrs(df: pd.DataFrame, features: Sequence[str], y: np.ndarray) -> list[tuple[str, float, float]]:
+    out: list[tuple[str, float, float]] = []
+    yv = np.asarray(y, dtype=float)
+    for f in features:
+        x = pd.to_numeric(df.get(f), errors="coerce").to_numpy()
+        mask = np.isfinite(x) & np.isfinite(yv)
+        if mask.sum() < 2:
+            continue
+        corr = np.corrcoef(x[mask], yv[mask])[0, 1]
+        if np.isfinite(corr):
+            out.append((f, float(abs(corr)), float(corr)))
+    out.sort(key=lambda t: t[1], reverse=True)
+    return out
+
+
+def _feature_mutual_info(df: pd.DataFrame, features: Sequence[str], y: np.ndarray) -> list[tuple[str, float]]:
+    X = _build_matrix(df, features)
+    try:
+        mi = mutual_info_classif(X, y, discrete_features=False, random_state=42)
+    except Exception:
+        return []
+    out = [(f, float(v)) for f, v in zip(features, mi)]
+    out.sort(key=lambda t: t[1], reverse=True)
+    return out
+
+
+def _model_importance(model, features: Sequence[str]) -> list[tuple[str, float]]:
+    est = _unwrap_estimator(model)
+    if hasattr(est, "feature_importances_"):
+        vals = getattr(est, "feature_importances_")
+        out = [(f, float(v)) for f, v in zip(features, vals)]
+        return sorted(out, key=lambda t: t[1], reverse=True)
+    if hasattr(est, "coef_"):
+        coef = getattr(est, "coef_")
+        if getattr(coef, "ndim", 1) > 1:
+            coef = coef[0]
+        vals = np.abs(np.asarray(coef))
+        out = [(f, float(v)) for f, v in zip(features, vals)]
+        return sorted(out, key=lambda t: t[1], reverse=True)
+    return []
+
+
+def _run_perfect_tripwire(
+    df: pd.DataFrame,
+    features: Sequence[str],
+    y: np.ndarray,
+    model,
+    stage: str,
+    path: str,
+    target: str | None,
+) -> None:
+    sample = _sample_df(df)
+    if len(sample) != len(df):
+        print(f"[tripwire] using sample rows={len(sample):,} from {path}")
+        y_series = pd.Series(y, index=df.index)
+        y = y_series.loc[sample.index].to_numpy()
+
+    forbidden = feature_guard.forbidden_columns_for_target(features, target)
+    print(f"[tripwire] forbidden features in X ({stage}): {forbidden}")
+
+    corrs = _feature_corrs(sample, features, y)
+    print("[tripwire] top-30 by |pearson|:")
+    for f, absc, corr in corrs[:30]:
+        print(f"  {f}: |r|={absc:.4f} r={corr:.4f}")
+
+    mi = _feature_mutual_info(sample, features, y)
+    if mi:
+        print("[tripwire] top-30 by mutual_info:")
+        for f, v in mi[:30]:
+            print(f"  {f}: mi={v:.4f}")
+
+    imp = _model_importance(model, features)
+    if imp:
+        print("[tripwire] top-30 model importance:")
+        for f, v in imp[:30]:
+            print(f"  {f}: importance={v:.6f}")
 
 
 def _lead_summary(vals: np.ndarray) -> tuple[int, float, float]:
@@ -181,7 +350,7 @@ def parse_args():
     ap.add_argument(
         "--panel",
         default="data/grid_train_gse_panel_targets.parquet",
-        help="Panel with y_viable, lead column, and features.",
+        help="Panel with y_commit (or y_viable), lead column, and features.",
     )
     ap.add_argument(
         "--model",
@@ -206,7 +375,7 @@ def parse_args():
     ap.add_argument(
         "--target",
         default=None,
-        help="Target column for coincident metrics. Defaults to metrics JSON target or y_viable.",
+        help="Target column for coincident metrics. Defaults to metrics JSON target or y_commit.",
     )
     ap.add_argument(
         "--lead-col",
@@ -219,6 +388,12 @@ def parse_args():
         type=str,
         default=["24", "48", "72", "120"],
         help="Lead horizons (hours) to evaluate.",
+    )
+    ap.add_argument(
+        "--lead-target-template",
+        default=None,
+        help="Optional label template for per-lead targets (e.g., 'y_knee_cross_{lead}h'). "
+             "If set, per-lead labels are read directly from columns instead of lead_col windows.",
     )
     ap.add_argument(
         "--lead-lower",
@@ -246,6 +421,29 @@ def parse_args():
         action="store_true",
         help="Allow single-class targets (will emit warnings instead of failing).",
     )
+    ap.add_argument(
+        "--allow-perfect",
+        action="store_true",
+        help="Allow near-perfect coincident scores without failing the run.",
+    )
+    ap.add_argument(
+        "--audit-shift-hours",
+        type=int,
+        default=6,
+        help="Run a quick shift-causality audit using +/- this many hours (0 disables).",
+    )
+    ap.add_argument(
+        "--audit-max-rows",
+        type=int,
+        default=200_000,
+        help="Max rows sampled for shift audit.",
+    )
+    ap.add_argument(
+        "--audit-max-features",
+        type=int,
+        default=50,
+        help="Max features to test in shift audit.",
+    )
     return ap.parse_args()
 
 
@@ -268,10 +466,17 @@ def main():
             features = list(maybe_feats)
     if not features:
         raise SystemExit("No feature list found. Provide --features, metrics JSON, or a bundle with 'features'.")
+    feature_guard.assert_no_forbidden_features(
+        features,
+        stage="eval.viability-leads",
+        path=str(args.panel),
+        target=args.target or tgt_from_metrics,
+    )
 
-    target = args.target or tgt_from_metrics or "y_viable"
+    target = args.target or tgt_from_metrics or "y_commit"
     lead_col = args.lead_col
     lead_hours = _parse_leads(args.lead_hours)
+    lead_template = args.lead_target_template
 
     # Resolve default output path
     out_path = args.out
@@ -283,7 +488,16 @@ def main():
         print(f"[skip] output already exists: {out_path}")
         return
 
-    need_cols = set(features) | {target, lead_col}
+    need_cols = set(features)
+    if lead_template:
+        for h in lead_hours:
+            col = lead_template.format(lead=int(float(h)))
+            need_cols.add(col)
+        # only require coincident target if explicitly provided
+        if args.target:
+            need_cols.add(target)
+    else:
+        need_cols |= {target, lead_col}
     df = _load_panel(args.panel, need_cols)
 
     missing = [c for c in need_cols if c not in df.columns]
@@ -291,71 +505,119 @@ def main():
         raise SystemExit(f"Panel missing columns: {missing}")
 
     # Convert lead/target to numeric
-    lead_vals = pd.to_numeric(df[lead_col], errors="coerce").to_numpy(dtype=float)
-    y_coincident = _coerce_binary_series(df[target], target, "viability-eval")
-    lead_info = _lead_summary(lead_vals)
-    if lead_info[0] == 0:
-        raise SystemExit(
-            f"[viability-eval] lead column '{lead_col}' has no finite values after coercion "
-            f"(panel={args.panel})."
-        )
+    lead_vals = None
+    lead_info = (0, float("nan"), float("nan"))
+    if not lead_template:
+        lead_vals = pd.to_numeric(df[lead_col], errors="coerce").to_numpy(dtype=float)
+        lead_info = _lead_summary(lead_vals)
+        if lead_info[0] == 0:
+            raise SystemExit(
+                f"[viability-eval] lead column '{lead_col}' has no finite values after coercion "
+                f"(panel={args.panel})."
+            )
 
     X = _build_matrix(df, features)
     probs = model.predict_proba(X)[:, 1]
 
+    if args.audit_shift_hours and args.audit_shift_hours != 0:
+        _audit_feature_shift(
+            df,
+            features,
+            target,
+            shift_h=int(args.audit_shift_hours),
+            max_rows=int(args.audit_max_rows),
+            max_features=int(args.audit_max_features),
+        )
+
     rows = []
 
     # Coincident metrics (info only, lead_h=0 marker)
-    _assert_binary(
-        y_coincident,
-        f"coincident target '{target}'",
-        allow_single=args.allow_single_class,
-        lead_info=lead_info,
-        panel=args.panel,
-    )
-    coinc = _safe_metrics(y_coincident, probs)
-    rows.append(
-        {
-            "kind": "coincident",
-            "lead_h": 0.0,
-            "pos": int(y_coincident.sum()),
-            "samples": int(len(y_coincident)),
-            "pos_rate": float(y_coincident.mean() if len(y_coincident) else np.nan),
-            "auc": coinc["auc"],
-            "prauc": coinc["prauc"],
-            "brier": coinc["brier"],
-            "lead_lower": args.lead_lower,
-            "lead_col": lead_col,
-            "target": target,
-            "run_name": args.run_name or "",
-        }
-    )
+    if lead_template is None or args.target:
+        y_coincident = _coerce_binary_series(df[target], target, "viability-eval")
+        _assert_binary(
+            y_coincident,
+            f"coincident target '{target}'",
+            allow_single=args.allow_single_class,
+            lead_info=lead_info,
+            panel=args.panel,
+        )
+        coinc = _safe_metrics(y_coincident, probs)
+        if (not args.allow_perfect) and (
+            (coinc.get("auc", 0.0) > 0.995) or (coinc.get("prauc", 0.0) > 0.995)
+        ):
+            _run_perfect_tripwire(
+                df,
+                features,
+                y_coincident,
+                model,
+                stage="eval.viability-leads",
+                path=str(args.panel),
+                target=target,
+            )
+            raise SystemExit(
+                "[viability-eval] coincident score is near-perfect; "
+                "run aborted (use --allow-perfect to override)."
+            )
+        pos_rate = float(y_coincident.mean() if len(y_coincident) else np.nan)
+        prauc = coinc["prauc"]
+        lift = float(prauc / pos_rate) if pos_rate and np.isfinite(prauc) else np.nan
+        rows.append(
+            {
+                "kind": "coincident",
+                "lead_h": 0.0,
+                "pos": int(y_coincident.sum()),
+                "samples": int(len(y_coincident)),
+                "pos_rate": pos_rate,
+                "prauc_chance": pos_rate,
+                "lift": lift,
+                "auc": coinc["auc"],
+                "prauc": prauc,
+                "brier": coinc["brier"],
+                "lead_lower": args.lead_lower,
+                "lead_col": lead_col,
+                "target": target,
+                "run_name": args.run_name or "",
+            }
+        )
 
     # Per-lead metrics
     for h in lead_hours:
-        mask = _lead_mask(lead_vals, lead_h=float(h), lead_lower=float(args.lead_lower))
-        y_lead = mask.astype(int)
+        if lead_template:
+            col = lead_template.format(lead=int(float(h)))
+            if col not in df.columns:
+                raise SystemExit(f"Lead target column not found: {col}")
+            y_lead = _coerce_binary_series(df[col], col, "viability-eval")
+            label_desc = f"lead_h={float(h)}h (target={col})"
+        else:
+            mask = _lead_mask(lead_vals, lead_h=float(h), lead_lower=float(args.lead_lower))
+            y_lead = mask.astype(int)
+            label_desc = f"lead_h={float(h)}h (lead_col={lead_col})"
         _assert_binary(
             y_lead,
-            f"lead_h={float(h)}h (lead_col={lead_col})",
+            label_desc,
             allow_single=args.allow_single_class,
             lead_info=lead_info,
             panel=args.panel,
         )
         mets = _safe_metrics(y_lead, probs)
+        pos_rate = float(y_lead.mean() if len(y_lead) else np.nan)
+        prauc = mets["prauc"]
+        lift = float(prauc / pos_rate) if pos_rate and np.isfinite(prauc) else np.nan
         rows.append(
             {
                 "kind": "lead",
                 "lead_h": float(h),
                 "pos": int(y_lead.sum()),
                 "samples": int(len(y_lead)),
-                "pos_rate": float(y_lead.mean() if len(y_lead) else np.nan),
+                "pos_rate": pos_rate,
+                "prauc_chance": pos_rate,
+                "lift": lift,
                 "auc": mets["auc"],
-                "prauc": mets["prauc"],
+                "prauc": prauc,
                 "brier": mets["brier"],
                 "lead_lower": args.lead_lower,
-                "lead_col": lead_col,
-                "target": target,
+                "lead_col": lead_col if not lead_template else "",
+                "target": (target if not lead_template else col),
                 "run_name": args.run_name or "",
             }
         )

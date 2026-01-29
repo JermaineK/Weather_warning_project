@@ -30,6 +30,8 @@ report:
       conversion-csv: results/seedmaps/coral_sea_demo_conversion_rates.csv
       alerts-dir: results/alerts
       viability-thresholds: results/sweeps/viability_best_thresholds.csv
+      slowtick-prob-quantile: 0.99
+      slowtick-require-lead-col: true
       storm-timeseries: data/storm_timeseries_panel.parquet
       ibtracs: data/tracks/tracks_subset.csv
       ibtracs-normalize-lon: *norm
@@ -45,7 +47,12 @@ report:
       animate-fps: 6
       diagnostics: true
       diagnostics-fail-on-checks: true
+      diagnostics-feature-meta: config/features_manifest.json
 report_pdf: true
+
+autofix:
+  use_diagnostics_rules: true
+  rebuild_on_change: false
 
 # =====================================================================
 # 0) Fetch — enabled to harvest ERA5 before merging existing files
@@ -211,6 +218,7 @@ features:
       chunk-hours: 72
       overwrite: false
       skip_if_exists: true
+      health_missing_ok_cols: ["t_to_storm_min_h"]
 
 
 # =====================================================================
@@ -241,6 +249,8 @@ data_stage:
       E-pulse-thr: 0.8
       persist-hours: 24
       pulse-hours: 96
+      knee-thr: 0.7
+      lock-hours: 12
       lite: false
       overwrite: true
       skip_if_exists: false
@@ -267,8 +277,8 @@ data_stage:
 
     # 2.2 Build training subset keyed by row_id, using t_to_storm_min_h
     - mode: subset-by-id
-      enabled: false
-      labelled: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+      enabled: true
+      labelled: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
       out: data/grid_train_subset_by_id.parquet
       id-col: row_id
       lead-col: t_to_storm_min_h
@@ -277,38 +287,44 @@ data_stage:
       max-rows: 20000000
       chunksize: 500000
       seed: 42
-      skip_if_exists: true
+      skip_if_exists: false
 
     # 2.4 GSE-style panel
     - mode: gse-panel
-      enabled: false
+      enabled: true
       subset: data/grid_train_subset_by_id.parquet
       out: data/grid_train_gse_panel.parquet
       chunksize: 200000
-      skip_if_exists: true
+      skip_if_exists: false
 
     # 2.5 Lagged GSE panel
     - mode: gse-lagged
-      enabled: false
+      enabled: true
       panel: data/grid_train_gse_panel.parquet
       out: data/grid_train_gse_panel_lagged.parquet
       lags: "1,2,3,6,12,24"
+      lag-cols: "gka_parity_lock,gka_knee_state,gka_SAI"
+      past-windows: "6,12,24"
+      past-mean-cols: "gka_parity_lock,gka_SAI,gka_knee_ratio,gka_chirality,gka_parity_eta"
+      past-std-cols: "gka_SAI,gka_knee_ratio,gka_chirality"
+      past-slope-cols: "gka_SAI,gka_knee_ratio,gka_chirality"
+      fliprate-cols: "gka_parity_lock,gka_knee_state"
       radius-deg: 0.0
       round-dp: 3
-      skip_if_exists: true
+      skip_if_exists: false
 
     # 2.6 Slow-tick features
     - mode: slowtick-features
-      enabled: false
+      enabled: true
       panel: data/grid_train_gse_panel_lagged.parquet
       out: data/grid_train_gse_panel_slowtick.parquet
       period-hours: 24.0
       use-modulated: true
-      skip_if_exists: true
+      skip_if_exists: false
 
     # 2.6b Discretised G/S/E states (for diagnostics/markov analysis)
     - mode: gse-states
-      enabled: false
+      enabled: true
       panel: data/grid_train_gse_panel_slowtick.parquet
       out: data/grid_train_gse_panel_states.parquet
       g-col: G_struct
@@ -316,42 +332,54 @@ data_stage:
       e-col: E_energy
       quantiles: "0,0.2,0.4,0.6,0.8,1.0"
       slow-phase-bins: 8
-      skip_if_exists: true
+      skip_if_exists: false
 
-    # 2.7 Viability targets / labels
+    # 2.7 Genesis/lead-window targets (IBTrACS horizons)
     - mode: viability-targets
-      enabled: false
+      enabled: true
       panel: data/grid_train_gse_panel_states.parquet
       out: data/grid_train_gse_panel_targets.parquet
+      save-targets-meta: data/grid_train_gse_panel_targets.meta.json
+      target-mode: knee-forecast
+      target-col: y_knee_cross_240h
+      knee-cross-col: gka_knee_cross
+      lock-col: gka_parity_lock
       lead-col: t_to_storm_min_h
       horizon-max: 240
       lead-h: 240
       g-min-quantile: 
-      g-min:
+      g-min: 0.0
       chunksize: 400000
       seed: 42
-      skip_if_exists: true
+      skip_if_exists: false
+      health_missing_ok_cols: ["lead_h", "lead_h_bucket", "lead_norm", "lead_inv", "G_lead_norm"]
 
     # 2.8 Train viability model
     - mode: train-viability
-      enabled: false
+      enabled: true
       train: data/grid_train_gse_panel_targets.parquet
-      target: y_viable
+      target: y_knee_cross_240h
       features:
-        - G_struct
-        - S_shear
-        - E_energy
-        - slow_cos
-        - slow_sin
-        - G_slow_cos
-        - G_slow_sin
+        - gka_SII
+        - gka_parity_eta
+        - gka_chirality
+        - gka_vortdiv_ratio
         - gka_F
         - gka_knee_ratio
+        - gka_knee_post_h
+        - gka_SAI_lag6h
+        - gka_SAI_mean_past12h
+        - gka_SAI_slope_past12h
+        - gka_parity_lock_lag6h
+        - gka_parity_lock_mean_past12h
+        - gka_parity_lock_fliprate_past24h
+        - gka_knee_state_lag6h
+        - gka_knee_state_fliprate_past24h
+        - gka_knee_ratio_slope_past12h
+        - gka_chirality_mean_past12h
         - SFI
         - SFI2
-        - lead_norm
-        - lead_inv
-        - G_lead_norm
+        - S3
       neg-pos-ratio: 3.0
       sample-frac: 0.8
       test-size: 0.2
@@ -365,7 +393,8 @@ data_stage:
       val-keys-out: models/viability_val_keys.parquet
       features-manifest: config/features_manifest.json
       require-feature-metadata: true
-      skip_if_exists: true
+      overwrite: true
+      skip_if_exists: false
 
     # 2.9 Storm-centric time series panel (optional)
     - mode: storm-timeseries
@@ -537,9 +566,9 @@ seeds:
     out-dir: results/seedmaps
     run-name: coral_sea_demo
     normalize-lon: *norm
-    prob-col: prob_viable
-    flag-col: y_viable
-    thr-file: results/sweeps/viability_best_thresholds.parquet
+    prob-col:
+    flag-col: y_knee_cross_240h
+    thr-file:
     thr-lead: 240
     thr-column: thr_Fbeta
     direction-col: zeta
@@ -558,21 +587,23 @@ seeds:
 # =====================================================================
 # 5) Sweep (viability thresholds)
 # =====================================================================
-sweep:
-  enabled: true
-  steps:
+  sweep:
+    enabled: true
+    steps:
     - mode: best-constrained
       enabled: true
       labelled: data/grid_train_gse_panel_targets.parquet
       model: models/viability_model.pkl
       metrics-json: models/viability_model_metrics.json
-      target: y_viable
-      success-col: y_viable
+      target: y_genesis
+      success-col: y_genesis
       lead-col: t_to_storm_min_h
       leads: "24,48,72,120,240"
       min-precision: 0.05
       max-coverage: 0.50
       fbeta: 0.5
+      thr-floor: 1e-6
+      thr-floor-quantile: 0.90
       normalize-lon: *norm
       area: *area
       out: results/sweeps/viability_best_thresholds.csv
@@ -581,9 +612,9 @@ sweep:
 # =====================================================================
 # 6) Evaluation (model + alerts)
 # =====================================================================
-eval:
-  enabled: true
-  steps:
+  eval:
+    enabled: true
+    steps:
     # Viability model skill vs t_to_storm_min_h leads
     - mode: viability-leads
       enabled: true
@@ -593,8 +624,9 @@ eval:
       model-metrics: models/viability_model_metrics.json
       lead-hours: "24,48,72,120,240"
       lead-col: t_to_storm_min_h
-      target: y_viable
-      out: results/metrics/coral_sea_demo_viability_leads.csv
+      target: y_knee_cross_240h
+      lead-target-template: "y_knee_cross_{lead}h"
+      out: results/metrics/coral_sea_demo_knee_leads.csv
       skip_if_exists: false
 
     # Alerts coverage / clustering (enable once alerts exist)

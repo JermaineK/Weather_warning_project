@@ -9,18 +9,20 @@ Post-process throttled/denoised/base alert grids to quantify:
   3) Slow-tick ridge: hourly spectrum peak near diurnal/slow band
 
 Upgrades:
-  • Anti-meridian-safe AOI crop
-  • Robust file selection (stage preference + latest mtime)
-  • Tolerant CSV read + consistent tz-naive UTC
-  • Guardrails (--min-hours-per-lead, NaN handling)
-  • Exposed bootstrap reps (--bootstrap-B)
-  • Optional gap-filling for FFT and hemi time-series export
+  - Anti-meridian-safe AOI crop
+  - Robust file selection (stage preference + latest mtime)
+  - Tolerant CSV read + consistent tz-naive UTC
+  - Guardrails (--min-hours-per-lead, NaN handling)
+  - Exposed bootstrap reps (--bootstrap-B)
+  - Optional gap-filling for FFT and hemi time-series export
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
+import sys
 from pathlib import Path
 from typing import Tuple, Optional, List, Dict
 
@@ -150,6 +152,44 @@ def _crop_aoi(df: pd.DataFrame, aoi, lat_col: str = "lat", lon_col: str = "lon")
     return df[(df[lon_col] >= lonW) | (df[lon_col] <= lonE)]
 
 
+def _hash_series(series: pd.Series, max_items: int = 1_000_000) -> str:
+    if series is None or len(series) == 0:
+        return ""
+    vals = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    idx = series.index
+    try:
+        idx_vals = pd.to_datetime(idx, errors="coerce").view("int64").to_numpy(dtype=np.int64, copy=False)
+    except Exception:
+        idx_vals = pd.to_numeric(pd.Index(idx), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    n = min(len(vals), max_items)
+    packed = np.column_stack([idx_vals[:n], vals[:n]]).astype(np.float64, copy=False)
+    return hashlib.sha256(packed.tobytes()).hexdigest()
+
+
+def _hash_hemi(df: pd.DataFrame, max_items: int = 1_000_000) -> str:
+    if df is None or df.empty:
+        return ""
+    north = pd.to_numeric(df.get("north"), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    south = pd.to_numeric(df.get("south"), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    idx = df.index
+    try:
+        idx_vals = pd.to_datetime(idx, errors="coerce").view("int64").to_numpy(dtype=np.int64, copy=False)
+    except Exception:
+        idx_vals = pd.to_numeric(pd.Index(idx), errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    n = min(len(idx_vals), max_items)
+    packed = np.column_stack([idx_vals[:n], north[:n], south[:n]]).astype(np.float64, copy=False)
+    return hashlib.sha256(packed.tobytes()).hexdigest()
+
+
+def _duplicate_hashes(hash_map: Dict[int, str]) -> Dict[str, List[int]]:
+    by_hash: Dict[str, List[int]] = {}
+    for lead, h in hash_map.items():
+        if not h:
+            continue
+        by_hash.setdefault(h, []).append(int(lead))
+    return {h: sorted(leads) for h, leads in by_hash.items() if len(leads) > 1}
+
+
 # ---------- file I/O ----------
 
 def _pick_candidate(paths: List[Path], prefer: str) -> Optional[Path]:
@@ -264,8 +304,10 @@ def _read_alert_for_lead(
     fallback_path: Optional[Path],
     thresholds: Dict[int, float],
     prob_col: str,
+    prob_quantile: Optional[float],
     fallback_df: Optional[pd.DataFrame],
-) -> Tuple[Optional[pd.DataFrame], Optional[Path], Optional[str]]:
+    require_lead_col: bool,
+) -> Tuple[Optional[pd.DataFrame], Optional[Path], Optional[str], Dict[str, object]]:
     """
     Locate the preferred alerts file for a given lead, load it, normalize time/lat/lon,
     determine the effective flag column (with fallbacks), and return (df, path, eff_flag).
@@ -299,6 +341,14 @@ def _read_alert_for_lead(
     else:
         cols = set(_peek_columns(path))
 
+    # Optional: filter by lead_h if present to avoid identical-per-lead series
+    lead_col = None
+    for cand in ("lead_h", "lead", "lead_hours", "lead_hr"):
+        if cand in cols:
+            lead_col = cand
+            break
+    inferred_lead = False
+
     thr = thresholds.get(int(lead))
     lead_flag = None
     if requested_flag:
@@ -316,14 +366,21 @@ def _read_alert_for_lead(
                 break
 
     use_prob_threshold = False
-    if thr is not None and prob_col in cols and lead_flag is None:
-        use_prob_threshold = True
+
+    # Enforce lead-aware filtering
+    if lead_col is None:
+        lead_in_name = f"lead{lead}" in str(path.name)
+        if not lead_in_name and lead_flag is None and require_lead_col:
+            raise SystemExit(
+                f"[slowtick] lead_h column missing in {path.name}; cannot guarantee per-lead filtering."
+            )
+        # Allow explicit lead-only files or lead-specific flags by injecting lead_h
+        lead_col = "lead_h"
+        inferred_lead = True
 
     # Decide effective flag
     if lead_flag is not None:
         eff_flag = lead_flag
-    elif use_prob_threshold:
-        eff_flag = f"_prob_thr_{lead}h"
     else:
         eff_flag = requested_flag if requested_flag in cols else None
         if eff_flag is None:
@@ -334,11 +391,33 @@ def _read_alert_for_lead(
         if eff_flag is None:
             eff_flag = requested_flag or "alert_final"
 
-    usecols = [c for c in ("time", "lat", "lon", eff_flag, prob_col) if c in cols] or None
+    usecols = [c for c in ("time", "lat", "lon", eff_flag, prob_col, lead_col) if c and c in cols] or None
     if using_fallback and fallback_df is not None:
         df = fallback_df
     else:
         df = _load_alert_table(path, time_fmt, norm_lon, aoi, usecols=usecols)
+    if inferred_lead:
+        df[lead_col] = float(lead)
+
+    # If a lead column exists, slice to this lead's rows to prevent cross-lead mixing
+    if lead_col and lead_col in df.columns:
+        lead_vals = pd.to_numeric(df[lead_col], errors="coerce")
+        mask = np.isfinite(lead_vals) & np.isclose(lead_vals.to_numpy(), float(lead), atol=0.01)
+        if mask.any():
+            df = df.loc[mask].copy()
+        # If mask is empty, keep original (per-lead files may omit lead column)
+
+    # Optional per-lead quantile thresholding on prob_col (overrides static thresholds)
+    if prob_quantile is not None and prob_col in df.columns:
+        prob_vals = pd.to_numeric(df[prob_col], errors="coerce")
+        if prob_vals.notna().any():
+            thr = float(prob_vals.quantile(prob_quantile))
+        else:
+            thr = None
+
+    if thr is not None and prob_col in df.columns and lead_flag is None:
+        use_prob_threshold = True
+        eff_flag = f"_prob_thr_{lead}h"
 
     if use_prob_threshold:
         if prob_col in df.columns:
@@ -360,8 +439,24 @@ def _read_alert_for_lead(
             f"| lon={df['lon'].min():.2f}..{df['lon'].max():.2f} "
             f"| flag_col={eff_flag}"
         )
+        if lead_col and lead_col in df.columns:
+            try:
+                uniq = pd.to_numeric(df[lead_col], errors="coerce").dropna().unique()
+                if len(uniq) <= 5:
+                    print(f"[slowtick][debug] lead_col={lead_col} values={sorted(map(float, uniq))}")
+                else:
+                    print(f"[slowtick][debug] lead_col={lead_col} unique={len(uniq)}")
+            except Exception:
+                pass
 
-    return df, path, eff_flag
+    filter_mode = "lead_h_subset" if lead_col and not inferred_lead else "lead_flag_subset"
+    if inferred_lead and f"lead{lead}" in str(path.name):
+        filter_mode = "file_per_lead"
+    meta = {
+        "filter_mode": filter_mode,
+        "lead_col": lead_col or "",
+    }
+    return df, path, eff_flag, meta
 
 
 def _coverage_by_hour(df: pd.DataFrame, flag_col: str) -> pd.Series:
@@ -375,6 +470,75 @@ def _coverage_by_hour_hemi(df: pd.DataFrame, flag_col: str) -> pd.DataFrame:
     south = df[df["lat"] < 0].assign(_t=tt).groupby("_t", sort=True)[flag_col].mean()
     both = pd.concat({"north": north, "south": south}, axis=1).astype(float)
     return both.fillna(0.0)
+
+
+def _format_coverage_pattern(pattern: str, lead: int) -> str:
+    try:
+        return pattern.format(lead=lead, lead_h=lead)
+    except KeyError as exc:
+        raise SystemExit(f"[slowtick] coverage-series-pattern missing key {exc}. Use {{lead}} or {{lead_h}}.")
+    except Exception as exc:
+        raise SystemExit(f"[slowtick] coverage-series-pattern error: {exc}")
+
+
+def _coverage_series_candidates(series_dir: Path, lead: int, pattern: str) -> List[Path]:
+    formatted = _format_coverage_pattern(pattern, lead)
+    base = Path(formatted)
+    if not base.is_absolute():
+        base = series_dir / base
+    if base.suffixes:
+        return [base]
+    base_str = str(base)
+    return [
+        Path(base_str + ".parquet"),
+        Path(base_str + ".csv"),
+        Path(base_str + ".csv.gz"),
+    ]
+
+
+def _load_coverage_series_file(
+    path: Path,
+    time_fmt: Optional[str],
+) -> Tuple[pd.Series, Optional[pd.DataFrame], str, Optional[Tuple[str, str]]]:
+    df = _read_table_tolerant(path)
+    if df.empty:
+        raise SystemExit(f"[slowtick] coverage series empty: {path}")
+    if "time" not in df.columns:
+        raise SystemExit(f"[slowtick] coverage series missing time column: {path}")
+    df["time"] = _try_parse_time_raw(df["time"], time_fmt)
+    df = df.dropna(subset=["time"]).copy()
+    if df.empty:
+        raise SystemExit(f"[slowtick] coverage series has no valid time rows: {path}")
+
+    cov_col = None
+    for cand in ("coverage", "cov", "mean_cov"):
+        if cand in df.columns:
+            cov_col = cand
+            break
+    if cov_col is None:
+        raise SystemExit(f"[slowtick] coverage series missing coverage column: {path}")
+    df[cov_col] = pd.to_numeric(df[cov_col], errors="coerce")
+    cov = df.groupby("time", sort=True)[cov_col].mean().sort_index()
+
+    hemi_cols: Optional[Tuple[str, str]] = None
+    hemi: Optional[pd.DataFrame] = None
+    if {"cov_north", "cov_south"}.issubset(df.columns):
+        hemi_cols = ("cov_north", "cov_south")
+        df["cov_north"] = pd.to_numeric(df["cov_north"], errors="coerce")
+        df["cov_south"] = pd.to_numeric(df["cov_south"], errors="coerce")
+        hemi = (
+            df.groupby("time", sort=True)[["cov_north", "cov_south"]]
+            .mean()
+            .rename(columns={"cov_north": "north", "cov_south": "south"})
+            .sort_index()
+        )
+    elif {"north", "south"}.issubset(df.columns):
+        hemi_cols = ("north", "south")
+        df["north"] = pd.to_numeric(df["north"], errors="coerce")
+        df["south"] = pd.to_numeric(df["south"], errors="coerce")
+        hemi = df.groupby("time", sort=True)[["north", "south"]].mean().sort_index()
+
+    return cov, hemi, cov_col, hemi_cols
 
 
 # ---------- stats helpers ----------
@@ -439,7 +603,7 @@ def _fft_peak(freqs, amps, target_per_h=24, band=0.20):
 
 
 def _fill_small_gaps_hourly(series: pd.Series, max_gap_h=3) -> pd.Series:
-    """Fill short NaN runs (≤ max_gap_h) by linear interpolation; leave longer gaps."""
+    """Fill short NaN runs (<= max_gap_h) by linear interpolation; leave longer gaps."""
     s = series.copy()
     interp = s.interpolate(limit=max_gap_h, limit_direction="both")
     is_nan = s.isna().to_numpy()
@@ -460,10 +624,37 @@ def main():
     ap = argparse.ArgumentParser(description="Slow-tick diagnostics from throttled/denoised/base alerts.")
     ap.add_argument("--alerts-dir", required=True, help="Directory with alerts (throttled/denoised/base).")
     ap.add_argument("--run-name", required=True, help="Run name used in filenames (alerts_<run>_leadX_...).")
+    ap.add_argument(
+        "--coverage-series-dir",
+        default=None,
+        help=(
+            "Optional directory with per-lead coverage series files "
+            "(coverage_timeseries_lead_{lead}.parquet/csv). When set, alerts are not read."
+        ),
+    )
+    ap.add_argument(
+        "--coverage-series-pattern",
+        default="coverage_timeseries_lead_{lead}",
+        help=(
+            "Per-lead coverage series filename pattern. Use {lead} or {lead_h}; "
+            "omit extension to try .parquet/.csv/.csv.gz."
+        ),
+    )
     ap.add_argument("--fallback-alerts", default=None, help="Optional alerts file to use when per-lead files are missing.")
     ap.add_argument("--thresholds", default=None, help="Optional thresholds table (CSV/Parquet) for per-lead flags.")
     ap.add_argument("--threshold-col", default="thr_Fbeta", help="Threshold column to use in --thresholds.")
     ap.add_argument("--prob-col", default="prob_viable", help="Probability column for derived per-lead flags.")
+    ap.add_argument(
+        "--prob-quantile",
+        type=float,
+        default=None,
+        help="Optional per-lead probability quantile for thresholds (overrides --thresholds).",
+    )
+    ap.add_argument(
+        "--require-lead-col",
+        action="store_true",
+        help="Require a lead_h column (or explicit per-lead file) to enforce lead filtering.",
+    )
     ap.add_argument("--leads", type=int, nargs="+", required=True, help="Lead hours to include.")
     ap.add_argument("--flag-col", default="alert_final", help="Preferred flag column (tries fallbacks).")
     ap.add_argument("--out-dir", default="results/slowtick", help="Output directory for CSVs/plots.")
@@ -489,8 +680,18 @@ def main():
     )
     ap.add_argument("--bootstrap-B", type=int, default=1000, help="Bootstrap draws for knee/parity CIs.")
     ap.add_argument("--min-hours-per-lead", type=int, default=8, help="Skip leads with fewer hourly points.")
-    ap.add_argument("--fft-gap-fill", type=int, default=2, help="Fill NaN gaps ≤ this many hours before FFT.")
+    ap.add_argument("--fft-gap-fill", type=int, default=2, help="Fill NaN gaps <= this many hours before FFT.")
     ap.add_argument("--cache-fallback", action="store_true", help="Cache fallback alerts in memory for reuse.")
+    ap.add_argument(
+        "--allow-identical",
+        action="store_true",
+        help="Allow identical per-lead coverage/parity series without failing (still logged).",
+    )
+    ap.add_argument(
+        "--allow-const-flags",
+        action="store_true",
+        help="Allow constant per-lead flags without aborting (default: fail on const).",
+    )
     ap.add_argument("--debug", action="store_true", help="Print file/range diagnostics.")
     args = ap.parse_args()
 
@@ -502,6 +703,9 @@ def main():
     thr_map = _load_threshold_map(args.thresholds, args.threshold_col)
     if args.thresholds and not thr_map:
         print("[slowtick] warning: thresholds provided but no lead thresholds parsed.")
+    if args.prob_quantile is not None:
+        if not (0.0 < args.prob_quantile < 1.0):
+            raise SystemExit("--prob-quantile must be in (0,1).")
 
     fallback_df: Optional[pd.DataFrame] = None
     if args.cache_fallback and fallback_path and fallback_path.exists():
@@ -528,71 +732,188 @@ def main():
     rows: List[Dict] = []
     cov_time: Dict[int, pd.Series] = {}
     cov_hemi_time: Dict[int, pd.DataFrame] = {}
+    cov_hashes: Dict[int, str] = {}
+    hemi_hashes: Dict[int, str] = {}
 
     # 1) coverage time series per lead
-    for L in args.leads:
-        df, path, eff_flag = _read_alert_for_lead(
-            alerts_dir,
-            args.run_name,
-            L,
-            args.flag_col,
-            time_fmt=args.time_format,
-            norm_lon=args.normalize_lon,
-            aoi=args.area,
-            prefer=args.prefer,
-            debug=args.debug,
-            fallback_path=fallback_path,
-            thresholds=thr_map,
-            prob_col=args.prob_col,
-            fallback_df=fallback_df,
-        )
-        if df is None or df.empty or eff_flag is None:
-            print(f"[slowtick] lead={L}: no usable alerts file; skipping.")
-            continue
+    use_series = bool(args.coverage_series_dir)
+    series_dir = Path(args.coverage_series_dir) if args.coverage_series_dir else None
+    if use_series and series_dir and not series_dir.exists():
+        raise SystemExit(f"[slowtick] coverage-series-dir not found: {series_dir}")
 
-        flag_vals = pd.to_numeric(df[eff_flag], errors="coerce").fillna(0.0)
-        flag_mean = float(flag_vals.mean()) if len(flag_vals) else float("nan")
-        flag_std = float(flag_vals.std(ddof=0)) if len(flag_vals) else float("nan")
-        flag_nonzero = float((flag_vals > 0).mean()) if len(flag_vals) else float("nan")
-        flag_const = bool((np.isfinite(flag_std) and flag_std == 0.0) or flag_nonzero in (0.0, 1.0))
+    if use_series:
+        # Agent: enforce per-lead coverage-series inputs when provided (no alerts parsing).
+        for L in args.leads:
+            candidates = _coverage_series_candidates(series_dir, L, args.coverage_series_pattern)
+            path = next((p for p in candidates if p.exists()), None)
+            if path is None:
+                searched = ", ".join(str(p.name) for p in candidates)
+                raise SystemExit(f"[slowtick] lead={L}: coverage series missing (searched {searched})")
 
-        coverage_col = eff_flag
-        if flag_const and args.prob_col in df.columns:
-            coverage_col = args.prob_col
-            df[coverage_col] = pd.to_numeric(df[coverage_col], errors="coerce")
-            print(
-                f"[slowtick] lead={L}: flag '{eff_flag}' is constant "
-                f"(mean={flag_mean:.4f}, frac>0={flag_nonzero:.4f}); using '{coverage_col}' for coverage."
+            cov, hemi, cov_col, _ = _load_coverage_series_file(path, args.time_format)
+            if cov.notna().sum() < max(4, args.min_hours_per_lead):
+                print(f"[slowtick] lead={L}: too few hourly points ({cov.notna().sum()}); skipping.")
+                continue
+
+            cov = cov.sort_index()
+            cov_time[L] = cov
+            cov_hash = _hash_series(cov)
+            cov_hashes[L] = cov_hash
+
+            hemi_hash = ""
+            if hemi is not None and not hemi.empty:
+                hemi = hemi.sort_index()
+                cov_hemi_time[L] = hemi
+                hemi_hash = _hash_hemi(hemi)
+                hemi_hashes[L] = hemi_hash
+
+            rows.append(
+                dict(
+                    run_id=str(args.run_name),
+                    lead_h=L,
+                    hours=int(cov.notna().sum()),
+                    mean_cov=float(np.nanmean(cov.values)),
+                    file=path.name,
+                    alerts_source_file="",
+                    filter_mode="coverage_series",
+                    n_rows_alerts_used=int(len(cov)),
+                    time_min=str(cov.index.min()) if len(cov) else "",
+                    time_max=str(cov.index.max()) if len(cov) else "",
+                    flag_col="",
+                    coverage_col=cov_col,
+                    flag_mean=float("nan"),
+                    flag_std=float("nan"),
+                    flag_nonzero_frac=float("nan"),
+                    flag_const=float("nan"),
+                    series_hash=cov_hash,
+                    hemi_hash=hemi_hash,
+                    source="coverage_series",
+                )
+            )
+    else:
+        const_issues = []
+        for L in args.leads:
+            df, path, eff_flag, meta = _read_alert_for_lead(
+                alerts_dir,
+                args.run_name,
+                L,
+                args.flag_col,
+                time_fmt=args.time_format,
+                norm_lon=args.normalize_lon,
+                aoi=args.area,
+                prefer=args.prefer,
+                debug=args.debug,
+                fallback_path=fallback_path,
+                thresholds=thr_map,
+                prob_col=args.prob_col,
+                prob_quantile=args.prob_quantile,
+                fallback_df=fallback_df,
+                require_lead_col=args.require_lead_col,
+            )
+            if df is None or df.empty or eff_flag is None:
+                print(f"[slowtick] lead={L}: no usable alerts file; skipping.")
+                continue
+
+            flag_vals = pd.to_numeric(df[eff_flag], errors="coerce").fillna(0.0)
+            flag_mean = float(flag_vals.mean()) if len(flag_vals) else float("nan")
+            flag_std = float(flag_vals.std(ddof=0)) if len(flag_vals) else float("nan")
+            flag_nonzero = float((flag_vals > 0).mean()) if len(flag_vals) else float("nan")
+            flag_const = bool((np.isfinite(flag_std) and flag_std == 0.0) or flag_nonzero in (0.0, 1.0))
+            if flag_const and not args.allow_const_flags:
+                prob_vals = None
+                if args.prob_col in df.columns:
+                    prob_vals = pd.to_numeric(df[args.prob_col], errors="coerce")
+                thr_used = thr_map.get(int(L))
+                if args.prob_quantile is not None and prob_vals is not None and prob_vals.notna().any():
+                    thr_used = float(prob_vals.quantile(args.prob_quantile))
+                hist = None
+                if prob_vals is not None:
+                    vals = prob_vals.dropna().to_numpy()
+                    if vals.size:
+                        hist = np.histogram(vals, bins=10)
+                const_issues.append(
+                    dict(
+                        lead_h=int(L),
+                        flag_col=eff_flag,
+                        prob_col=args.prob_col if args.prob_col in df.columns else None,
+                        prob_min=float(np.nanmin(prob_vals)) if prob_vals is not None else float("nan"),
+                        prob_max=float(np.nanmax(prob_vals)) if prob_vals is not None else float("nan"),
+                        thr_used=thr_used,
+                        flag_mean=flag_mean,
+                        flag_nonzero_frac=flag_nonzero,
+                        hist=hist,
+                    )
+                )
+
+            coverage_col = eff_flag
+            if flag_const and args.prob_col in df.columns:
+                coverage_col = args.prob_col
+                df[coverage_col] = pd.to_numeric(df[coverage_col], errors="coerce")
+                print(
+                    f"[slowtick] lead={L}: flag '{eff_flag}' is constant "
+                    f"(mean={flag_mean:.4f}, frac>0={flag_nonzero:.4f}); using '{coverage_col}' for coverage."
+                )
+
+            cov = _coverage_by_hour(df, coverage_col)
+            if cov.notna().sum() < max(4, args.min_hours_per_lead):
+                print(f"[slowtick] lead={L}: too few hourly points ({cov.notna().sum()}); skipping.")
+                continue
+
+            hemi = _coverage_by_hour_hemi(df, coverage_col)
+            cov_hash = _hash_series(cov)
+            hemi_hash = _hash_hemi(hemi)
+            cov_hashes[L] = cov_hash
+            hemi_hashes[L] = hemi_hash
+            cov_time[L] = cov.sort_index()
+            cov_hemi_time[L] = hemi.sort_index()
+
+            time_min = pd.to_datetime(df["time"], errors="coerce").min() if "time" in df.columns else None
+            time_max = pd.to_datetime(df["time"], errors="coerce").max() if "time" in df.columns else None
+            rows.append(
+                dict(
+                    run_id=str(args.run_name),
+                    lead_h=L,
+                    hours=int(cov.notna().sum()),
+                    mean_cov=float(np.nanmean(cov.values)),
+                    file=Path(path).name if path else "",
+                    alerts_source_file=str(path.name) if path else "",
+                    filter_mode=str(meta.get("filter_mode", "")),
+                    n_rows_alerts_used=int(len(df)),
+                    time_min=str(time_min) if time_min is not None else "",
+                    time_max=str(time_max) if time_max is not None else "",
+                    flag_col=eff_flag,
+                    coverage_col=coverage_col,
+                    flag_mean=flag_mean,
+                    flag_std=flag_std,
+                    flag_nonzero_frac=flag_nonzero,
+                    flag_const=int(flag_const),
+                    series_hash=cov_hash,
+                    hemi_hash=hemi_hash,
+                    source="alerts",
+                )
             )
 
-        cov = _coverage_by_hour(df, coverage_col)
-        if cov.notna().sum() < max(4, args.min_hours_per_lead):
-            print(f"[slowtick] lead={L}: too few hourly points ({cov.notna().sum()}); skipping.")
-            continue
-
-        hemi = _coverage_by_hour_hemi(df, coverage_col)
-        cov_time[L] = cov.sort_index()
-        cov_hemi_time[L] = hemi.sort_index()
-
-        rows.append(
-            dict(
-                lead_h=L,
-                hours=int(cov.notna().sum()),
-                mean_cov=float(np.nanmean(cov.values)),
-                file=Path(path).name if path else "",
-                flag_col=eff_flag,
-                coverage_col=coverage_col,
-                flag_mean=flag_mean,
-                flag_std=flag_std,
-                flag_nonzero_frac=flag_nonzero,
-                flag_const=int(flag_const),
-            )
-        )
+        # Agent: abort on constant per-lead flags to avoid meaningless slowtick summaries.
+        if const_issues and not args.allow_const_flags:
+            print("[slowtick] constant per-lead flag detected; aborting.", file=sys.stderr)
+            for issue in const_issues:
+                print(
+                    f"[slowtick] lead={issue['lead_h']} flag={issue['flag_col']} "
+                    f"prob_min={issue['prob_min']:.6f} prob_max={issue['prob_max']:.6f} "
+                    f"thr={issue['thr_used']} nonzero_frac={issue['flag_nonzero_frac']:.4f}",
+                    file=sys.stderr,
+                )
+                hist = issue.get("hist")
+                if hist is not None:
+                    counts, bins = hist
+                    print(f"[slowtick] prob_hist bins={bins.tolist()} counts={counts.tolist()}", file=sys.stderr)
+            raise SystemExit("constant per-lead flag; check thresholds/probability inputs")
 
     if not rows:
         print("[slowtick] no lead summaries produced; skipping diagnostics.")
         (out_dir / "slowtick_summary.csv").write_text(
-            "lead_h,hours,mean_cov,file,flag_col,coverage_col,flag_mean,flag_std,flag_nonzero_frac,flag_const\n",
+            "run_id,lead_h,hours,mean_cov,file,alerts_source_file,filter_mode,n_rows_alerts_used,time_min,time_max,"
+            "flag_col,coverage_col,flag_mean,flag_std,flag_nonzero_frac,flag_const,series_hash,hemi_hash,source\n",
             encoding="utf-8",
         )
         return 0
@@ -609,6 +930,20 @@ def main():
             out_dir / "coverage_timeseries.csv",
             index=False,
         )
+        for L, s in cov_time.items():
+            df_lead = pd.DataFrame(
+                {
+                    "time": pd.to_datetime(s.index),
+                    "coverage": pd.to_numeric(s.values, errors="coerce"),
+                }
+            )
+            hemi = cov_hemi_time.get(L)
+            if hemi is not None and not hemi.empty:
+                hemi_aligned = hemi.reindex(s.index)
+                df_lead["cov_north"] = pd.to_numeric(hemi_aligned.get("north"), errors="coerce").to_numpy()
+                df_lead["cov_south"] = pd.to_numeric(hemi_aligned.get("south"), errors="coerce").to_numpy()
+            out_path = out_dir / f"coverage_timeseries_lead_{int(L)}.csv"
+            df_lead.to_csv(out_path, index=False)
 
     if args.save_hemi_timeseries and cov_hemi_time:
         long_hemi = []
@@ -626,6 +961,40 @@ def main():
             out_dir / "coverage_timeseries_hemi.csv",
             index=False,
         )
+
+    dup_cov = _duplicate_hashes(cov_hashes)
+    dup_hemi = _duplicate_hashes(hemi_hashes) if hemi_hashes else {}
+    identical_issue = False
+    if dup_cov:
+        print(f"[slowtick] identical coverage series across leads: {dup_cov}")
+        identical_issue = True
+    if dup_hemi:
+        print(f"[slowtick] identical hemispheric coverage series across leads: {dup_hemi}")
+        identical_issue = True
+
+    if 24 in cov_time and 240 in cov_time:
+        s24 = cov_time[24]
+        s240 = cov_time[240]
+        if cov_hashes.get(24) == cov_hashes.get(240):
+            print("[slowtick] coverage series identical for lead 24h and 240h.")
+            identical_issue = True
+        aligned = pd.DataFrame({"l24": s24, "l240": s240}).dropna()
+        if len(aligned) > 3:
+            d1 = aligned["l24"].diff().dropna()
+            d2 = aligned["l240"].diff().dropna()
+            if len(d1) and len(d2):
+                corr = np.corrcoef(d1, d2)[0, 1]
+                print(f"[slowtick] corr(dcov_24h, dcov_240h)={corr:.4f}")
+                if np.isfinite(corr) and abs(corr) > 0.95:
+                    identical_issue = True
+
+    if not summary.empty and summary["hours"].nunique() == 1 and len(summary) > 1:
+        hours_val = int(summary["hours"].iloc[0])
+        print(f"[slowtick] identical per-lead hour counts detected (hours={hours_val}).")
+        identical_issue = True
+
+    if identical_issue and not args.allow_identical:
+        raise SystemExit("[slowtick] identical per-lead series detected; rerun with --allow-identical to continue.")
 
     # 2) knee law fit on mean coverage vs lead
     if not summary.empty and (summary["mean_cov"] > 0).sum() >= 2:
@@ -684,14 +1053,16 @@ def main():
                 ci_lo=float(lo),
                 ci_hi=float(hi),
                 n_hours=int(dif.size),
+                series_hash=cov_hashes.get(int(L), ""),
+                hemi_hash=hemi_hashes.get(int(L), ""),
             )
         )
         # quick plot
         plt.figure(figsize=(6.6, 3.2))
-        plt.title(f"Hemispheric parity Δcov = cov(N) - cov(S)  (lead {L}h)")
+        plt.title(f"Hemispheric parity delta_cov = cov(N) - cov(S)  (lead {L}h)")
         plt.plot(hemi.index, dif, lw=0.7)
         plt.axhline(0, color="k", lw=0.8)
-        plt.ylabel("Δ coverage")
+        plt.ylabel("delta coverage")
         plt.xlabel("Time")
         plt.tight_layout()
         plt.savefig(out_dir / f"parity_lead{L}.png", dpi=160)
@@ -719,7 +1090,7 @@ def main():
 
         f_peak, a_peak = _fft_peak(freqs, amps, target_per_h=24, band=0.20)
 
-        # Diurnal power ratio: power in 24h±20% band / total low-f power (≥5h)
+        # Diurnal power ratio: power in 24h+/-20% band / total low-f power (>=5h)
         f0 = 1 / 24.0
         band_mask = (freqs >= f0 * (1 - 0.2)) & (freqs <= f0 * (1 + 0.2))
         low_mask = (freqs > 0) & (freqs <= 0.2)
@@ -735,10 +1106,11 @@ def main():
                 peak_amp=a_peak,
                 diurnal_ratio=float(diurnal_ratio) if np.isfinite(diurnal_ratio) else np.nan,
                 n_hours=int(y.size),
+                series_hash=cov_hashes.get(int(L), ""),
             )
         )
 
-        # spectrum plot (focus 0..0.2 cph ~ periods ≥5h)
+        # spectrum plot (focus 0..0.2 cph ~ periods >=5h)
         plt.figure(figsize=(6.6, 3.6))
         plt.title(f"Hourly coverage spectrum (lead {L}h)")
         plt.plot(freqs, amps)

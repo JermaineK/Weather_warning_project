@@ -166,14 +166,19 @@ def _parse_horizons(raw: str) -> List[int]:
 def _viability_conversion_snapshot(path: Optional[Path], horizons: List[int]) -> pd.DataFrame:
     if not _exists_nonempty(path):
         return pd.DataFrame()
+    cols = _peek_columns(Path(path))
+    label_col = "y_commit" if "y_commit" in cols else ("y_viable" if "y_viable" in cols else None)
+    if label_col is None:
+        return pd.DataFrame()
     try:
-        df = _read_any(Path(path), columns=["t_to_storm_min_h", "y_viable"])
+        df = _read_any(Path(path), columns=["t_to_storm_min_h", label_col])
     except Exception:
         return pd.DataFrame()
     if df is None or df.empty or "t_to_storm_min_h" not in df.columns:
         return pd.DataFrame()
     lead_vals = pd.to_numeric(df["t_to_storm_min_h"], errors="coerce")
-    yv = pd.to_numeric(df.get("y_viable", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    yv = pd.to_numeric(df.get(label_col, pd.Series(dtype=float)), errors="coerce").fillna(0)
+    mean_key = f"{label_col}_mean"
     rows = []
     start = 0.0
     for h in horizons:
@@ -186,7 +191,7 @@ def _viability_conversion_snapshot(path: Optional[Path], horizons: List[int]) ->
             {
                 "horizon": f"({start},{h}]",
                 "rows": total,
-                "y_viable_mean": rate if pd.notna(rate) else np.nan,
+                mean_key: rate if pd.notna(rate) else np.nan,
                 "positives": pos,
             }
         )
@@ -201,7 +206,7 @@ def _viability_conversion_snapshot(path: Optional[Path], horizons: List[int]) ->
             {
                 "horizon": f"> {start}",
                 "rows": total,
-                "y_viable_mean": rate if pd.notna(rate) else np.nan,
+                mean_key: rate if pd.notna(rate) else np.nan,
                 "positives": pos,
             }
         )
@@ -1007,7 +1012,7 @@ def main() -> int:
     ap.add_argument(
         "--viability-targets",
         default="data/grid_train_gse_panel_targets.parquet",
-        help="Panel with t_to_storm_min_h / y_viable for conversion snapshot.",
+        help="Panel with t_to_storm_min_h and y_commit/y_viable for conversion snapshot.",
     )
     ap.add_argument(
         "--viability-metrics",
@@ -1266,11 +1271,15 @@ def main() -> int:
     slowtick_spectrum = pd.DataFrame()
     slowtick_knee = pd.DataFrame()
     slowtick_parity = pd.DataFrame()
+    slowtick_cov = pd.DataFrame()
     slowtick_dir = _slowtick_dir(out_dir, tables_dir)
     if slowtick_dir:
         summary_path = slowtick_dir / "slowtick_summary.csv"
         if summary_path.exists():
             slowtick_summary = _read_any(summary_path)
+        cov_path = slowtick_dir / "coverage_timeseries.csv"
+        if cov_path.exists():
+            slowtick_cov = _read_any(cov_path)
         spectrum_path = slowtick_dir / "spectrum_summary.csv"
         if spectrum_path.exists():
             slowtick_spectrum = _read_any(spectrum_path)
@@ -1400,9 +1409,50 @@ def main() -> int:
             lines.append("```")
 
     if not skill_by_lead.empty:
+        title = "Viability Skill by Lead"
+        knee_horizon = None
+        if "target" in skill_by_lead.columns:
+            targets = skill_by_lead["target"].astype(str).str.lower()
+            if targets.str.contains("knee").any():
+                title = "Knee Skill by Lead"
+                # Capture knee horizon from target name (e.g., y_knee_cross_240h)
+                try:
+                    import re
+
+                    for t in targets:
+                        m = re.search(r"y_knee_cross_(\d+)h", str(t))
+                        if m:
+                            knee_horizon = int(m.group(1))
+                            break
+                except Exception:
+                    knee_horizon = None
         lines.append("")
-        lines.append("## Viability Skill by Lead")
-        lines.append(_markdown_table(skill_by_lead, max_rows=20))
+        lines.append(f"## {title}")
+        skill_disp = skill_by_lead.copy()
+        if knee_horizon and "kind" in skill_disp.columns:
+            mask = skill_disp["kind"].astype(str).str.lower() == "coincident"
+            if mask.any():
+                skill_disp.loc[mask, "kind"] = f"horizon_{knee_horizon}h"
+                if "lead_h" in skill_disp.columns:
+                    skill_disp.loc[mask, "lead_h"] = float(knee_horizon)
+        lines.append(_markdown_table(skill_disp, max_rows=20))
+        if knee_horizon:
+            lines.append(
+                f"- Note: horizon_{knee_horizon}h rows are future-window targets (not at-event coincident)."
+            )
+        # Quick human-readable summary for knee focus
+        if "lead_h" in skill_by_lead.columns and {"auc", "prauc"} <= set(skill_by_lead.columns):
+            lead_rows = skill_by_lead.copy()
+            if "kind" in lead_rows.columns:
+                lead_rows = lead_rows[lead_rows["kind"].astype(str).str.lower() == "lead"]
+            auc_vals = pd.to_numeric(lead_rows.get("auc"), errors="coerce")
+            pr_vals = pd.to_numeric(lead_rows.get("prauc"), errors="coerce")
+            if auc_vals.notna().any() and pr_vals.notna().any():
+                lines.append("")
+                lines.append(
+                    f"- Lead AUC range: {auc_vals.min():.3f} → {auc_vals.max():.3f} | "
+                    f"PRAUC range: {pr_vals.min():.3f} → {pr_vals.max():.3f}"
+                )
 
     if not proto_outcomes.empty:
         lines.append("")
@@ -1466,21 +1516,33 @@ def main() -> int:
     lines.append("")
     lines.append("## Slow-tick Diagnostics (observational)")
     lines.append("_Diagnostic only; does not influence pulse definitions or training._")
-    if slowtick_dir and (not slowtick_summary.empty or not slowtick_spectrum.empty or not slowtick_knee.empty or not slowtick_parity.empty):
+    if slowtick_dir and (not slowtick_summary.empty or not slowtick_spectrum.empty or not slowtick_knee.empty or not slowtick_parity.empty or not slowtick_cov.empty):
+        # Order of operations: per-hour activity -> per-bucket -> total
+        if not slowtick_cov.empty and {"lead_h", "time", "coverage"} <= set(slowtick_cov.columns):
+            lines.append("Per-hour activity (coverage):")
+            try:
+                cov_time = pd.to_datetime(slowtick_cov["time"], errors="coerce")
+                tmin = cov_time.min()
+                tmax = cov_time.max()
+                leads = slowtick_cov["lead_h"].nunique()
+                lines.append(f"- Leads: {int(leads)} | time span: {tmin} -> {tmax}")
+            except Exception:
+                pass
         if not slowtick_summary.empty:
-            lines.append("Summary:")
+            lines.append("")
+            lines.append("Per-bucket (lead) summary:")
             lines.append(_markdown_table(slowtick_summary, max_rows=20))
         if not slowtick_spectrum.empty:
             lines.append("")
-            lines.append("Spectrum summary (24h +/-20% band):")
+            lines.append("Total: spectrum summary (24h +/-20% band):")
             lines.append(_markdown_table(slowtick_spectrum, max_rows=20))
         if not slowtick_knee.empty:
             lines.append("")
-            lines.append("Knee fit:")
+            lines.append("Total: knee fit:")
             lines.append(_markdown_table(slowtick_knee, max_rows=10))
         if not slowtick_parity.empty:
             lines.append("")
-            lines.append("Hemispheric parity:")
+            lines.append("Total: hemispheric parity:")
             lines.append(_markdown_table(slowtick_parity, max_rows=20))
     else:
         lines.append("_No slow-tick diagnostics found._")

@@ -83,7 +83,7 @@ fetch:
     suffix: oper
     overwrite: false
 features:
-  enabled: false
+  enabled: true
   steps:
   - mode: build
     enabled: true
@@ -187,7 +187,7 @@ features:
     near_time_h: 12.0
     features_chunk_rows: 400000
     chunk_hours: 72
-    overwrite: false
+    overwrite: true
     skip_if_exists: true
     health_missing_ok_cols:
     - t_to_storm_min_h
@@ -497,9 +497,9 @@ seeds:
     out_dir: results/seedmaps
     run_name: coral_sea_demo
     normalize_lon: -180..180
-    prob_col: null
+    prob_col:
     flag_col: y_knee_cross_240h
-    thr_file: null
+    thr_file:
     thr_lead: 240
     thr_column: thr_Fbeta
     direction_col: zeta

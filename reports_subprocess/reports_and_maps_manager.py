@@ -961,6 +961,17 @@ def main() -> int:
         help="Probability column for derived per-lead flags.",
     )
     ap.add_argument(
+        "--slowtick-prob-quantile",
+        type=float,
+        default=None,
+        help="Optional per-lead probability quantile for slowtick thresholds (overrides thresholds table).",
+    )
+    ap.add_argument(
+        "--slowtick-require-lead-col",
+        action="store_true",
+        help="Require a lead_h column in alerts for slowtick filtering.",
+    )
+    ap.add_argument(
         "--slowtick-out-subdir",
         default="slowtick",
         help="Subdirectory under the run folder for slow-tick outputs.",
@@ -986,6 +997,16 @@ def main() -> int:
         choices=["throttled", "denoised", "base"],
         default="throttled",
         help="Preferred alerts stage if multiple files exist.",
+    )
+    ap.add_argument(
+        "--slowtick-coverage-series-dir",
+        default=None,
+        help="Optional per-lead coverage series directory for slowtick inputs.",
+    )
+    ap.add_argument(
+        "--slowtick-coverage-series-pattern",
+        default="coverage_timeseries_lead_{lead}",
+        help="Pattern for per-lead coverage series files (use {lead} or {lead_h}).",
     )
     ap.add_argument(
         "--slowtick-save-timeseries",
@@ -1815,16 +1836,22 @@ def main() -> int:
                 "--min-hours-per-lead", str(args.slowtick_min_hours_per_lead),
                 "--fft-gap-fill", str(args.slowtick_fft_gap_fill),
             ]
+            if args.slowtick_coverage_series_dir:
+                step_args += ["--coverage-series-dir", args.slowtick_coverage_series_dir]
+                if args.slowtick_coverage_series_pattern:
+                    step_args += ["--coverage-series-pattern", args.slowtick_coverage_series_pattern]
             slowtick_thr = args.slowtick_thresholds
             if slowtick_thr is None and viability_thr and Path(viability_thr).exists():
                 slowtick_thr = viability_thr
-            if slowtick_thr:
+            if slowtick_thr and args.slowtick_prob_quantile is None:
                 step_args += [
                     "--thresholds", slowtick_thr,
                     "--threshold-col", args.slowtick_threshold_col,
                 ]
             if args.slowtick_prob_col:
                 step_args += ["--prob-col", args.slowtick_prob_col]
+            if args.slowtick_prob_quantile is not None:
+                step_args += ["--prob-quantile", str(args.slowtick_prob_quantile)]
             if args.slowtick_cache_fallback:
                 step_args.append("--cache-fallback")
             fallback_candidates = [
@@ -1853,6 +1880,8 @@ def main() -> int:
                 step_args.append("--save-hemi-timeseries")
             if args.slowtick_debug:
                 step_args.append("--debug")
+            if args.slowtick_require_lead_col:
+                step_args.append("--require-lead-col")
             ok, code = run_step("slowtick-diag", script, step_args)
             if not ok and args.strict:
                 return code
