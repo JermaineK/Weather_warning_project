@@ -10,8 +10,9 @@ Streams large tables (pyarrow when available) and writes per-chunk outputs.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Optional
 
 import joblib
 import numpy as np
@@ -95,6 +96,68 @@ def _select_features(columns: Sequence[str], feature_list: Sequence[str] | None,
     return feats or [c for c in columns if c not in label_cols]
 
 
+def _metrics_candidates(model_path: Path) -> List[Path]:
+    stem = model_path.with_suffix("").name
+    base = model_path.with_suffix("")
+    candidates = [base.with_name(f"{stem}_metrics.json")]
+    if "_model" in stem:
+        candidates.append(base.with_name(f"{stem.replace('_model', '')}_metrics.json"))
+    return candidates
+
+
+def _load_metrics_features(path: Optional[Path]) -> Optional[List[str]]:
+    if path is None or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        feats = data.get("features")
+        if isinstance(feats, list):
+            return [str(f) for f in feats]
+        return None
+    if isinstance(data, list):
+        for entry in reversed(data):
+            if isinstance(entry, dict) and isinstance(entry.get("features"), list):
+                return [str(f) for f in entry.get("features")]
+    return None
+
+
+def _resolve_model_features(
+    columns: Sequence[str],
+    feature_list: Sequence[str] | None,
+    prefixes: Sequence[str],
+    label_cols: Sequence[str],
+    model,
+    calibrator,
+    metrics_path: Optional[Path],
+    role: str,
+) -> List[str]:
+    metrics_feats = _load_metrics_features(metrics_path)
+    if metrics_feats:
+        missing = [f for f in metrics_feats if f not in columns]
+        if missing:
+            raise SystemExit(f"[predict] {role} metrics features missing from input: {missing[:10]}")
+        return metrics_feats
+
+    if hasattr(model, "feature_names_in_"):
+        feats = [f for f in list(getattr(model, "feature_names_in_")) if f in columns]
+        missing = [f for f in list(getattr(model, "feature_names_in_")) if f not in columns]
+        if missing:
+            raise SystemExit(f"[predict] {role} model features missing from input: {missing[:10]}")
+        return feats
+
+    feats = _select_features(columns, feature_list, prefixes, label_cols)
+    expected = getattr(calibrator or model, "n_features_in_", None)
+    if expected is not None and len(feats) != int(expected):
+        raise SystemExit(
+            f"[predict] {role} model expects {expected} features but selected {len(feats)}. "
+            f"Provide --{role}-metrics or --feature-cols matching training."
+        )
+    return feats
+
+
 def _mask_regime(df: pd.DataFrame, base_prob: np.ndarray, args) -> np.ndarray:
     mask = base_prob >= args.base_thr
     if args.G_thr is not None and "G" in df.columns:
@@ -121,19 +184,6 @@ def predict(path: str, args) -> None:
             out_path.unlink()
         except Exception:
             pass
-    cols_all = _peek_columns(path)
-    prefixes = [p.strip() for p in args.feature_prefixes.split(",") if p.strip()]
-    label_cols = {args.time_col, "lat", "lon", args.label_col}
-    features = _select_features(cols_all, args.feature_cols, prefixes, label_cols)
-    if not features:
-        raise SystemExit("No feature columns selected for prediction.")
-
-    extra_cols = {"lead_h", "t_to_storm_min_h", "row_id", "cell_id", "ilat", "ilon"}
-    columns_needed = {args.time_col, args.label_col, "lat", "lon", "G", "SFI", *features, *extra_cols}
-    columns_needed = [c for c in columns_needed if c in cols_all]
-    writer = None
-    first = True
-
     def _require(path_str: str, name: str):
         p = Path(path_str)
         if not p.exists():
@@ -150,17 +200,79 @@ def predict(path: str, args) -> None:
     if args.specialist_calibrator:
         spec_calibrator = joblib.load(args.specialist_calibrator)
 
+    cols_all = _peek_columns(path)
+    prefixes = [p.strip() for p in args.feature_prefixes.split(",") if p.strip()]
+    label_cols = {args.time_col, "lat", "lon", args.label_col}
+
+    base_metrics_path = Path(args.base_metrics) if args.base_metrics else None
+    if base_metrics_path is None:
+        for cand in _metrics_candidates(base_model_path):
+            if cand.exists():
+                base_metrics_path = cand
+                break
+
+    spec_metrics_path = Path(args.specialist_metrics) if args.specialist_metrics else None
+    if spec_metrics_path is None and args.specialist_model:
+        for cand in _metrics_candidates(Path(args.specialist_model)):
+            if cand.exists():
+                spec_metrics_path = cand
+                break
+
+    base_features = _resolve_model_features(
+        cols_all,
+        args.feature_cols,
+        prefixes,
+        label_cols,
+        base_model,
+        base_calibrator,
+        base_metrics_path,
+        "base",
+    )
+    if not base_features:
+        raise SystemExit("No feature columns selected for prediction (base model).")
+
+    spec_features = base_features
+    if spec_model is not None:
+        spec_features = _resolve_model_features(
+            cols_all,
+            args.feature_cols,
+            prefixes,
+            label_cols,
+            spec_model,
+            spec_calibrator,
+            spec_metrics_path,
+            "specialist",
+        )
+        if not spec_features:
+            raise SystemExit("No feature columns selected for prediction (specialist model).")
+
+    extra_cols = {"lead_h", "t_to_storm_min_h", "row_id", "cell_id", "ilat", "ilon"}
+    columns_needed = {
+        args.time_col,
+        args.label_col,
+        "lat",
+        "lon",
+        "G",
+        "SFI",
+        *base_features,
+        *spec_features,
+        *extra_cols,
+    }
+    columns_needed = [c for c in columns_needed if c in cols_all]
+    writer = None
+    first = True
+
     total_rows = 0
     for chunk in _stream_frames(path, list(columns_needed), args.chunk_rows, args.parquet_rows):
         if chunk.empty:
             continue
-        base_prob = _predict_chunk(chunk, features, base_model, base_calibrator)
+        base_prob = _predict_chunk(chunk, base_features, base_model, base_calibrator)
         chunk["P_base"] = base_prob
         regime = _mask_regime(chunk, base_prob, args)
         if spec_model is not None:
             spec_df = chunk.loc[regime]
             if not spec_df.empty:
-                spec_prob = _predict_chunk(spec_df, features, spec_model, spec_calibrator)
+                spec_prob = _predict_chunk(spec_df, spec_features, spec_model, spec_calibrator)
                 chunk.loc[regime, "P_spec"] = spec_prob
         if "P_spec" in chunk.columns:
             blend = args.blend_weight
@@ -197,6 +309,8 @@ def parse_args():
     ap.add_argument("--base-calibrator", default=None, help="Optional calibrator for base model.")
     ap.add_argument("--specialist-model", default=None, help="Specialist model path (joblib).")
     ap.add_argument("--specialist-calibrator", default=None, help="Optional calibrator for specialist.")
+    ap.add_argument("--base-metrics", default=None, help="Optional base metrics.json for feature alignment.")
+    ap.add_argument("--specialist-metrics", default=None, help="Optional specialist metrics.json for feature alignment.")
     ap.add_argument("--feature-cols", nargs="*", default=None, help="Explicit feature columns.")
     ap.add_argument(
         "--feature-prefixes",

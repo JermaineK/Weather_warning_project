@@ -1,7 +1,7 @@
 ---
 Mini README - Data Subprocess Suite
 This directory contains the data-stage plumbing for the cyclone early-warning pipeline.
-The core flow now centers on ID-based subsetting and G/S/E viability. Legacy heuristic scorers live in archive/.
+The core flow now centers on ID-based subsetting and G/S/E viability or commitment labels. Legacy heuristic scorers live in archive/.
 
 Usage
 python data_subprocess/data_stage_manager.py <mode> [args...]
@@ -14,7 +14,7 @@ subset-by-id       build_train_subset_by_id.py          Two-pass ID subset (smal
 gse-panel          build_gse_panel_from_subset.py       Add G_struct, S_shear, E_energy to the subset.
 gse-lagged         build_gse_lagged.py                  Add temporal lag (same-cell + optional nearby) G/S/E features.
 slowtick-features  build_slowtick_features.py           Add slow-cycle cos/sin (and modulated) features to GSE panel.
-viability-targets  build_viability_targets.py           Derive y_viable (and related targets) from the panel.
+viability-targets  build_viability_targets.py           Derive y_viable (lead-window) or y_commit (commitment) from the panel.
 train-viability    train_viability_model.py             Fit a simple viability model (logit baseline).
 storm-timeseries   build_storm_timeseries_by_id.py      Stub for slow-tick storm-centred aggregation.
 Legacy archived    archive/thresholds_and_alerts.py, archive/predict_storm_probability.py, archive/ibtracs_match.py, archive/thresholds_scan.py, archive/train_per_lead_logit.py
@@ -93,8 +93,8 @@ python data_subprocess/build_slowtick_features.py \
   --period-hours 24 \
   --use-modulated
 
-7. build_viability_targets.py - Viability Labels
-Adds y_viable based on a lead window and a geometry threshold (absolute or quantile-derived).
+7. build_viability_targets.py - Viability / Commitment Labels
+Adds y_viable based on a lead window and a geometry threshold, or y_commit based on post-knee parity lock.
 Typical CLI
 python data_subprocess/build_viability_targets.py \
   --panel data/grid_train_gse_panel_slowtick.parquet \
@@ -102,6 +102,15 @@ python data_subprocess/build_viability_targets.py \
   --lead-col t_to_storm_min_h \
   --horizon-max 240 \
   --g-min-quantile 0.7 \
+  --chunksize 400000
+Commitment mode (uses knee/parity lock):
+python data_subprocess/build_viability_targets.py \
+  --panel data/grid_train_gse_panel_slowtick.parquet \
+  --out data/grid_train_gse_panel_targets.parquet \
+  --target-mode commitment \
+  --commitment-knee-col gka_knee_state \
+  --commitment-lock-col gka_parity_lock \
+  --commitment-sai-thr 0.5 \
   --chunksize 400000
 
 8. train_viability_model.py - Physics-Shaped Baseline

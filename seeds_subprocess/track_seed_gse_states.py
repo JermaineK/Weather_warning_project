@@ -30,6 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import numpy as np
 import pandas as pd
+import re
 from utils import join_audit
 
 try:
@@ -51,6 +52,7 @@ except Exception:
 
 CANDIDATE_TIME_COLS = ["time", "time_h", "valid_time", "datetime"]
 CANDIDATE_FLAG_COLS = ["alert_final", "alert_base", "alert", "flag", "any_alert", "__flag__"]
+CANDIDATE_FLAG_PREFIXES = ("y_knee_cross_", "y_lock_stable_", "y_commit_")
 CANDIDATE_PROB_COLS = ["prob_viable", "prob", "prob_max", "p", "score"]
 
 
@@ -135,6 +137,24 @@ def _pick_col(cols: Sequence[str], cands: Sequence[str]) -> Optional[str]:
         if c in cols:
             return c
     return None
+
+
+def _pick_prefixed_col(cols: Sequence[str], prefixes: Sequence[str]) -> Optional[str]:
+    """
+    Pick a label column by prefix, preferring the largest lead suffix (e.g., *_240h).
+    """
+    best = None
+    best_lead = -1
+    for c in cols:
+        for p in prefixes:
+            if not c.startswith(p):
+                continue
+            m = re.search(r"_([0-9]+)h$", c)
+            lead = int(m.group(1)) if m else 0
+            if lead > best_lead:
+                best_lead = lead
+                best = c
+    return best
 
 
 def _prep_seed_mask(df: pd.DataFrame, prob_col: Optional[str], flag_col: Optional[str], thr: Optional[float]) -> pd.Series:
@@ -292,6 +312,8 @@ def main() -> None:
             pcol_detected = args.prob_col or _pick_col(cols, CANDIDATE_PROB_COLS)
         if not fcol_detected:
             fcol_detected = args.flag_col or _pick_col(cols, CANDIDATE_FLAG_COLS)
+            if not fcol_detected:
+                fcol_detected = _pick_prefixed_col(cols, CANDIDATE_FLAG_PREFIXES)
         if not tcol_detected:
             raise SystemExit("No time column found; pass --time-col.")
         chunk = chunk.copy()

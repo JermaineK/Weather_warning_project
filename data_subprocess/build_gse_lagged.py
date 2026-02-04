@@ -57,6 +57,101 @@ def _parse_lags(spec: str) -> List[int]:
     return lags or [1]
 
 
+def _parse_csv_list(spec: str | None) -> List[str]:
+    if not spec:
+        return []
+    return [p.strip() for p in str(spec).split(",") if p.strip()]
+
+
+def _parse_windows(spec: str | None) -> List[int]:
+    if not spec:
+        return []
+    parts = [p.strip() for p in str(spec).split(",") if p.strip()]
+    wins = []
+    for p in parts:
+        try:
+            wins.append(int(p))
+        except Exception:
+            continue
+    wins = [w for w in wins if w > 0]
+    return wins
+
+
+def _apply_past_roll(
+    df: pd.DataFrame,
+    cols: List[str],
+    wins: List[int],
+    kind: str,
+) -> dict[str, np.ndarray]:
+    """
+    Apply past-only rolling features per (lat_r, lon_r).
+    kind: mean | std | slope | fliprate
+    """
+    # Agent: enforce past-only windows to avoid target leakage.
+    if not cols or not wins:
+        return {}
+    idx_map = df.groupby(["lat_r", "lon_r"], sort=False).indices
+    new_cols: dict[str, np.ndarray] = {}
+
+    for col in cols:
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+        for win in wins:
+            out = np.zeros(len(df), dtype=np.float32)
+            for _, idx in idx_map.items():
+                ii = np.asarray(idx, dtype=np.int64)
+                x = pd.Series(vals[ii])
+                if kind == "mean":
+                    res = x.shift(1).rolling(win, min_periods=1).mean()
+                elif kind == "std":
+                    res = x.shift(1).rolling(win, min_periods=1).std().fillna(0.0)
+                elif kind == "slope":
+                    if win <= 1:
+                        res = pd.Series(0.0, index=x.index)
+                    else:
+                        xs = x.shift(1)
+                        res = (xs - xs.shift(win - 1)) / float(win - 1)
+                elif kind == "fliprate":
+                    sgn = np.sign(x)
+                    flips = (sgn * sgn.shift(1) < 0).astype(float)
+                    res = flips.shift(1).rolling(win, min_periods=1).mean()
+                else:
+                    continue
+                out[ii] = pd.to_numeric(res, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+
+            suffix = {
+                "mean": "mean_past",
+                "std": "std_past",
+                "slope": "slope_past",
+                "fliprate": "fliprate_past",
+            }[kind]
+            new_cols[f"{col}_{suffix}{int(win)}h"] = out
+    return new_cols
+
+
+def _apply_past_corr(
+    df: pd.DataFrame,
+    col_a: str,
+    col_b: str,
+    win: int,
+    out_col: str,
+) -> dict[str, np.ndarray]:
+    if col_a not in df.columns or col_b not in df.columns or win <= 1:
+        return {}
+    idx_map = df.groupby(["lat_r", "lon_r"], sort=False).indices
+    out = np.zeros(len(df), dtype=np.float32)
+    a_vals = pd.to_numeric(df[col_a], errors="coerce").to_numpy(dtype=float)
+    b_vals = pd.to_numeric(df[col_b], errors="coerce").to_numpy(dtype=float)
+    for _, idx in idx_map.items():
+        ii = np.asarray(idx, dtype=np.int64)
+        a = pd.Series(a_vals[ii]).shift(1)
+        b = pd.Series(b_vals[ii]).shift(1)
+        corr = a.rolling(win, min_periods=2).corr(b)
+        out[ii] = pd.to_numeric(corr, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+    return {out_col: out}
+
+
 def _max_within_radius(prev_block: pd.DataFrame, lat_now: np.ndarray, lon_now: np.ndarray, col: str, r: float) -> np.ndarray:
     """
     For each row in the current block, compute max of `col` in prev_block within |dlat|,|dlon| <= r.
@@ -83,7 +178,39 @@ def main() -> None:
     )
     ap.add_argument("--panel", required=True, help="Input GSE panel (CSV(.gz) or Parquet).")
     ap.add_argument("--out", required=True, help="Output with lagged features.")
+    # Agent: accept overwrite flag for pipeline compatibility (output overwrites by default).
+    ap.add_argument("--overwrite", action="store_true", help="No-op; output is overwritten if present.")
     ap.add_argument("--lags", default="1", help="Comma-separated hour lags (e.g., '1,2').")
+    ap.add_argument(
+        "--lag-cols",
+        default="",
+        help="Additional columns to lag (CSV, e.g., 'gka_parity_lock,gka_knee_state').",
+    )
+    ap.add_argument(
+        "--past-windows",
+        default="",
+        help="Comma-separated past windows for rolling stats (hours).",
+    )
+    ap.add_argument(
+        "--past-mean-cols",
+        default="",
+        help="CSV of columns for past rolling mean features.",
+    )
+    ap.add_argument(
+        "--past-std-cols",
+        default="",
+        help="CSV of columns for past rolling std features.",
+    )
+    ap.add_argument(
+        "--past-slope-cols",
+        default="",
+        help="CSV of columns for past slope features (endpoint trend).",
+    )
+    ap.add_argument(
+        "--fliprate-cols",
+        default="",
+        help="CSV of sign-like columns for past flip-rate features.",
+    )
     ap.add_argument("--radius-deg", type=float, default=0.0, help="Radius (deg) for drift-aware prev-hour max (0 disables).")
     ap.add_argument("--lat-col", default="lat", help="Latitude column.")
     ap.add_argument("--lon-col", default="lon", help="Longitude column.")
@@ -99,9 +226,20 @@ def main() -> None:
         default=None,
         help="Optional chunk size for streaming CSV or Parquet batches (0/None = load whole file).",
     )
+    ap.add_argument(
+        "--defragment",
+        action="store_true",
+        help="Optional final copy to defragment before write (uses extra memory).",
+    )
     args = ap.parse_args()
 
     lags = _parse_lags(args.lags)
+    lag_cols = _parse_csv_list(args.lag_cols)
+    past_windows = _parse_windows(args.past_windows)
+    past_mean_cols = _parse_csv_list(args.past_mean_cols)
+    past_std_cols = _parse_csv_list(args.past_std_cols)
+    past_slope_cols = _parse_csv_list(args.past_slope_cols)
+    fliprate_cols = _parse_csv_list(args.fliprate_cols)
     chunk_rows = args.chunksize if args.chunksize and args.chunksize > 0 else None
 
     if _is_parquet(args.panel):
@@ -110,18 +248,20 @@ def main() -> None:
             import pyarrow.parquet as pq  # type: ignore
             pf = pq.ParquetFile(args.panel)
             df_iter = (batch.to_pandas() for batch in pf.iter_batches(batch_size=chunk_rows))
+            print("[warn] chunk_rows set, but lagged features still materialize full panel in memory.")
         if df_iter is None:
             df = _read_any(args.panel)
-            dfs = [df]
         else:
-            dfs = []
-            for b in df_iter:
-                dfs.append(b)
-        df = pd.concat(dfs, ignore_index=True)
+            # Note: still materializes the full frame for lagged features.
+            df = pd.concat(list(df_iter), ignore_index=True, copy=False)
     else:
         if chunk_rows:
-            dfs = list(pd.read_csv(args.panel, low_memory=False, chunksize=chunk_rows))
-            df = pd.concat(dfs, ignore_index=True)
+            df = pd.concat(
+                list(pd.read_csv(args.panel, low_memory=False, chunksize=chunk_rows)),
+                ignore_index=True,
+                copy=False,
+            )
+            print("[warn] chunk_rows set, but lagged features still materialize full panel in memory.")
         else:
             df = _read_any(args.panel)
 
@@ -142,6 +282,14 @@ def main() -> None:
                          ("E_energy", f"E_prev{lag}h_same")):
             if src in df:
                 df[tgt] = grp[src].shift(lag)
+
+    # extra same-cell lags for requested columns
+    if lag_cols:
+        for col in lag_cols:
+            if col not in df.columns:
+                continue
+            for lag in lags:
+                df[f"{col}_lag{lag}h"] = grp[col].shift(lag)
 
     # drift-aware lags (radius > 0)
     r = float(args.radius_deg)
@@ -171,8 +319,79 @@ def main() -> None:
 
         df.drop(columns=["time_floor"], inplace=True)
 
+    # Past-only rolling features (computed on sorted, grouped data)
+    extra_cols = []
+    if past_windows:
+        extra_cols.append(_apply_past_roll(df, past_mean_cols, past_windows, "mean"))
+        extra_cols.append(_apply_past_roll(df, past_std_cols, past_windows, "std"))
+        extra_cols.append(_apply_past_roll(df, past_slope_cols, past_windows, "slope"))
+        extra_cols.append(_apply_past_roll(df, fliprate_cols, past_windows, "fliprate"))
+    if extra_cols:
+        merged = {}
+        for block in extra_cols:
+            merged.update(block)
+        if merged:
+            # Assign in-place to avoid large temporary concat allocations.
+            for col, arr in merged.items():
+                df[col] = arr
+
+    # Mud churn + slopes (aliases for readability)
+    if "S_shear_std_past6h" in df.columns and "S_churn_6h" not in df.columns:
+        df["S_churn_6h"] = df["S_shear_std_past6h"].astype("float32")
+    if "G_struct_slope_past6h" in df.columns and "G_slope_6h" not in df.columns:
+        df["G_slope_6h"] = df["G_struct_slope_past6h"].astype("float32")
+    if "S_shear_slope_past6h" in df.columns and "S_slope_6h" not in df.columns:
+        df["S_slope_6h"] = df["S_shear_slope_past6h"].astype("float32")
+
+    # Rolling corr(G, S) over past window (causal, shifted)
+    corr_cols = _apply_past_corr(df, "G_struct", "S_shear", 24, "corr_G_S_past24h")
+    if corr_cols:
+        for col, arr in corr_cols.items():
+            df[col] = arr
+
+    # Regime tags + spikes
+    if "S_shear" in df.columns:
+        s_vals = pd.to_numeric(df["S_shear"], errors="coerce")
+        s_q50 = float(np.nanquantile(s_vals, 0.50)) if s_vals.notna().any() else float("nan")
+        s_q90 = float(np.nanquantile(s_vals, 0.90)) if s_vals.notna().any() else float("nan")
+        if "G_struct" in df.columns:
+            g_vals = pd.to_numeric(df["G_struct"], errors="coerce")
+            g_q90 = float(np.nanquantile(g_vals, 0.90)) if g_vals.notna().any() else float("nan")
+        else:
+            g_q90 = float("nan")
+
+        if "A_agree" in df.columns:
+            a_vals = pd.to_numeric(df["A_agree"], errors="coerce")
+        elif "gka_dir_var" in df.columns:
+            a_vals = 1.0 - pd.to_numeric(df["gka_dir_var"], errors="coerce").clip(lower=0.0, upper=1.0)
+        else:
+            a_vals = pd.Series(np.nan, index=df.index)
+        a_q90 = float(np.nanquantile(a_vals, 0.90)) if a_vals.notna().any() else float("nan")
+
+        grp = df.groupby(["lat_r", "lon_r"], sort=False)
+        ds = grp["S_shear"].diff(1)
+        ds_q90 = float(np.nanquantile(ds, 0.90)) if ds.notna().any() else float("nan")
+
+        df["mud_high"] = (s_vals > s_q90).astype("float32")
+        df["mud_low"] = (s_vals < s_q50).astype("float32")
+        if np.isfinite(g_q90):
+            df["geom_high"] = (pd.to_numeric(df["G_struct"], errors="coerce") > g_q90).astype("float32")
+        else:
+            df["geom_high"] = 0.0
+        if np.isfinite(a_q90):
+            df["coh_high"] = (a_vals > a_q90).astype("float32")
+        else:
+            df["coh_high"] = 0.0
+        df["mud_high_geom_high"] = (df["mud_high"] * df["geom_high"]).astype("float32")
+        df["mud_high_geom_low"] = (df["mud_high"] * (1.0 - df["geom_high"]).astype("float32")).astype("float32")
+        df["S_spike"] = ((s_vals > s_q90) | (ds > ds_q90)).astype("float32")
+
     # cleanup
     df.drop(columns=["lat_r", "lon_r"], inplace=True)
+
+    # Defragment before write only if requested (saves memory).
+    if args.defragment:
+        df = df.copy()
     _write_any(args.out, df)
     print(f"[done] wrote {len(df):,} rows with lags -> {args.out}")
 

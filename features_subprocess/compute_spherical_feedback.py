@@ -60,6 +60,9 @@ def parse_args():
                     help="Skip recompute; resume from existing temp file and only finalize SFI/SFI2.")
     ap.add_argument("--keep-tmp", action="store_true",
                     help="Keep temp file after successful finalize (useful with --resume).")
+    # Agent: accept overwrite flag for pipeline compatibility.
+    ap.add_argument("--overwrite", action="store_true",
+                    help="Allow replacing existing output file.")
     # Kept for compatibility; lead correlations are not computed in this streamer.
     ap.add_argument("--lead-hours", type=int, default=24,
                     help="Accepted for backward compatibility; currently unused in streaming mode.")
@@ -559,6 +562,8 @@ def main():
     aoi = parse_area(args.area)
     in_path = Path(args.labelled)
     out_path = Path(args.out)
+    if out_path.exists() and not args.overwrite:
+        raise SystemExit(f"[spherical] output exists; use --overwrite: {out_path}")
 
     fmt_out = _detect_table_format(out_path)
     if args.tmp_path:
@@ -676,7 +681,7 @@ def main():
         mix_q1, mix_q99 = q["SFI2_raw"]
         print(f"Quantiles (exact scan): SFI q1={sfi_q1:.4f} q99={sfi_q99:.4f} | SFI2 q1={mix_q1:.4f} q99={mix_q99:.4f}", flush=True)
 
-        writer_out = _ChunkedWriter(out_path, overwrite=True)
+        writer_out = _ChunkedWriter(out_path, overwrite=args.overwrite)
         tmp_cols_all = _peek_columns(tmp_path)
         base_keep = [c for c in tmp_cols_all if c not in ("SFI_raw","SFI2_raw")]
         keep_final = base_keep + ["SFI","SFI2"]

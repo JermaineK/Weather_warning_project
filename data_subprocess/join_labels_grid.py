@@ -746,6 +746,11 @@ def main():
                     labeled["lead_h"] = np.where(np.isfinite(lead_vals), np.ceil(lead_vals), np.nan)
                 if "lead_h_bucket" not in labeled.columns:
                     labeled["lead_h_bucket"] = _lead_bucket(lead_vals, lead_bins)
+                # Keep a stable dtype for parquet streaming (avoid int/float schema flips).
+                labeled["lead_h"] = pd.to_numeric(labeled["lead_h"], errors="coerce").astype("float64")
+                labeled["lead_h_bucket"] = pd.to_numeric(
+                    labeled["lead_h_bucket"], errors="coerce"
+                ).astype("float64")
 
             labeled = labeled.reindex(columns=final_order)
 

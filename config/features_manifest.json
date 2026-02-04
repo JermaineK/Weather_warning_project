@@ -23,4 +23,26 @@
   {"name": "lead_norm", "source": "lead", "window": "instant t", "past_only": true},
   {"name": "lead_inv", "source": "lead", "window": "instant t", "past_only": true},
   {"name": "G_lead_norm", "source": "lead", "window": "instant t", "past_only": true}
+  ,
+  {"name": "S_shear", "source": "mud_features", "window": "instant t", "past_only": true},
+  {"name": "S_zeta_var", "source": "mud_features", "window": "instant t", "past_only": true},
+  {"name": "S_dir_var", "source": "mud_features", "window": "instant t", "past_only": true},
+  {"name": "S_churn_6h", "source": "mud_features", "window": "t-6h..t", "past_only": true},
+  {"name": "S_spike", "source": "mud_features", "window": "t-1h..t", "past_only": true},
+  {"name": "G_over_S", "source": "mud_interactions", "window": "instant t", "past_only": true},
+  {"name": "S_over_G", "source": "mud_interactions", "window": "instant t", "past_only": true},
+  {"name": "G_times_S", "source": "mud_interactions", "window": "instant t", "past_only": true},
+  {"name": "G_times_S_disagree", "source": "mud_interactions", "window": "instant t", "past_only": true},
+  {"name": "corr_G_S_past24h", "source": "mud_interactions", "window": "t-24h..t", "past_only": true},
+  {"name": "G_slope_6h", "source": "mud_interactions", "window": "t-6h..t", "past_only": true},
+  {"name": "S_slope_6h", "source": "mud_interactions", "window": "t-6h..t", "past_only": true},
+  {"name": "same_sign", "source": "mud_interactions", "window": "instant t", "past_only": true},
+  {"name": "mud_high", "source": "mud_regimes", "window": "instant t", "past_only": true},
+  {"name": "mud_low", "source": "mud_regimes", "window": "instant t", "past_only": true},
+  {"name": "geom_high", "source": "mud_regimes", "window": "instant t", "past_only": true},
+  {"name": "coh_high", "source": "mud_regimes", "window": "instant t", "past_only": true},
+  {"name": "mud_high_geom_high", "source": "mud_regimes", "window": "instant t", "past_only": true},
+  {"name": "mud_high_geom_low", "source": "mud_regimes", "window": "instant t", "past_only": true}
+  ,
+  {"name": "A_agree", "source": "mud_features", "window": "instant t", "past_only": true}
 ]

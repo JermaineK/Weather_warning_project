@@ -167,6 +167,44 @@ def _compute_gse(chunk: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     df["G_struct"] = g_struct.astype("float32")
     df["S_shear"] = s_shear.astype("float32")
     df["E_energy"] = e_energy.astype("float32")
+
+    # --- Mud feature block (S): reuse existing neighborhood metrics where available ---
+    zeta = s("zeta")
+    gka_dir = s("gka_dir_var")
+    sph_vdr_std = s("sph_vdr_std")
+    if sph_vdr_std.notna().any():
+        s_zeta_var = sph_vdr_std
+    elif zeta.notna().any():
+        s_zeta_var = zeta.abs()
+    else:
+        s_zeta_var = pd.Series(np.nan, index=df.index)
+
+    s_dir_var = gka_dir if gka_dir.notna().any() else pd.Series(np.nan, index=df.index)
+    a_agree = (1.0 - gka_dir.clip(lower=0.0, upper=1.0)) if gka_dir.notna().any() else pd.Series(np.nan, index=df.index)
+
+    df["S_zeta_var"] = s_zeta_var.astype("float32")
+    df["S_dir_var"] = s_dir_var.astype("float32")
+    df["A_agree"] = a_agree.astype("float32")
+
+    # --- Same-time G×S interaction block ---
+    eps = 1.0e-6
+    g_safe = df["G_struct"].to_numpy(dtype="float32", copy=False)
+    s_safe = df["S_shear"].to_numpy(dtype="float32", copy=False)
+    a_safe = pd.to_numeric(df["A_agree"], errors="coerce").fillna(0.0).to_numpy(dtype="float32", copy=False)
+    df["G_over_S"] = ((g_safe + eps) / (s_safe + eps)).astype("float32")
+    df["S_over_G"] = ((s_safe + eps) / (g_safe + eps)).astype("float32")
+    df["G_times_S"] = (g_safe * s_safe).astype("float32")
+    df["G_times_S_disagree"] = (g_safe * s_safe * (1.0 - a_safe)).astype("float32")
+
+    # --- Same-sign proxy (causal, same-time) ---
+    chir = s("gka_chirality")
+    if not chir.notna().any():
+        chir = s("gka_parity_eta")
+    if zeta.notna().any() and chir.notna().any():
+        same_sign = (np.sign(zeta.fillna(0.0)) == np.sign(chir.fillna(0.0))).astype("float32")
+    else:
+        same_sign = pd.Series(0.0, index=df.index)
+    df["same_sign"] = same_sign.astype("float32")
     return df
 
 
@@ -177,6 +215,8 @@ def main() -> None:
     )
     ap.add_argument("--subset", required=True, help="ID-filtered subset file (CSV(.gz) or Parquet).")
     ap.add_argument("--out", required=True, help="Output panel file (CSV(.gz) or Parquet).")
+    # Agent: accept overwrite flag for pipeline compatibility (writer overwrites by default).
+    ap.add_argument("--overwrite", action="store_true", help="No-op; output is overwritten if present.")
     ap.add_argument(
         "--chunksize",
         "--chunk-rows",

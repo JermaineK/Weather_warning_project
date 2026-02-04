@@ -47,12 +47,15 @@ report:
       animate-fps: 6
       diagnostics: true
       diagnostics-fail-on-checks: true
+      diagnostics-fast: true
       diagnostics-feature-meta: config/features_manifest.json
 report_pdf: true
 
 autofix:
   use_diagnostics_rules: true
   rebuild_on_change: false
+  add_overwrite: true
+  only_rebuild_failed: true
 
 # =====================================================================
 # 0) Fetch — enabled to harvest ERA5 before merging existing files
@@ -306,8 +309,8 @@ data_stage:
       lag-cols: "gka_parity_lock,gka_knee_state,gka_SAI"
       past-windows: "6,12,24"
       past-mean-cols: "gka_parity_lock,gka_SAI,gka_knee_ratio,gka_chirality,gka_parity_eta"
-      past-std-cols: "gka_SAI,gka_knee_ratio,gka_chirality"
-      past-slope-cols: "gka_SAI,gka_knee_ratio,gka_chirality"
+      past-std-cols: "gka_SAI,gka_knee_ratio,gka_chirality,S_shear,G_struct"
+      past-slope-cols: "gka_SAI,gka_knee_ratio,gka_chirality,S_shear,G_struct"
       fliprate-cols: "gka_parity_lock,gka_knee_state"
       radius-deg: 0.0
       round-dp: 3
@@ -341,7 +344,7 @@ data_stage:
       out: data/grid_train_gse_panel_targets.parquet
       save-targets-meta: data/grid_train_gse_panel_targets.meta.json
       target-mode: knee-forecast
-      target-col: y_knee_cross_240h
+      target-col: y_commit_240h
       knee-cross-col: gka_knee_cross
       lock-col: gka_parity_lock
       lead-col: t_to_storm_min_h
@@ -358,15 +361,34 @@ data_stage:
     - mode: train-viability
       enabled: true
       train: data/grid_train_gse_panel_targets.parquet
-      target: y_knee_cross_240h
+      target: y_commit_240h
       features:
-        - gka_SII
+        - G_struct
+        - E_energy
+        - S_shear
+        - S_zeta_var
+        - S_dir_var
+        - S_churn_6h
+        - S_spike
+        - G_over_S
+        - S_over_G
+        - G_times_S
+        - G_times_S_disagree
+        - corr_G_S_past24h
+        - G_slope_6h
+        - S_slope_6h
+        - same_sign
+        - mud_high
+        - mud_low
+        - geom_high
+        - coh_high
+        - mud_high_geom_high
+        - mud_high_geom_low
         - gka_parity_eta
         - gka_chirality
         - gka_vortdiv_ratio
         - gka_F
         - gka_knee_ratio
-        - gka_knee_post_h
         - gka_SAI_lag6h
         - gka_SAI_mean_past12h
         - gka_SAI_slope_past12h
@@ -380,6 +402,9 @@ data_stage:
         - SFI
         - SFI2
         - S3
+      feature-set: GES
+      ablation-sets: "G,E,S,GE,GS,ES,GES"
+      ablation-out: results/metrics/coral_sea_demo_ablation.csv
       neg-pos-ratio: 3.0
       sample-frac: 0.8
       test-size: 0.2
@@ -425,6 +450,7 @@ alerts_logic:
       persist-hours: 1
       min-neighbors: 3
       normalize-lon: *norm
+      passthrough-cols: "row_id,ilat,ilon,cell_id,lead_h,t_to_storm_min_h,u10,v10"
       base-out: results/alerts/alerts_coral_sea_demo_base.parquet
       thr-out: results/alerts/alerts_coral_sea_demo_thr.parquet
       out: results/alerts/alerts_coral_sea_demo_final.parquet
@@ -477,6 +503,7 @@ training:
       train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state_slim.parquet
       alerts: results/alerts/alerts_coral_sea_demo_final.parquet
       label: storm
+      exclude-cols: gka_parity_lock,gka_knee_post_h
       G-thr: 0.8
       SFI-thr: 0.8
       knee-thr: 0.6
@@ -567,7 +594,7 @@ seeds:
     run-name: coral_sea_demo
     normalize-lon: *norm
     prob-col:
-    flag-col: y_knee_cross_240h
+    flag-col: y_commit_240h
     thr-file:
     thr-lead: 240
     thr-column: thr_Fbeta
@@ -595,8 +622,8 @@ seeds:
       labelled: data/grid_train_gse_panel_targets.parquet
       model: models/viability_model.pkl
       metrics-json: models/viability_model_metrics.json
-      target: y_genesis
-      success-col: y_genesis
+      target: y_commit_240h
+      success-col: y_commit_240h
       lead-col: t_to_storm_min_h
       leads: "24,48,72,120,240"
       min-precision: 0.05
@@ -624,9 +651,11 @@ seeds:
       model-metrics: models/viability_model_metrics.json
       lead-hours: "24,48,72,120,240"
       lead-col: t_to_storm_min_h
-      target: y_knee_cross_240h
-      lead-target-template: "y_knee_cross_{lead}h"
+      target: y_commit_240h
+      lead-target-template: "y_commit_{lead}h"
       out: results/metrics/coral_sea_demo_knee_leads.csv
+      regime-col: mud_high
+      regime-out: results/metrics/coral_sea_demo_viability_leads_regimes.csv
       skip_if_exists: false
 
     # Alerts coverage / clustering (enable once alerts exist)

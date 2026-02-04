@@ -49,7 +49,8 @@ except Exception:
 NEW_COLS = [
     "gka_kappa","gka_tau","gka_parity_eta","gka_A_overlap",
     "gka_F","gka_msl_nd","gka_knee_ratio",
-    "gka_chirality","gka_Q","gka_dir_var","gka_vortdiv_ratio"
+    "gka_chirality","gka_Q","gka_dir_var","gka_vortdiv_ratio",
+    "gka_SAI","gka_SII",
 ]
 
 ALIASES: Dict[str, List[str]] = {
@@ -90,6 +91,26 @@ def _safe_num(s: Optional[pd.Series]) -> pd.Series:
     if s is None:
         return pd.Series(dtype=float)
     return pd.to_numeric(s, errors="coerce")
+
+def _robust01(arr: np.ndarray, q_low: float = 0.05, q_high: float = 0.95) -> np.ndarray:
+    """
+    Robust 0-1 scaling using quantiles; safe for chunked data and NaNs.
+    """
+    out = np.zeros_like(arr, dtype=float)
+    mask = np.isfinite(arr)
+    if not mask.any():
+        return out
+    vals = arr[mask]
+    lo = np.nanquantile(vals, q_low) if vals.size else 0.0
+    hi = np.nanquantile(vals, q_high) if vals.size else 1.0
+    if not np.isfinite(lo):
+        lo = 0.0
+    if not np.isfinite(hi):
+        hi = lo + 1e-6
+    if hi - lo < 1e-8:
+        hi = lo + 1e-6
+    out[mask] = np.clip((arr[mask] - lo) / (hi - lo), 0.0, 1.0)
+    return out
 
 def print_bindings(bind: Dict[str, Optional[str]]):
     print("\n[GKA] Column bindings:")
@@ -294,6 +315,54 @@ def _compute_chunk_features(df: pd.DataFrame,
         out["gka_dir_var"] = 1.0 - R
     else:
         out["gka_dir_var"] = 0.0
+
+    # --- composite spiral indices ---
+    # SAI: alignment/coherence of spiral structure (amplitude + coherence + knee balance).
+    kappa = pd.to_numeric(out["gka_kappa"], errors="coerce").to_numpy(float)
+    tau = pd.to_numeric(out["gka_tau"], errors="coerce").to_numpy(float)
+    Fv = pd.to_numeric(out["gka_F"], errors="coerce").to_numpy(float)
+    dir_var = pd.to_numeric(out["gka_dir_var"], errors="coerce").to_numpy(float)
+    overlap = pd.to_numeric(out["gka_A_overlap"], errors="coerce").to_numpy(float)
+    knee = pd.to_numeric(out["gka_knee_ratio"], errors="coerce").to_numpy(float)
+
+    kappa_term = _robust01(np.abs(kappa))
+    F_term = np.clip(Fv, 0.0, 1.0)
+    dir_term = np.clip(1.0 - dir_var, 0.0, 1.0)
+    overlap_term = _robust01(np.abs(overlap))
+    knee_term = np.exp(-np.abs(np.log10(np.abs(knee) + 1e-6)))
+    sai = (
+        0.30 * kappa_term
+        + 0.20 * F_term
+        + 0.20 * dir_term
+        + 0.20 * overlap_term
+        + 0.10 * knee_term
+    )
+    out["gka_SAI"] = np.clip(sai, 0.0, 1.0)
+
+    # SII: instability/tearing (vort+div, shear, and time-derivative activity).
+    shear_base = None
+    if S3 is not None:
+        shear_base = _safe_num(S3).to_numpy(float)
+    elif shear is not None:
+        shear_base = _safe_num(shear).to_numpy(float)
+    else:
+        shear_base = np.zeros(len(out), dtype=float)
+    shear_term = _robust01(np.abs(shear_base))
+    vortdiv = pd.to_numeric(out["gka_vortdiv_ratio"], errors="coerce").to_numpy(float)
+    vortdiv_term = _robust01(np.abs(vortdiv))
+    dS_term = np.zeros(len(out), dtype=float)
+    if "dS_dt" in out.columns:
+        dS_vals = pd.to_numeric(out["dS_dt"], errors="coerce").to_numpy(float)
+        dS_term = _robust01(np.abs(dS_vals))
+    tau_term = _robust01(np.abs(tau))
+    sii = (
+        0.25 * kappa_term
+        + 0.20 * tau_term
+        + 0.20 * shear_term
+        + 0.20 * vortdiv_term
+        + 0.15 * dS_term
+    )
+    out["gka_SII"] = np.clip(sii, 0.0, 1.0)
 
     # sanitize dtypes for new cols (downcast to float32 to keep size reasonable)
     for c in NEW_COLS:

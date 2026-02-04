@@ -47,6 +47,7 @@ GKA_NEW_COLUMNS: List[str] = [
     "gka_kappa", "gka_tau", "gka_parity_eta", "gka_A_overlap",
     "gka_F", "gka_msl_nd", "gka_knee_ratio",
     "gka_chirality", "gka_Q", "gka_dir_var", "gka_vortdiv_ratio",
+    "gka_SAI", "gka_SII",
 ]
 
 GKA_MS_COLUMNS: List[str] = [
@@ -206,6 +207,7 @@ class InputIssue:
     used_key: Optional[str]
     path: Optional[Path]
     detail: str
+    missing_cols: Optional[List[str]] = None
 
 
 # --------------------------- schema helpers ---------------------------
@@ -351,6 +353,58 @@ def _viability_leads_cols(step: Dict[str, Any]) -> List[str]:
         cols.append(target)
     return cols
 
+def _viability_targets_input_columns(step: Dict[str, Any]) -> List[str]:
+    mode = _first_key(step, ("target_mode", "target-mode")) or ""
+    mode = mode.replace("_", "-").strip().lower()
+    cols: List[str] = []
+    if mode == "commitment":
+        knee = _first_key(step, ("commitment_knee_col", "commitment-knee-col")) or "gka_knee_state"
+        lock = _first_key(step, ("commitment_lock_col", "commitment-lock-col")) or "gka_parity_lock"
+        cols.extend([knee, lock])
+        sai_thr = step.get("commitment_sai_thr")
+        if sai_thr in (None, ""):
+            sai_thr = step.get("commitment-sai-thr")
+        if sai_thr not in (None, ""):
+            sai_col = _first_key(step, ("commitment_sai_col", "commitment-sai-col")) or "gka_SAI"
+            cols.append(sai_col)
+    elif mode == "knee-forecast":
+        knee = _first_key(step, ("knee_cross_col", "knee-cross-col")) or "gka_knee_cross"
+        lock = _first_key(step, ("lock_col", "lock-col")) or "gka_parity_lock"
+        cols.extend([knee, lock])
+    else:
+        g_col = _first_key(step, ("g_col", "g-col")) or "G_struct"
+        cols.append(g_col)
+    return cols
+
+def _viability_targets_output_columns(step: Dict[str, Any]) -> List[str]:
+    mode = _first_key(step, ("target_mode", "target-mode")) or ""
+    mode = mode.replace("_", "-").strip().lower()
+    target = _first_key(step, ("target_col", "target-col"))
+    if not target:
+        if mode == "commitment":
+            target = "y_commit"
+        elif mode == "knee-forecast":
+            target = "y_knee_cross_240h"
+        else:
+            target = "y_viable"
+    cols = [target, "lead_h", "lead_h_bucket"]
+    include_leads = bool(step.get("include_lead_features") or step.get("include-lead-features"))
+    if mode == "lead-window" or include_leads:
+        cols.extend(["lead_norm", "lead_inv", "G_lead_norm"])
+    if mode == "knee-forecast":
+        lead_hours = _parse_csv_list(_first_key(step, ("lead_hours", "lead-hours")) or "24,48,72,120,240")
+        for h in lead_hours:
+            try:
+                hh = int(float(h))
+            except Exception:
+                continue
+            cols.extend([
+                f"y_knee_cross_{hh}h",
+                f"y_lock_stable_{hh}h",
+                f"y_commit_{hh}h",
+            ])
+    return cols
+
 
 STEP_CONTRACTS: Dict[Tuple[str, str], StepContract] = {
     ("features", "build"): StepContract(
@@ -477,11 +531,61 @@ STEP_CONTRACTS: Dict[Tuple[str, str], StepContract] = {
         outputs=[PathSpec(("outfile", "out"), kind="file", required=True)],
         output_columns=["row_id"],
     ),
+    ("data_stage", "subset-by-id"): StepContract(
+        section="data_stage",
+        mode="subset-by-id",
+        inputs=[PathSpec(
+            ("labelled",),
+            kind="file",
+            required=True,
+            required_columns=("row_id", "t_to_storm_min_h"),
+            produced_by=("data_stage.state-transitions",),
+        )],
+        outputs=[PathSpec(("out",), kind="file", required=True)],
+        output_columns=["row_id", "time", "lat", "lon"],
+        dependencies=["state-transitions"],
+    ),
+    ("data_stage", "gse-panel"): StepContract(
+        section="data_stage",
+        mode="gse-panel",
+        inputs=[PathSpec(("subset",), kind="file", required=True, required_columns=("time", "lat", "lon"), produced_by=("data_stage.subset-by-id",))],
+        outputs=[PathSpec(("out",), kind="file", required=True)],
+        output_columns=["time", "lat", "lon", "G_struct", "S_shear", "E_energy"],
+        dependencies=["subset-by-id"],
+    ),
+    ("data_stage", "gse-lagged"): StepContract(
+        section="data_stage",
+        mode="gse-lagged",
+        inputs=[PathSpec(("panel",), kind="file", required=True, required_columns=("time", "lat", "lon", "G_struct"), produced_by=("data_stage.gse-panel",))],
+        outputs=[PathSpec(("out",), kind="file", required=True)],
+        output_columns=["G_struct"],
+        dependencies=["gse-panel"],
+    ),
+    ("data_stage", "slowtick-features"): StepContract(
+        section="data_stage",
+        mode="slowtick-features",
+        inputs=[PathSpec(("panel",), kind="file", required=True, required_columns=("time", "lat", "lon"), produced_by=("data_stage.gse-lagged",))],
+        outputs=[PathSpec(("out",), kind="file", required=True)],
+        output_columns=["slow_cos", "slow_sin"],
+        dependencies=["gse-lagged"],
+    ),
+    ("data_stage", "gse-states"): StepContract(
+        section="data_stage",
+        mode="gse-states",
+        inputs=[PathSpec(("panel",), kind="file", required=True, required_columns=("G_struct", "S_shear", "E_energy"), produced_by=("data_stage.slowtick-features",))],
+        outputs=[PathSpec(("out",), kind="file", required=True)],
+        output_columns=["G_level", "S_level", "E_level", "GSE_str"],
+        dependencies=["slowtick-features"],
+    ),
     ("data_stage", "viability-targets"): StepContract(
         section="data_stage",
         mode="viability-targets",
         inputs=[PathSpec(("panel", "infile", "in"), kind="file", required=True, required_columns=("time", "lat", "lon"), produced_by=("data_stage.gse-states",))],
         outputs=[PathSpec(("out", "outfile"), kind="file", required=True)],
+        required_input_columns=[],
+        input_column_rule=_viability_targets_input_columns,
+        output_column_rule=_viability_targets_output_columns,
+        dependencies=["gse-states"],
     ),
     ("data_stage", "train-viability"): StepContract(
         section="data_stage",
@@ -823,6 +927,21 @@ def preflight_step(section: str, step: Dict[str, Any]) -> PreflightResult:
     errors: List[str] = []
     input_schemas: Dict[str, List[str]] = {}
     input_issues: List[InputIssue] = []
+    dynamic_cols = contract.expected_input_columns(step)
+    primary_spec: Optional[PathSpec] = None
+    if dynamic_cols:
+        for spec in contract.inputs:
+            if spec.kind in {"file", "glob"} and any(
+                key in {"panel", "infile", "in", "train", "labelled", "features", "subset", "source"}
+                for key in spec.path_keys
+            ):
+                primary_spec = spec
+                break
+        if primary_spec is None:
+            for spec in contract.inputs:
+                if spec.kind in {"file", "glob"}:
+                    primary_spec = spec
+                    break
 
     for spec in contract.inputs:
         path, used_key = spec.resolve(step)
@@ -884,14 +1003,26 @@ def preflight_step(section: str, step: Dict[str, Any]) -> PreflightResult:
                 if rows < 0:
                     print(f"[warn] {label}: row count unavailable for {target}; continuing.")
 
-        if spec.required_columns:
-            missing_cols = _validate_required_columns(target, spec.required_columns)
+        required_cols = list(spec.required_columns)
+        if dynamic_cols and spec is primary_spec:
+            for c in dynamic_cols:
+                if c not in required_cols:
+                    required_cols.append(c)
+        if required_cols:
+            missing_cols = _validate_required_columns(target, required_cols)
             if missing_cols:
                 errors.append(
                     f"{label}: missing columns {missing_cols} in {target}. "
                     f"Upstream step may not have produced them.{_format_produced_by(spec)}"
                 )
-                input_issues.append(InputIssue(spec, "missing_columns", used_key, target, detail="missing required columns"))
+                input_issues.append(InputIssue(
+                    spec,
+                    "missing_columns",
+                    used_key,
+                    target,
+                    detail=f"missing required columns: {', '.join(missing_cols)}",
+                    missing_cols=missing_cols,
+                ))
             else:
                 input_schemas[used_key or str(path)] = _peek_columns(target)
         else:

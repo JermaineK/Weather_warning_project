@@ -77,6 +77,8 @@ def main() -> None:
     )
     ap.add_argument("--panel", required=True, help="Input GSE panel (CSV(.gz) or Parquet).")
     ap.add_argument("--out", required=True, help="Output path with slow-tick features.")
+    # Agent: accept overwrite flag for pipeline compatibility (output overwrites by default).
+    ap.add_argument("--overwrite", action="store_true", help="No-op; output is overwritten if present.")
     ap.add_argument("--time-col", default="time", help="Timestamp column (UTC naive).")
     ap.add_argument("--period-hours", type=float, default=24.0, help="Slow-tick period in hours.")
     ap.add_argument(

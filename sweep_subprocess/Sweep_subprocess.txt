@@ -11,7 +11,7 @@ Use sweep_manager.py as the entry point (direct or via run_pipeline.py).
 Viability-first defaults (new pipeline)
 - labelled: data/grid_train_gse_panel_targets.parquet
 - model   : models/viability_model.pkl
-- target/success: y_viable
+- target/success: y_commit
 - lead-col: t_to_storm_min_h (labels = 0<lead<=L per lead)
 - Run best-constrained via sweep_manager to emit results/sweeps/viability_best_thresholds.csv.
 
@@ -28,8 +28,8 @@ Example (viability thresholds)
   python sweep_subprocess/sweep_manager.py best-constrained \
     --labelled data/grid_train_gse_panel_targets.parquet \
     --model models/viability_model.pkl \
-    --target y_viable \
-    --success-col y_viable \
+    --target y_commit \
+    --success-col y_commit \
     --lead-col t_to_storm_min_h \
     --leads 24 48 72 120 \
     --min-precision 0.3 \

@@ -26,6 +26,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# Defaults can be overridden via CLI in main().
+MAX_COUNT_MB = 200
+SAMPLE_ROWS_HINT = 50_000
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -70,9 +74,15 @@ def _hash_df(df: pd.DataFrame) -> str:
     return hashlib.sha256(h.tobytes()).hexdigest()
 
 
-def _count_csv_rows(path: Path) -> int:
+def _count_csv_rows(path: Path, max_count_mb: int) -> Optional[int]:
     if not path.exists():
         return 0
+    try:
+        size_mb = path.stat().st_size / (1024 * 1024)
+        if max_count_mb and size_mb > max_count_mb:
+            return None
+    except Exception:
+        pass
     opener = gzip.open if path.suffix.lower().endswith("gz") else open
     rows = -1
     with opener(path, "rt", encoding="utf-8", errors="ignore") as f:
@@ -117,7 +127,7 @@ def _file_info(path: Path, max_hash_mb: int = 200) -> Dict[str, Optional[object]
     if _is_parquet(path):
         meta_rows, counted = _count_parquet_rows(path)
     else:
-        counted = _count_csv_rows(path)
+        counted = _count_csv_rows(path, MAX_COUNT_MB)
     sha = None
     size_mb = stat.st_size / (1024 * 1024)
     if size_mb <= max_hash_mb:
@@ -153,6 +163,31 @@ def _find_provenance(path: Path) -> Optional[str]:
         if cand.exists():
             return str(cand)
     return None
+
+
+def _collect_run_files(
+    run_dir: Path,
+    *,
+    max_files: int = 5000,
+    skip_dirs: Optional[List[str]] = None,
+) -> List[Path]:
+    if not run_dir.exists():
+        return []
+    skip_dirs = skip_dirs or []
+    files: List[Path] = []
+    for p in run_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            rel = p.relative_to(run_dir).as_posix()
+        except Exception:
+            rel = str(p)
+        if any(rel.startswith(sd) for sd in skip_dirs):
+            continue
+        files.append(p)
+        if max_files and len(files) >= max_files:
+            break
+    return files
 
 
 def _sample_parquet(path: Path, columns: Optional[List[str]], n: int, seed: int) -> pd.DataFrame:
@@ -222,7 +257,10 @@ def _row_count(path: Path) -> int:
     if _is_parquet(path):
         meta_rows, counted = _count_parquet_rows(path)
         return int(counted or meta_rows or 0)
-    return _count_csv_rows(path)
+    counted = _count_csv_rows(path, MAX_COUNT_MB)
+    if counted is None:
+        return int(max(1, SAMPLE_ROWS_HINT))
+    return counted
 
 
 def _detect_cell_keys(cols: List[str]) -> List[str]:
@@ -889,10 +927,16 @@ def main() -> int:
     ap.add_argument("--metrics-json", default=None, help="Metrics JSON with feature list.")
     ap.add_argument("--feature-metadata", default=None, help="Optional feature metadata JSON.")
     ap.add_argument("--slowtick-dir", default=None, help="Slowtick output directory.")
-    ap.add_argument("--label-col", default="y_viable", help="Label column name for training.")
+    ap.add_argument("--label-col", default="y_commit", help="Label column name for training.")
     ap.add_argument("--lead-col", default="lead_h", help="Lead column name (if present).")
     ap.add_argument("--key-cols", default="time,ilat,ilon", help="Comma-separated key columns.")
     ap.add_argument("--sample-rows", type=int, default=50_000, help="Sample size for hashing.")
+    ap.add_argument(
+        "--max-count-mb",
+        type=int,
+        default=200,
+        help="Skip full CSV row counts when file size exceeds this threshold (MB).",
+    )
     ap.add_argument("--seed", type=int, default=42, help="Sampling seed.")
     ap.add_argument("--max-overlap-rows", type=int, default=5_000_000, help="Max rows for exact overlap check.")
     ap.add_argument("--max-hash-mb", type=int, default=200, help="Max file size for sha256 hashing.")
@@ -901,11 +945,23 @@ def main() -> int:
     ap.add_argument("--time-shift-hours", type=int, default=72, help="Hours to shift features in time-shift test.")
     ap.add_argument("--skip-time-shift", action="store_true", help="Skip time-shift diagnostics.")
     ap.add_argument(
+        "--fast",
+        action="store_true",
+        help="Fast diagnostics: reduce sample size and skip expensive scans (lead fingerprints, time-shift).",
+    )
+    ap.add_argument(
         "--fail-on-checks",
         action="store_true",
         help="Exit non-zero if any check is marked as fail.",
     )
     args = ap.parse_args()
+    global MAX_COUNT_MB, SAMPLE_ROWS_HINT
+    if args.fast:
+        args.sample_rows = min(int(args.sample_rows), 5000)
+        args.max_hash_mb = min(int(args.max_hash_mb), 50)
+        args.skip_time_shift = True
+    MAX_COUNT_MB = int(args.max_count_mb)
+    SAMPLE_ROWS_HINT = int(args.sample_rows)
 
     run_dir = Path(args.run_dir)
     run_name = args.run_name or _parse_run_name(run_dir) or "unknown_run"
@@ -1048,121 +1104,123 @@ def main() -> int:
         out_path = artifacts_dir / f"{name}_sample.parquet"
         _write_sample_table(path, out_path, keep_cols or None, n=min(2000, args.sample_rows), seed=args.seed)
 
-    # Lead hash detection
+    # Lead hash detection / fingerprints / label stats (skip in fast mode)
     lead_hashes = []
-    lead_hash_note = None
-    if train_tables:
-        lead_hashes, lead_hash_note = _detect_lead_hashes(
-            train_tables, lead_col, label_col, key_cols, args.sample_rows, args.seed
-        )
-    elif train_table_path and train_table_path.exists():
-        lead_hashes, lead_hash_note = _detect_lead_hashes_from_single(
-            train_table_path, lead_col, label_col, key_cols, args.sample_rows, args.seed
-        )
-
+    lead_hash_note = "skipped"
     lead_fingerprints = []
-    lead_fp_note = None
-    if train_tables:
-        lead_fingerprints, lead_fp_note = _lead_fingerprints_from_tables(
-            train_tables, lead_col, label_col, key_cols, args.sample_rows, args.seed
-        )
-    elif train_table_path and train_table_path.exists():
-        lead_fingerprints, lead_fp_note = _lead_fingerprints_from_single(
-            train_table_path, lead_col, label_col, key_cols, args.sample_rows, args.seed
-        )
+    lead_fp_note = "skipped"
+    lead_label_stats = pd.DataFrame()
+    if not args.fast:
+        if train_tables:
+            lead_hashes, lead_hash_note = _detect_lead_hashes(
+                train_tables, lead_col, label_col, key_cols, args.sample_rows, args.seed
+            )
+        elif train_table_path and train_table_path.exists():
+            lead_hashes, lead_hash_note = _detect_lead_hashes_from_single(
+                train_table_path, lead_col, label_col, key_cols, args.sample_rows, args.seed
+            )
+
+        if train_tables:
+            lead_fingerprints, lead_fp_note = _lead_fingerprints_from_tables(
+                train_tables, lead_col, label_col, key_cols, args.sample_rows, args.seed
+            )
+        elif train_table_path and train_table_path.exists():
+            lead_fingerprints, lead_fp_note = _lead_fingerprints_from_single(
+                train_table_path, lead_col, label_col, key_cols, args.sample_rows, args.seed
+            )
+
+        if train_tables:
+            stats_rows = []
+            for p in train_tables:
+                lead_val = _lead_from_name(p.name)
+                stats = _lead_label_stats(p, lead_col, label_col)
+                if stats.empty and lead_val is not None:
+                    stats = pd.DataFrame({"lead_h": [lead_val], "pos_count": [np.nan], "n_rows": [np.nan]})
+                if lead_val is not None:
+                    stats["lead_h"] = lead_val
+                stats_rows.append(stats)
+            if stats_rows:
+                lead_label_stats = pd.concat(stats_rows, ignore_index=True)
+        elif train_table_path and train_table_path.exists():
+            lead_label_stats = _lead_label_stats(train_table_path, lead_col, label_col)
+        if not lead_label_stats.empty:
+            lead_label_stats.to_parquet(project_dir / "lead_label_stats.parquet", index=False)
+
     (project_dir / "lead_feature_fingerprints.json").write_text(
         json.dumps({"note": lead_fp_note, "fingerprints": lead_fingerprints}, indent=2, ensure_ascii=True),
         encoding="utf-8",
     )
 
-    # Label stats per lead
-    lead_label_stats = pd.DataFrame()
-    if train_tables:
-        stats_rows = []
-        for p in train_tables:
-            lead_val = _lead_from_name(p.name)
-            stats = _lead_label_stats(p, lead_col, label_col)
-            if stats.empty and lead_val is not None:
-                stats = pd.DataFrame({"lead_h": [lead_val], "pos_count": [np.nan], "n_rows": [np.nan]})
-            if lead_val is not None:
-                stats["lead_h"] = lead_val
-            stats_rows.append(stats)
-        if stats_rows:
-            lead_label_stats = pd.concat(stats_rows, ignore_index=True)
-    elif train_table_path and train_table_path.exists():
-        lead_label_stats = _lead_label_stats(train_table_path, lead_col, label_col)
-    if not lead_label_stats.empty:
-        lead_label_stats.to_parquet(project_dir / "lead_label_stats.parquet", index=False)
-
     # Train/val overlap (auto-discover if not explicitly provided)
     overlap_count = None
     overlap_mode = "missing"
     overlap_rows = []
-    if args.train_keys and args.val_keys:
-        overlap_count, overlap_mode = _overlap_count(
-            Path(args.train_keys), Path(args.val_keys), key_cols, args.max_overlap_rows
-        )
-        overlap_rows.append(
-            {
-                "train_path": str(args.train_keys),
-                "val_path": str(args.val_keys),
-                "overlap": overlap_count,
-                "mode": overlap_mode,
-                "key_cols": ",".join(key_cols),
-            }
-        )
-    else:
-        train_keys = sorted(Path("models").glob("*_train_keys.*"))
-        val_keys = sorted(Path("models").glob("*_val_keys.*"))
-        val_map = {p.name.replace("_val_keys", ""): p for p in val_keys}
-        for tr in train_keys:
-            key = tr.name.replace("_train_keys", "")
-            vl = val_map.get(key)
-            if not vl:
-                continue
-            tr_cols = [c for c, _ in _read_schema(tr)]
-            vl_cols = [c for c, _ in _read_schema(vl)]
-            common = [c for c in tr_cols if c in vl_cols]
-            keys = []
-            if "time" in common:
-                keys.append("time")
-            if "cell_id" in common:
-                keys.append("cell_id")
-            elif {"ilat", "ilon"}.issubset(common):
-                keys.extend(["ilat", "ilon"])
-            elif {"lat", "lon"}.issubset(common):
-                keys.extend(["lat", "lon"])
-            if lead_col in common:
-                keys.append(lead_col)
-            if not keys:
+    if not args.fast:
+        if args.train_keys and args.val_keys:
+            overlap_count, overlap_mode = _overlap_count(
+                Path(args.train_keys), Path(args.val_keys), key_cols, args.max_overlap_rows
+            )
+            overlap_rows.append(
+                {
+                    "train_path": str(args.train_keys),
+                    "val_path": str(args.val_keys),
+                    "overlap": overlap_count,
+                    "mode": overlap_mode,
+                    "key_cols": ",".join(key_cols),
+                }
+            )
+        else:
+            train_keys = sorted(Path("models").glob("*_train_keys.*"))
+            val_keys = sorted(Path("models").glob("*_val_keys.*"))
+            val_map = {p.name.replace("_val_keys", ""): p for p in val_keys}
+            for tr in train_keys:
+                key = tr.name.replace("_train_keys", "")
+                vl = val_map.get(key)
+                if not vl:
+                    continue
+                tr_cols = [c for c, _ in _read_schema(tr)]
+                vl_cols = [c for c, _ in _read_schema(vl)]
+                common = [c for c in tr_cols if c in vl_cols]
+                keys = []
+                if "time" in common:
+                    keys.append("time")
+                if "cell_id" in common:
+                    keys.append("cell_id")
+                elif {"ilat", "ilon"}.issubset(common):
+                    keys.extend(["ilat", "ilon"])
+                elif {"lat", "lon"}.issubset(common):
+                    keys.extend(["lat", "lon"])
+                if lead_col in common:
+                    keys.append(lead_col)
+                if not keys:
+                    overlap_rows.append(
+                        {
+                            "train_path": str(tr),
+                            "val_path": str(vl),
+                            "overlap": None,
+                            "mode": "missing_keys",
+                            "key_cols": "",
+                        }
+                    )
+                    continue
+                ov, mode = _overlap_count(tr, vl, keys, args.max_overlap_rows)
                 overlap_rows.append(
                     {
                         "train_path": str(tr),
                         "val_path": str(vl),
-                        "overlap": None,
-                        "mode": "missing_keys",
-                        "key_cols": "",
+                        "overlap": ov,
+                        "mode": mode,
+                        "key_cols": ",".join(keys),
                     }
                 )
-                continue
-            ov, mode = _overlap_count(tr, vl, keys, args.max_overlap_rows)
-            overlap_rows.append(
-                {
-                    "train_path": str(tr),
-                    "val_path": str(vl),
-                    "overlap": ov,
-                    "mode": mode,
-                    "key_cols": ",".join(keys),
-                }
-            )
-        if overlap_rows:
-            overlaps = [r for r in overlap_rows if r.get("overlap") is not None]
-            if overlaps:
-                overlap_count = max(int(r["overlap"]) for r in overlaps)
-                overlap_mode = "auto"
+            if overlap_rows:
+                overlaps = [r for r in overlap_rows if r.get("overlap") is not None]
+                if overlaps:
+                    overlap_count = max(int(r["overlap"]) for r in overlaps)
+                    overlap_mode = "auto"
 
-    if overlap_rows:
-        pd.DataFrame(overlap_rows).to_parquet(project_dir / "split_overlap.parquet", index=False)
+        if overlap_rows:
+            pd.DataFrame(overlap_rows).to_parquet(project_dir / "split_overlap.parquet", index=False)
 
     # Forbidden columns
     forbidden_patterns = [
@@ -1302,7 +1360,7 @@ def main() -> int:
             checks.append({
                 "issue": "identical per-lead inputs",
                 "detected": False,
-                "status": "warn",
+                "status": "pass",
                 "evidence": "feature fingerprints differ across leads",
             })
     else:

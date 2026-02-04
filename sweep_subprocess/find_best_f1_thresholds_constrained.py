@@ -319,6 +319,28 @@ def add_fbeta(table: pd.DataFrame, beta: float) -> pd.DataFrame:
     return t
 
 
+def _metrics_at_threshold(p: np.ndarray, y: np.ndarray, thr: float) -> Dict[str, float]:
+    """Compute precision/recall/coverage/F1 at a single threshold."""
+    pred = p >= float(thr)
+    tp = int(np.sum(pred & (y > 0)))
+    fp = int(np.sum(pred & (y <= 0)))
+    Ptot = int(np.sum(y > 0))
+    pred_n = tp + fp
+    precision = (tp / pred_n) if pred_n else 0.0
+    recall = (tp / Ptot) if Ptot else 0.0
+    coverage = pred_n / len(y) if len(y) else 0.0
+    denom = precision + recall
+    f1 = (2 * precision * recall / denom) if denom else 0.0
+    return {
+        "thr": float(thr),
+        "precision": float(precision),
+        "recall": float(recall),
+        "coverage": float(coverage),
+        "F1": float(f1),
+        "alerts": int(pred_n),
+    }
+
+
 def pick_best(
     table: pd.DataFrame,
     min_precision: float,
@@ -484,12 +506,12 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--target",
-        default="y_viable",
-        help="Base label used for training (default: y_viable).",
+        default="y_commit",
+        help="Base label used for training (default: y_commit).",
     )
     ap.add_argument(
         "--success-col",
-        default="y_viable",
+        default="y_commit",
         help=(
             "Success metric column (evaluated at t+lead on the same grid). "
             "If missing, we fall back to future window of --target per lead."
@@ -512,6 +534,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-precision", type=float, default=0.12)
     ap.add_argument("--max-coverage", type=float, default=0.25)
     ap.add_argument("--fbeta", type=float, default=0.5)
+    ap.add_argument(
+        "--thr-floor",
+        type=float,
+        default=None,
+        help="Optional absolute floor for thresholds (avoids trivial always-on flags).",
+    )
+    ap.add_argument(
+        "--thr-floor-quantile",
+        type=float,
+        default=None,
+        help="Optional quantile floor for thresholds (e.g., 0.95).",
+    )
     ap.add_argument(
         "--max-rows",
         type=int,
@@ -663,7 +697,7 @@ def main():
         meta_feats, meta_target = _load_metrics_features(args.metrics_json)
         if meta_feats:
             feats = meta_feats
-            if meta_target and not cli_feats and args.target == "y_viable":
+            if meta_target and not cli_feats and args.target == "y_commit":
                 # only override if user did not set a different target explicitly
                 args.target = meta_target
             print(f"[info] loaded {len(feats)} features from metrics JSON {args.metrics_json}")
@@ -907,6 +941,37 @@ def main():
         best_f1["lead_h"] = h
         best_fbet["lead_h"] = h
 
+        # Optional threshold floor to prevent degenerate always-on flags.
+        floor_thr = None
+        if args.thr_floor is not None:
+            floor_thr = float(args.thr_floor)
+        if args.thr_floor_quantile is not None:
+            try:
+                q_thr = float(np.quantile(prob, float(args.thr_floor_quantile)))
+                floor_thr = q_thr if floor_thr is None else max(floor_thr, q_thr)
+            except Exception:
+                pass
+        if floor_thr is not None and np.isfinite(floor_thr):
+            floor_thr = float(np.clip(floor_thr, 0.0, 1.0))
+            for key, tag in (("best_f1", "F1"), ("best_fbet", "Fbeta")):
+                res = best_f1 if key == "best_f1" else best_fbet
+                if res.get("thr", 0.0) < floor_thr:
+                    m = _metrics_at_threshold(prob, y, floor_thr)
+                    res["thr"] = m["thr"]
+                    res["P"] = m["precision"]
+                    res["R"] = m["recall"]
+                    res["Cov"] = m["coverage"]
+                    res["Alerts"] = m["alerts"]
+                    res[tag] = m["F1"] if tag == "F1" else float(
+                        add_fbeta(pd.DataFrame([m]), args.fbeta)["Fbeta"].iloc[0]
+                    )
+                    res["status"] = f"{res.get('status', '')} + floor"
+            if np.all(prob < floor_thr) or np.all(prob >= floor_thr):
+                print(
+                    f"[warn] lead={h}h: threshold floor {floor_thr:.6f} yields constant flags.",
+                    file=sys.stderr,
+                )
+
         _fmt(best_f1, "F1", "F1")
         _fmt(best_fbet, f"Fbeta={args.fbeta}", "Fbeta")
 
@@ -927,6 +992,7 @@ def main():
                 "Alerts_Fbeta": best_fbet["Alerts"],
                 "status_f1": best_f1["status"],
                 "status_Fbeta": best_fbet["status"],
+                "thr_floor": float(floor_thr) if floor_thr is not None else np.nan,
                 "label_mode": label_mode,
                 "n_rows": total_rows,
                 "positives": pos,

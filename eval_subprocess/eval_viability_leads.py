@@ -427,6 +427,16 @@ def parse_args():
         help="Allow near-perfect coincident scores without failing the run.",
     )
     ap.add_argument(
+        "--regime-col",
+        default="mud_high",
+        help="Optional regime column for conditioned metrics (e.g., mud_high).",
+    )
+    ap.add_argument(
+        "--regime-out",
+        default=None,
+        help="Optional CSV for regime-conditioned metrics.",
+    )
+    ap.add_argument(
         "--audit-shift-hours",
         type=int,
         default=6,
@@ -624,6 +634,53 @@ def main():
 
     out_df = pd.DataFrame(rows)
     io_common.write_any(out_path, out_df)
+
+    # Regime-conditioned metrics (e.g., mud_high vs mud_low)
+    if args.regime_col and args.regime_col in df.columns:
+        reg_out = args.regime_out
+        if not reg_out and args.run_name:
+            reg_out = f"results/metrics/{args.run_name}_viability_leads_regimes.csv"
+        if not reg_out:
+            reg_out = "results/metrics/viability_leads_regimes.csv"
+        reg_rows = []
+        reg_vals = pd.to_numeric(df[args.regime_col], errors="coerce").fillna(0.0).to_numpy()
+        for reg_name, reg_mask in [("regime_high", reg_vals > 0.5), ("regime_low", reg_vals <= 0.5)]:
+            if not reg_mask.any():
+                continue
+            for h in lead_hours:
+                if lead_template:
+                    col = lead_template.format(lead=int(float(h)))
+                    y_lead = _coerce_binary_series(df[col], col, "viability-eval")[reg_mask]
+                else:
+                    mask = _lead_mask(lead_vals, lead_h=float(h), lead_lower=float(args.lead_lower))
+                    y_lead = mask.astype(int)[reg_mask]
+                p_lead = probs[reg_mask]
+                if len(y_lead) == 0 or np.unique(y_lead).size < 2:
+                    continue
+                mets = _safe_metrics(y_lead, p_lead)
+                pos_rate = float(np.mean(y_lead))
+                prauc = mets["prauc"]
+                lift = float(prauc / pos_rate) if pos_rate and np.isfinite(prauc) else np.nan
+                reg_rows.append(
+                    {
+                        "regime": reg_name,
+                        "lead_h": float(h),
+                        "pos": int(np.sum(y_lead)),
+                        "samples": int(len(y_lead)),
+                        "pos_rate": pos_rate,
+                        "prauc_chance": pos_rate,
+                        "lift": lift,
+                        "auc": mets["auc"],
+                        "prauc": prauc,
+                        "brier": mets["brier"],
+                        "regime_col": args.regime_col,
+                        "target": (target if not lead_template else col),
+                        "run_name": args.run_name or "",
+                    }
+                )
+        if reg_rows:
+            io_common.write_any(reg_out, pd.DataFrame(reg_rows))
+            print(f"[viability-eval] regime metrics -> {reg_out}")
 
     print(
         f"[viability-eval] rows={len(df):,} coincident_pos={y_coincident.sum():,} "

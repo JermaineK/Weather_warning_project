@@ -5,7 +5,7 @@ compute_state_transitions.py
 
 Agent: derive per-cell state deltas/persistence from existing GKA/SFI style
 features without changing their mathematics. Outputs lightweight geometry (G)
-and excitability (E) proxies plus short/long horizon transition indicators.
+and excitability (E) proxies plus transition indicators and knee/parity tags.
 
 Design goals
 - Stream-friendly: iterates parquet via pyarrow batches or CSV chunks.
@@ -100,6 +100,10 @@ class CellState:
     last_G: float = np.nan
     last_E: float = np.nan
     last_sign: float = np.nan
+    last_knee_flag: bool = False
+    knee_time: pd.Timestamp | None = None
+    knee_sign: float = np.nan
+    last_flip_time: pd.Timestamp | None = None
     g_window: Deque[Tuple[pd.Timestamp, float]] = field(default_factory=deque)
     e_window: Deque[Tuple[pd.Timestamp, float]] = field(default_factory=deque)
     g_pulses: Deque[pd.Timestamp] = field(default_factory=deque)
@@ -219,6 +223,19 @@ def process_stream(path: str, args) -> None:
         "t_to_storm_min_h",
         "row_id",
     ]
+    # Agent: preserve key GKA/SFI + thermo columns for downstream commitment/viability stages.
+    feature_passthrough = [
+        "gka_SAI",
+        "gka_SII",
+        "gka_parity_eta",
+        "gka_chirality",
+        "gka_vortdiv_ratio",
+        "SFI",
+        "SFI2",
+        "thermo_shear",
+        "pdrop_nd",
+        "t2m_anom_local",
+    ]
     cols_needed = {
         args.time_col,
         args.lat_col,
@@ -235,6 +252,7 @@ def process_stream(path: str, args) -> None:
         "zeta_mean3h",
         "zeta",
     }
+    cols_needed.update(feature_passthrough)
     cols = [c for c in cols_needed if c and c in all_cols]
     cols += [c for c in label_passthrough if c in all_cols]
     missing_core = {"gka_dir_var", "gka_F", "gka_knee_ratio"} - set(cols)
@@ -258,13 +276,20 @@ def process_stream(path: str, args) -> None:
         G = _compute_G(chunk, args).astype("float32")
         E = _compute_E(chunk, args).astype("float32")
         S_sign = _sign_proxy(chunk).astype("float32")
+        knee_raw = _float_series(chunk, "gka_knee_ratio").to_numpy(float)
+        knee_score = _robust01(np.abs(knee_raw), args.knee_q_low, args.knee_q_high).astype("float32")
 
         chunk["G"] = G
         chunk["E"] = E
         chunk["S_sign"] = S_sign
+        chunk["gka_knee_score"] = knee_score
         chunk["dG_1h"] = np.zeros(len(chunk), dtype=np.float32)
         chunk["dE_1h"] = np.zeros(len(chunk), dtype=np.float32)
         chunk["dSsign_flip"] = np.zeros(len(chunk), dtype=np.int8)
+        chunk["gka_knee_cross"] = np.zeros(len(chunk), dtype=np.int8)
+        chunk["gka_knee_state"] = np.zeros(len(chunk), dtype=np.int8)
+        chunk["gka_knee_post_h"] = np.full(len(chunk), np.nan, dtype=np.float32)
+        chunk["gka_parity_lock"] = np.zeros(len(chunk), dtype=np.int8)
         chunk["G_persist_24h"] = np.full(len(chunk), np.nan, dtype=np.float32)
         chunk["G_pulse_count_96h"] = np.zeros(len(chunk), dtype=np.int16)
         chunk["E_pulse_count_96h"] = np.zeros(len(chunk), dtype=np.int16)
@@ -279,6 +304,11 @@ def process_stream(path: str, args) -> None:
                 gval = float(row["G"])
                 eval_ = float(row["E"])
                 sgn = float(row["S_sign"])
+                knee_val = float(row["gka_knee_score"]) if "gka_knee_score" in row else 0.0
+                knee_flag = bool(knee_val >= float(args.knee_thr))
+                knee_cross = int(knee_flag and (not st.last_knee_flag))
+                # knee_state: 0=pre, 1=crossing, 2=post
+                knee_state = 1 if knee_cross else (2 if knee_flag else 0)
 
                 if np.isfinite(st.last_G):
                     chunk.at[idx, "dG_1h"] = gval - st.last_G
@@ -286,6 +316,14 @@ def process_stream(path: str, args) -> None:
                     chunk.at[idx, "dE_1h"] = eval_ - st.last_E
                 if np.isfinite(st.last_sign):
                     chunk.at[idx, "dSsign_flip"] = int(sgn != st.last_sign)
+
+                if knee_flag:
+                    if knee_cross or st.knee_time is None:
+                        st.knee_time = t
+                        st.knee_sign = sgn
+                else:
+                    st.knee_time = None
+                    st.knee_sign = np.nan
 
                 if not args.lite:
                     cutoff_g = t - persist_td
@@ -308,10 +346,32 @@ def process_stream(path: str, args) -> None:
                         st.e_pulses.append(t)
                     chunk.at[idx, "E_pulse_count_96h"] = len(st.e_pulses)
 
+                if np.isfinite(st.last_sign) and np.isfinite(sgn) and (sgn != st.last_sign):
+                    st.last_flip_time = t
+                    if knee_flag:
+                        st.knee_time = t
+                        st.knee_sign = sgn
+
+                knee_age_h = np.nan
+                if st.knee_time is not None:
+                    knee_age_h = float((t - st.knee_time) / np.timedelta64(1, "h"))
+
+                lock_ok = False
+                if knee_flag and st.knee_time is not None and np.isfinite(st.knee_sign):
+                    if knee_age_h >= float(args.lock_hours):
+                        if (st.last_flip_time is None) or (st.last_flip_time <= st.knee_time):
+                            lock_ok = True
+
+                chunk.at[idx, "gka_knee_cross"] = knee_cross
+                chunk.at[idx, "gka_knee_state"] = knee_state
+                chunk.at[idx, "gka_knee_post_h"] = knee_age_h
+                chunk.at[idx, "gka_parity_lock"] = int(lock_ok)
+
                 st.last_time = t
                 st.last_G = gval
                 st.last_E = eval_
                 st.last_sign = sgn
+                st.last_knee_flag = knee_flag
             state[int(key)] = st
 
         chunk["transition_class"] = _classify_transition(
@@ -331,6 +391,11 @@ def process_stream(path: str, args) -> None:
             "G",
             "E",
             "S_sign",
+            "gka_knee_score",
+            "gka_knee_cross",
+            "gka_knee_state",
+            "gka_knee_post_h",
+            "gka_parity_lock",
             "dG_1h",
             "dE_1h",
             "dSsign_flip",
@@ -374,6 +439,8 @@ def parse_args():
     ap.add_argument("--G-q-high", type=float, default=0.95, help="High quantile for robust01 on G.")
     ap.add_argument("--knee-q-low", type=float, default=0.05, help="Low quantile for robust01 on knee.")
     ap.add_argument("--knee-q-high", type=float, default=0.95, help="High quantile for robust01 on knee.")
+    ap.add_argument("--knee-thr", type=float, default=0.7, help="Knee-score threshold for knee state tagging.")
+    ap.add_argument("--lock-hours", type=float, default=12.0, help="Hours required for parity lock after knee.")
 
     # E definition weights + scaling
     ap.add_argument("--E-w-S3", type=float, default=1.0, help="Weight on |S3| term.")

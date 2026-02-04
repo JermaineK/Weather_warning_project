@@ -322,33 +322,72 @@ def _proto_outcomes_snapshot(path: Optional[Path]) -> pd.DataFrame:
 def _slowtick_union_snapshot(path: Optional[Path]) -> Dict[str, Any]:
     if not _exists_nonempty(path):
         return {}
+    path = Path(path)
+    prob_col = None
+    cols = []
     try:
-        seeds = _read_any(Path(path))
+        if path.suffix.lower() == ".parquet":
+            import pyarrow.parquet as pq  # type: ignore
+
+            pf = pq.ParquetFile(path)
+            cols = pf.schema.names
+        else:
+            cols = list(pd.read_csv(path, nrows=0).columns)
     except Exception:
         return {}
-    if seeds is None or seeds.empty:
-        return {}
-    prob_col = None
     for c in ("prob_max", "prob_viable", "prob"):
-        if c in seeds.columns:
+        if c in cols:
             prob_col = c
             break
-    if prob_col is None:
+    if prob_col is None or not {"slow_cos", "slow_sin"}.issubset(cols):
         return {}
-    hi = seeds[pd.to_numeric(seeds[prob_col], errors="coerce") >= 0.5]
-    if not {"slow_cos", "slow_sin"}.issubset(seeds.columns) or hi.empty:
-        return {}
-    phase = np.arctan2(
-        pd.to_numeric(hi["slow_sin"], errors="coerce"),
-        pd.to_numeric(hi["slow_cos"], errors="coerce"),
-    )
-    phase_hours = (phase % (2 * np.pi)) * 24.0 / (2 * np.pi)
     bins = np.arange(0, 25, 3)
-    hist, _ = np.histogram(phase_hours, bins=bins)
+    hist = np.zeros(len(bins) - 1, dtype=np.int64)
+    count = 0
+    sum_h = 0.0
+    sumsq_h = 0.0
+
+    def _accumulate(df: pd.DataFrame) -> None:
+        nonlocal count, sum_h, sumsq_h, hist
+        if df.empty:
+            return
+        prob = pd.to_numeric(df[prob_col], errors="coerce")
+        mask = prob >= 0.5
+        if not mask.any():
+            return
+        sinv = pd.to_numeric(df.loc[mask, "slow_sin"], errors="coerce")
+        cosv = pd.to_numeric(df.loc[mask, "slow_cos"], errors="coerce")
+        phase = np.arctan2(sinv, cosv)
+        phase_hours = (phase % (2 * np.pi)) * 24.0 / (2 * np.pi)
+        arr = np.asarray(phase_hours, dtype="float64")
+        if arr.size == 0:
+            return
+        hist += np.histogram(arr, bins=bins)[0]
+        count += int(np.sum(~np.isnan(arr)))
+        sum_h += float(np.nansum(arr))
+        sumsq_h += float(np.nansum(arr * arr))
+
+    try:
+        if path.suffix.lower() == ".parquet":
+            import pyarrow.parquet as pq  # type: ignore
+
+            pf = pq.ParquetFile(path)
+            for batch in pf.iter_batches(columns=[prob_col, "slow_cos", "slow_sin"], batch_size=250000):
+                _accumulate(batch.to_pandas())
+        else:
+            for chunk in pd.read_csv(path, usecols=[prob_col, "slow_cos", "slow_sin"], chunksize=250000):
+                _accumulate(chunk)
+    except Exception:
+        return {}
+
+    if count == 0:
+        return {}
+    mean_h = sum_h / count
+    var_h = max(0.0, (sumsq_h / count) - (mean_h * mean_h))
     return {
-        "high_prob_count": int(len(hi)),
-        "phase_mean_h": float(np.nanmean(phase_hours)),
-        "phase_std_h": float(np.nanstd(phase_hours)),
+        "high_prob_count": int(count),
+        "phase_mean_h": float(mean_h),
+        "phase_std_h": float(np.sqrt(var_h)),
         "bins_h": bins.tolist(),
         "hist": hist.tolist(),
     }
@@ -1099,6 +1138,22 @@ def main() -> int:
     cfg = _read_yaml_or_json(cfg_path) if cfg_path else {}
     cfg, _ = config_normalize.normalize_config(cfg)
 
+    # Optional mud interaction summary (sampled to keep memory bounded)
+    corr_summary = {}
+    panel_path = _first_existing([Path("data/grid_train_gse_panel_targets.parquet")])
+    if panel_path and panel_path.exists():
+        cols = _peek_columns(panel_path)
+        if "corr_G_S_past24h" in cols:
+            samp = _read_any(panel_path, columns=["corr_G_S_past24h"], nrows=200_000)
+            vals = pd.to_numeric(samp["corr_G_S_past24h"], errors="coerce")
+            if vals.notna().any():
+                corr_summary = {
+                    "count": int(vals.notna().sum()),
+                    "q10": float(np.nanquantile(vals, 0.10)),
+                    "q50": float(np.nanquantile(vals, 0.50)),
+                    "q90": float(np.nanquantile(vals, 0.90)),
+                }
+
     blocked_path = Path(args.blocked) if args.blocked else None
     if blocked_path is None:
         cand = tables_dir / "blocked.json"
@@ -1260,11 +1315,29 @@ def main() -> int:
 
     # Viability skill-by-lead (from report_pack)
     skill_by_lead = pd.DataFrame()
+    ablation_metrics = pd.DataFrame()
+    regime_metrics = pd.DataFrame()
     skill_path = tables_dir / "skill_by_lead.parquet"
     if not skill_path.exists():
         skill_path = tables_dir / "skill_by_lead.csv"
     if skill_path.exists():
         skill_by_lead = _read_any(skill_path)
+    # Optional ablation / regime tables (look in metrics or tables dir)
+    if run_name:
+        ablation_path = Path(f"results/metrics/{run_name}_ablation.csv")
+        if ablation_path.exists():
+            ablation_metrics = _read_any(ablation_path)
+        regime_path = Path(f"results/metrics/{run_name}_viability_leads_regimes.csv")
+        if regime_path.exists():
+            regime_metrics = _read_any(regime_path)
+    if ablation_metrics.empty:
+        ab_path = tables_dir / "ablation.csv"
+        if ab_path.exists():
+            ablation_metrics = _read_any(ab_path)
+    if regime_metrics.empty:
+        reg_path = tables_dir / "viability_leads_regimes.csv"
+        if reg_path.exists():
+            regime_metrics = _read_any(reg_path)
 
     # Agent: surface slow-tick diagnostics in the report without feeding any model logic.
     slowtick_summary = pd.DataFrame()
@@ -1410,31 +1483,35 @@ def main() -> int:
 
     if not skill_by_lead.empty:
         title = "Viability Skill by Lead"
-        knee_horizon = None
+        horizon = None
         if "target" in skill_by_lead.columns:
             targets = skill_by_lead["target"].astype(str).str.lower()
-            if targets.str.contains("knee").any():
+            if targets.str.contains("commit").any():
+                title = "Commit Skill by Lead"
+            elif targets.str.contains("lock").any():
+                title = "Lock-Stable Skill by Lead"
+            elif targets.str.contains("knee").any():
                 title = "Knee Skill by Lead"
-                # Capture knee horizon from target name (e.g., y_knee_cross_240h)
-                try:
-                    import re
+            # Capture horizon from target name (e.g., y_commit_240h)
+            try:
+                import re
 
-                    for t in targets:
-                        m = re.search(r"y_knee_cross_(\d+)h", str(t))
-                        if m:
-                            knee_horizon = int(m.group(1))
-                            break
-                except Exception:
-                    knee_horizon = None
+                for t in targets:
+                    m = re.search(r"y_(?:knee_cross|commit|lock_stable)_(\d+)h", str(t))
+                    if m:
+                        horizon = int(m.group(1))
+                        break
+            except Exception:
+                horizon = None
         lines.append("")
         lines.append(f"## {title}")
         skill_disp = skill_by_lead.copy()
-        if knee_horizon and "kind" in skill_disp.columns:
+        if horizon and "kind" in skill_disp.columns:
             mask = skill_disp["kind"].astype(str).str.lower() == "coincident"
             if mask.any():
-                skill_disp.loc[mask, "kind"] = f"horizon_{knee_horizon}h"
+                skill_disp.loc[mask, "kind"] = f"horizon_{horizon}h"
                 if "lead_h" in skill_disp.columns:
-                    skill_disp.loc[mask, "lead_h"] = float(knee_horizon)
+                    skill_disp.loc[mask, "lead_h"] = float(horizon)
         lines.append(_markdown_table(skill_disp, max_rows=20))
         if knee_horizon:
             lines.append(
@@ -1453,6 +1530,24 @@ def main() -> int:
                     f"- Lead AUC range: {auc_vals.min():.3f} → {auc_vals.max():.3f} | "
                     f"PRAUC range: {pr_vals.min():.3f} → {pr_vals.max():.3f}"
                 )
+
+    if not ablation_metrics.empty:
+        lines.append("")
+        lines.append("## Ablation Results")
+        lines.append(_markdown_table(ablation_metrics, max_rows=20))
+
+    if not regime_metrics.empty:
+        lines.append("")
+        lines.append("## Regime-Conditioned Skill")
+        lines.append(_markdown_table(regime_metrics, max_rows=30))
+
+    if corr_summary:
+        lines.append("")
+        lines.append("## Mud Interaction Summary")
+        lines.append(
+            f"- corr_G_S_past24h (sample n={corr_summary['count']:,}): "
+            f"q10={corr_summary['q10']:.3f} q50={corr_summary['q50']:.3f} q90={corr_summary['q90']:.3f}"
+        )
 
     if not proto_outcomes.empty:
         lines.append("")

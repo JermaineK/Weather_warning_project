@@ -42,6 +42,8 @@ META_COLS = [
 _FORBIDDEN_RX = [re.compile(pat, flags=re.IGNORECASE) for pat in FORBIDDEN_REGEX]
 _META_SET = {c.lower() for c in META_COLS}
 _SUBS = [s.lower() for s in FORBIDDEN_SUBSTRINGS]
+_CAUSAL_BLOCK_TOKENS = ("lock", "future", "post", "tplus")
+_CAUSAL_ALLOW_TOKENS = ("past", "lag")
 _TARGET_POLICY_CACHE: Dict[str, Dict[str, List[str]]] | None = None
 
 
@@ -109,6 +111,11 @@ def forbidden_columns(
     bad: List[str] = []
     for c in columns:
         name = _norm(c)
+        if any(tok in name for tok in _CAUSAL_BLOCK_TOKENS) and not any(
+            allow in name for allow in _CAUSAL_ALLOW_TOKENS
+        ):
+            bad.append(str(c))
+            continue
         if name in allow_set:
             continue
         if name in extra_set:

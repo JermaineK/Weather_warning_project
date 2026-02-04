@@ -20,6 +20,8 @@ Everything is orchestrated from a single YAML config via `run_pipeline.py`.
 - `skip_if_exists` is supported in more tools (sweep best-constrained + eval).
 - Alerts now preserve `row_id` through denoise so specialist training can
   use alert IDs.
+- Viability targets support a commitment mode (post-knee parity lock) and
+  new composite GKA alignment/instability indices.
 
 ## Repository layout (current)
 

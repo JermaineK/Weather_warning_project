@@ -104,6 +104,51 @@ def _label_leaks(target: str, features: Sequence[str]) -> List[str]:
     return sorted(set(blocked))
 
 
+def _feature_group(name: str) -> str:
+    """
+    Rough grouping for ablations / feature_set selection.
+    G: geometry-related
+    E: energy / thermo
+    S: shear / mud
+    X: G×S interactions
+    R: regime tags
+    """
+    n = str(name).lower()
+    if n in {"g_over_s", "s_over_g", "g_times_s", "g_times_s_disagree", "corr_g_s_past24h", "g_slope_6h", "s_slope_6h", "same_sign"}:
+        return "X"
+    if n in {"mud_high", "mud_low", "geom_high", "coh_high", "mud_high_geom_high", "mud_high_geom_low"}:
+        return "R"
+    if n.startswith("s_") or n.startswith("shear_") or n in {"s3", "s", "s_shear", "s_zeta_var", "s_dir_var", "s_churn_6h", "s_spike"}:
+        return "S"
+    if n.startswith("e_") or n in {"e_energy", "thermo_shear", "pdrop_nd", "t2m_anom_local"}:
+        return "E"
+    if n.startswith("g_") or n in {"g_struct", "gka_f", "gka_knee_ratio", "gka_knee_post_h", "gka_sai", "gka_parity_eta", "gka_chirality", "gka_vortdiv_ratio", "zeta", "zeta_mean3h", "sfi", "sfi2", "gka_dir_var"}:
+        return "G"
+    if n.startswith("gka_"):
+        return "G"
+    return "G"
+
+
+def _select_feature_set(features: Sequence[str], feature_set: str) -> List[str]:
+    fs = str(feature_set or "").upper().strip()
+    if not fs:
+        return list(features)
+    keep = set(fs)
+    out: List[str] = []
+    for f in features:
+        grp = _feature_group(f)
+        if grp in keep:
+            out.append(f)
+        elif grp in {"X", "R"} and keep == {"G", "E", "S"}:
+            out.append(f)
+    # For full GES, include interactions + regimes
+    if keep == {"G", "E", "S"}:
+        for f in features:
+            if _feature_group(f) in {"X", "R"} and f not in out:
+                out.append(f)
+    return out
+
+
 def _load_feature_manifest(path: str | None) -> List[dict]:
     if not path:
         return []
@@ -433,6 +478,21 @@ def main() -> None:
         help="Feature columns to use (space-separated or comma-separated).",
     )
     ap.add_argument(
+        "--feature-set",
+        default="",
+        help="Feature set for ablations: G, E, S, GE, GS, ES, GES (filters --features).",
+    )
+    ap.add_argument(
+        "--ablation-sets",
+        default="",
+        help="CSV of feature sets to ablate (e.g., G,E,S,GE,GS,ES,GES).",
+    )
+    ap.add_argument(
+        "--ablation-out",
+        default=None,
+        help="Optional CSV to write ablation metrics (AUC/PRAUC per feature set).",
+    )
+    ap.add_argument(
         "--blocklist",
         default="",
         help="Comma-separated glob patterns to block from training features (added to defaults).",
@@ -588,6 +648,9 @@ def main() -> None:
     print(f"[train] using {len(df_fit):,} rows after subsample (features={args.features})")
 
     features = [f for f in args.features]
+    if args.feature_set:
+        features = _select_feature_set(features, args.feature_set)
+        print(f"[train] feature_set={args.feature_set} -> {features}")
     blocked = _blocked_features(features, block_patterns)
     if blocked:
         raise SystemExit(f"Blocked columns in training features: {blocked}")
@@ -723,6 +786,41 @@ def main() -> None:
             raise SystemExit(
                 f"Shuffled-label test did not collapse (auc={auc}, prauc={prauc}, base_rate={base_rate})."
             )
+
+    # Optional ablation runs (same split, different feature subsets)
+    if args.ablation_sets and args.ablation_out:
+        sets = _parse_csv_list(args.ablation_sets)
+        rows = []
+        for fs in sets:
+            fs = fs.strip().upper()
+            if not fs:
+                continue
+            feats = _select_feature_set(features, fs)
+            feats = [f for f in feats if f in df_fit.columns and f not in key_cols]
+            if not feats:
+                continue
+            X_tr, y_tr = _prepare_xy(df_train, feats, args.target)
+            X_va, y_va = _prepare_xy(df_val, feats, args.target)
+            ab_model = _fit_model(X_tr, y_tr, args.C, args.seed)
+            ab_metrics = _metrics(ab_model, X_va, y_va)
+            rows.append(
+                {
+                    "feature_set": fs,
+                    "n_features": len(feats),
+                    "roc_auc": ab_metrics.get("roc_auc"),
+                    "avg_precision": ab_metrics.get("avg_precision"),
+                    "brier": ab_metrics.get("brier"),
+                }
+            )
+        if rows:
+            out_path = Path(args.ablation_out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            ab_df = pd.DataFrame(rows)
+            if out_path.suffix.lower() in {".parquet", ".parq", ".pq", ".pqt"}:
+                ab_df.to_parquet(out_path, index=False)
+            else:
+                ab_df.to_csv(out_path, index=False)
+            print(f"[save] ablation metrics -> {out_path}")
 
     out_model = Path(args.model_out)
     out_model.parent.mkdir(parents=True, exist_ok=True)

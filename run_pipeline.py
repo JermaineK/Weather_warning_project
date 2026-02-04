@@ -90,7 +90,12 @@ RUN_LOCK_PATH: Path | None = None
 def sh(cmd: List[Union[str, Path]], check: bool = True) -> int:
     cmd = [str(c) for c in cmd]
     print(f"\n$ {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    env = os.environ.copy()
+    repo_root = str(HERE)
+    py_path = env.get("PYTHONPATH", "")
+    if repo_root not in py_path.split(os.pathsep):
+        env["PYTHONPATH"] = repo_root + (os.pathsep + py_path if py_path else "")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     if proc.stdout:
         for line in proc.stdout:
             sys.stdout.write(line)
@@ -252,10 +257,12 @@ def _canonical_config_path(cfg_path: Path) -> Path:
         return cfg_path
     return cfg_path.with_suffix(".canonical.yaml")
 
+def _is_autofix_path(cfg_path: Path) -> bool:
+    name = cfg_path.name.lower()
+    return name.endswith(".autofix.yaml") or name.endswith(".autofix.yml")
 
 def _autofix_config_path(cfg_path: Path) -> Path:
-    name = cfg_path.name.lower()
-    if name.endswith(".autofix.yaml") or name.endswith(".autofix.yml"):
+    if _is_autofix_path(cfg_path):
         return cfg_path
     return cfg_path.with_suffix(".autofix.yaml")
 
@@ -299,6 +306,21 @@ def _flatten_kv(prefix: str, obj: Any) -> List[str]:
         return out
     out += [f"--{prefix.replace('_','-')}", str(obj)]
     return out
+
+
+_STEP_CLI_SKIP_PREFIXES = ("health_", "health-")
+
+def _step_cli_args(step: Dict[str, Any], skip_keys: Iterable[str] = ()) -> List[str]:
+    # Agent: avoid passing health-only config keys to subprocess CLIs.
+    skip = {k for k in skip_keys if k}
+    payload: Dict[str, Any] = {}
+    for k, v in step.items():
+        if k in skip:
+            continue
+        if isinstance(k, str) and k.startswith(_STEP_CLI_SKIP_PREFIXES):
+            continue
+        payload[k] = v
+    return _flatten_kv("", payload)
 
 
 def _apply_table_format(step: Dict[str, Any], convert_existing: bool = True) -> Dict[str, Any]:
@@ -402,6 +424,9 @@ def _candidate_out_path(step: Dict[str, Any]) -> Path | None:
         if isinstance(v, str) and v.strip():
             return Path(v)
     return None
+
+def _should_skip_if_exists(step: Dict[str, Any]) -> bool:
+    return bool(step.get("skip_if_exists")) and not bool(step.get("overwrite"))
 
 
 def _progress(tag: str, idx: int, total: int, label: str) -> None:
@@ -632,7 +657,7 @@ def _parse_run_log_errors(log_path: Path | None) -> Dict[str, Any]:
     }
     if not log_path or not log_path.exists():
         return info
-    mgr_fail = re.compile(r"\[manager\] STEP ([^\\s:]+) FAILED", re.IGNORECASE)
+    mgr_fail = re.compile(r"\[manager\] STEP ([^\s:]+) FAILED", re.IGNORECASE)
     no_such = re.compile(r"No such file or directory: ['\\\"]([^'\\\"]+)['\\\"]", re.IGNORECASE)
     missing_re = re.compile(r"missing (?:required|file|input|glob)[^:]*:?\\s*(.+)$", re.IGNORECASE)
     cmd_re = re.compile(r"^\\$\\s+(.+)$")
@@ -685,6 +710,21 @@ def _stage_output_index(stages: Dict[str, Any]) -> Dict[str, set[str]]:
     return index
 
 
+def _config_output_index(cfg: Dict[str, Any], sections: List[str]) -> Dict[str, set[str]]:
+    index: Dict[str, set[str]] = {}
+    for section in sections:
+        for step in _section_steps_for_fix(cfg, section):
+            if not isinstance(step, dict):
+                continue
+            mode = str(step.get("mode", "")).strip()
+            if not mode:
+                continue
+            for p in _output_paths(step):
+                norm = _normalize_path_str(str(p))
+                index.setdefault(norm, set()).add(f"{section}.{mode}")
+    return index
+
+
 def _match_stage_outputs(output_index: Dict[str, set[str]], missing_path: str) -> List[str]:
     norm = _normalize_path_str(missing_path)
     matches: set[str] = set()
@@ -714,10 +754,77 @@ def _expand_upstream_deps(section: str, mode: str) -> List[str]:
     return sorted(deps)
 
 
+def _collect_step_index(cfg: Dict[str, Any], sections: List[str]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    index: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for section in sections:
+        steps = _section_steps_for_fix(cfg, section)
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            mode = str(step.get("mode", "")).strip()
+            if not mode:
+                continue
+            index[(section, mode)] = step
+    return index
+
+
+def _step_upstreams(section: str, mode: str, step: Dict[str, Any]) -> set[Tuple[str, str]]:
+    upstream: set[Tuple[str, str]] = set()
+    contract = contract_for(section, mode)
+    if not contract:
+        return upstream
+    for dep in contract.dependencies or ():
+        upstream.add((section, dep))
+    for spec in contract.inputs:
+        for prod in spec.produced_by or ():
+            if "." not in prod:
+                continue
+            sec, mod = prod.split(".", 1)
+            upstream.add((sec, mod))
+    return upstream
+
+
+def _build_downstream_index(
+    cfg: Dict[str, Any],
+    sections: List[str],
+) -> Dict[Tuple[str, str], set[Tuple[str, str]]]:
+    steps = _collect_step_index(cfg, sections)
+    downstream: Dict[Tuple[str, str], set[Tuple[str, str]]] = {key: set() for key in steps}
+    for (section, mode), step in steps.items():
+        for upstream in _step_upstreams(section, mode, step):
+            if upstream in steps:
+                downstream.setdefault(upstream, set()).add((section, mode))
+    return downstream
+
+
+def _expand_downstream_deps(
+    cfg: Dict[str, Any],
+    sections: List[str],
+    section: str,
+    mode: str,
+) -> List[Tuple[str, str]]:
+    downstream = _build_downstream_index(cfg, sections)
+    start = (section, mode)
+    if start not in downstream:
+        return []
+    seen: set[Tuple[str, str]] = set()
+    stack = [start]
+    while stack:
+        curr = stack.pop()
+        for nxt in downstream.get(curr, set()):
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            stack.append(nxt)
+    seen.discard(start)
+    return sorted(seen)
+
+
 def _collect_last_run_error_reasons(
     cfg: Dict[str, Any],
     run_name: str | None,
     stages_manifest: Dict[str, Any],
+    sections: List[str],
 ) -> Dict[Tuple[str, str], set[str]]:
     reasons: Dict[Tuple[str, str], set[str]] = {}
     def _add(section: str, mode: str, reason: str) -> None:
@@ -736,11 +843,17 @@ def _collect_last_run_error_reasons(
     log_info = _parse_run_log_errors(log_path)
     if log_info.get("manager_failed"):
         if _find_step_ref(cfg, "report", "bundle") is not None:
+            for step in sorted(log_info.get("manager_failed", [])):
+                _add("report", "bundle", f"last_run_manager_failed:{step}")
             _add("report", "bundle", "last_run_report_failure")
 
     output_index = _stage_output_index(stages_manifest)
+    config_index = _config_output_index(cfg, sections) if sections else {}
     for path in sorted(log_info.get("missing_paths", [])):
-        for key in _match_stage_outputs(output_index, path):
+        matches = _match_stage_outputs(output_index, path)
+        if not matches and config_index:
+            matches = _match_stage_outputs(config_index, path)
+        for key in matches:
             if "." not in key:
                 continue
             section, mode = key.split(".", 1)
@@ -758,6 +871,80 @@ def _collect_last_run_error_reasons(
             _add(section, mode, "last_run_error")
 
     return reasons
+
+
+def _apply_last_run_reasons(
+    cfg: Dict[str, Any],
+    run_name: str | None,
+    stages_manifest: Dict[str, Any],
+    sections: List[str],
+    changes: List[str],
+    add_overwrite: bool,
+    log_mtime: float | None,
+) -> set[Tuple[str, str]]:
+    touched: set[Tuple[str, str]] = set()
+    last_run_reasons = _collect_last_run_error_reasons(cfg, run_name, stages_manifest, sections)
+    if not last_run_reasons:
+        return touched
+    slowtick_failed = False
+    report_reasons = last_run_reasons.get(("report", "bundle"), set())
+    if any(str(r).startswith("last_run_manager_failed:slowtick-diag") for r in report_reasons):
+        slowtick_failed = True
+    for (section, mode), reasons in sorted(last_run_reasons.items()):
+        step_ref = _find_step_ref(cfg, section, mode)
+        if step_ref is None:
+            continue
+        # Agent: skip stale log-driven rebuilds only if outputs are newer than the log.
+        step_for_preflight = dict(step_ref)
+        step_for_preflight = _apply_runtime_hints(step_for_preflight)
+        step_for_preflight = _apply_table_format(step_for_preflight, convert_existing=False)
+        pref = preflight_step(section, step_for_preflight)
+        outputs = _output_paths(step_for_preflight)
+        force_on_manager_fail = any(str(r).startswith("last_run_manager_failed:") for r in reasons)
+        if outputs and any(p.exists() for p in outputs) and not force_on_manager_fail:
+            out_mtime = _outputs_max_mtime(outputs) if log_mtime is not None else None
+            if out_mtime is not None and log_mtime is not None and out_mtime >= log_mtime:
+                health_ok, _ = _outputs_health(step_for_preflight, pref.expected_output_columns or [])
+                if health_ok:
+                    continue
+            elif log_mtime is None:
+                health_ok, _ = _outputs_health(step_for_preflight, pref.expected_output_columns or [])
+                if health_ok:
+                    continue
+        reason = "last_run_error: " + ", ".join(sorted(reasons))
+        if _mark_overwrite(
+            cfg, section, mode, reason, changes, add_overwrite, stages_manifest, log_mtime, True
+        ):
+            touched.add((section, mode))
+        needs_upstream = any(r.startswith("last_run_missing_input:") for r in reasons)
+        if needs_upstream:
+            for dep in _expand_upstream_deps(section, mode):
+                if _mark_overwrite(
+                    cfg,
+                    section,
+                    dep,
+                    f"upstream of {section}.{mode} ({reason})",
+                    changes,
+                    add_overwrite,
+                    stages_manifest,
+                    log_mtime,
+                    True,
+                ):
+                    touched.add((section, dep))
+    if slowtick_failed:
+        if _mark_overwrite(
+            cfg,
+            "alerts_logic",
+            "viability-pipeline",
+            "slowtick-diag failed; refresh alerts for lead-specific coverage",
+            changes,
+            add_overwrite,
+            stages_manifest,
+            log_mtime,
+            True,
+        ):
+            touched.add(("alerts_logic", "viability-pipeline"))
+    return touched
 
 
 def _diagnostics_overwrite_targets(issue: str) -> List[Tuple[str, str]]:
@@ -1138,10 +1325,12 @@ def _health_check_outputs(
     expected_cols: List[str],
     max_missing: float,
     scan_rows: int,
+    missing_ok_cols: Sequence[str] | None = None,
 ) -> tuple[bool, List[Dict[str, Any]], str | None]:
     outputs_info: List[Dict[str, Any]] = []
     health_ok = True
     reason = None
+    missing_ok = {str(c).strip() for c in (missing_ok_cols or []) if str(c).strip()}
     for p in paths:
         info: Dict[str, Any] = {"path": str(p)}
         if not p.exists():
@@ -1174,6 +1363,11 @@ def _health_check_outputs(
                 health_ok = False
                 reason = reason or "health_sample_empty"
             else:
+                missing_cols = [col for col in expected_cols if col not in sample.columns]
+                if missing_cols:
+                    info["missing_cols"] = missing_cols
+                    health_ok = False
+                    reason = reason or "missing_columns"
                 missing_fracs = {}
                 for col in expected_cols:
                     if col not in sample.columns:
@@ -1181,10 +1375,11 @@ def _health_check_outputs(
                     else:
                         missing_fracs[col] = float(sample[col].isna().mean())
                 info["missing_frac_max"] = max(missing_fracs.values()) if missing_fracs else None
-                if missing_fracs and max(missing_fracs.values()) > max_missing:
+                missing_vals = [v for k, v in missing_fracs.items() if k not in missing_ok]
+                if missing_vals and max(missing_vals) > max_missing:
                     health_ok = False
                     reason = reason or "missing_frac"
-                if missing_fracs and all(val >= 1.0 for val in missing_fracs.values()):
+                if missing_vals and all(val >= 1.0 for val in missing_vals):
                     health_ok = False
                     reason = reason or "all_nan"
         outputs_info.append(info)
@@ -1374,11 +1569,34 @@ def _outputs_health(step: Dict[str, Any], expected_cols: List[str]) -> tuple[boo
     outputs = _cacheable_outputs(step) or _output_paths(step)
     if not outputs:
         return None, []
+    # Agent: allow per-step health thresholds to avoid false rebuilds.
+    max_missing = step.get("health_max_missing", step.get("health-max-missing"))
+    scan_rows = step.get("health_scan_rows", step.get("health-scan-rows"))
+    missing_ok = step.get("health_missing_ok_cols", step.get("health-missing-ok-cols", []))
+    if isinstance(missing_ok, str):
+        missing_ok = [c.strip() for c in missing_ok.split(",") if c.strip()]
+    elif missing_ok is None:
+        missing_ok = []
+    else:
+        missing_ok = [str(c).strip() for c in missing_ok if str(c).strip()]
+    if max_missing in (None, ""):
+        max_missing = CACHE_CFG.get("health_max_missing", 0.05)
+    try:
+        max_missing = float(max_missing)
+    except Exception:
+        max_missing = float(CACHE_CFG.get("health_max_missing", 0.05))
+    if scan_rows in (None, ""):
+        scan_rows = CACHE_CFG.get("health_scan_rows", 200_000)
+    try:
+        scan_rows = int(scan_rows)
+    except Exception:
+        scan_rows = int(CACHE_CFG.get("health_scan_rows", 200_000))
     health_ok, outputs_info, _ = _health_check_outputs(
         outputs,
         expected_cols,
-        float(CACHE_CFG.get("health_max_missing", 0.05)),
-        int(CACHE_CFG.get("health_scan_rows", 200_000)),
+        max_missing,
+        scan_rows,
+        missing_ok,
     )
     return health_ok, outputs_info
 
@@ -1491,6 +1709,7 @@ def validate_pipeline(cfg: Dict[str, Any], sections: List[str]) -> None:
     check_sections = [s for s in sections if s in {"features", "data_stage", "training", "alerts_logic", "eval", "seeds", "report"}]
     steps_by_section: Dict[str, List[Dict[str, Any]]] = {}
     enabled_ids: set[str] = set()
+    step_lookup: Dict[Tuple[str, str], Dict[str, Any]] = {}
     errors: List[str] = []
 
     def _enabled_steps(section: str) -> List[Dict[str, Any]]:
@@ -1524,6 +1743,23 @@ def validate_pipeline(cfg: Dict[str, Any], sections: List[str]) -> None:
                 continue
             mode = str(step.get("mode", section)).strip()
             enabled_ids.add(f"{section}.{mode}")
+            step_lookup[(section, mode)] = step
+
+    def _producer_will_run(produced: Iterable[str]) -> bool:
+        for prod in produced:
+            if "." not in prod:
+                continue
+            sec, mode = prod.split(".", 1)
+            cfg_step = step_lookup.get((sec, mode))
+            if not cfg_step or cfg_step.get("enabled") is False:
+                continue
+            if cfg_step.get("overwrite") is True:
+                return True
+            if not cfg_step.get("skip_if_exists"):
+                return True
+            if cfg.get("auto_overwrite_on_invalid", False):
+                return True
+        return False
 
     for section, steps in steps_by_section.items():
         for step in steps:
@@ -1538,6 +1774,8 @@ def validate_pipeline(cfg: Dict[str, Any], sections: List[str]) -> None:
                 handled = False
                 if issue.reason in {"missing_file", "missing_glob", "empty_file", "empty_glob"} and upstream_enabled:
                     # Produced by an enabled upstream step; defer validation until after it runs.
+                    handled = True
+                if issue.reason == "missing_columns" and upstream_enabled and _producer_will_run(produced):
                     handled = True
                 if handled:
                     continue
@@ -1615,6 +1853,90 @@ def _find_step_ref(cfg: Dict[str, Any], section: str, mode: str) -> Dict[str, An
     return None
 
 
+def _ensure_section_enabled(
+    cfg: Dict[str, Any],
+    section: str,
+    changes: List[str],
+    reason: str,
+) -> None:
+    sec = cfg.get(section)
+    if not isinstance(sec, dict):
+        return
+    if sec.get("enabled") is True:
+        return
+    sec["enabled"] = True
+    changes.append(f"enabled {section} ({reason})")
+
+
+def _enable_step(
+    cfg: Dict[str, Any],
+    section: str,
+    mode: str,
+    changes: List[str],
+    reason: str,
+) -> bool:
+    target = _find_step_ref(cfg, section, mode)
+    if target is None:
+        return False
+    if target.get("enabled") is False:
+        target["enabled"] = True
+        changes.append(f"enabled {section}.{mode} ({reason})")
+    _ensure_section_enabled(cfg, section, changes, f"required by {section}.{mode}")
+    return True
+
+
+def _parse_autofix_rebuild(raw: Any) -> List[Tuple[str, str]]:
+    if raw is None:
+        return []
+    items: List[str] = []
+    if isinstance(raw, (list, tuple, set)):
+        for entry in raw:
+            if entry is None:
+                continue
+            if isinstance(entry, dict):
+                sec = str(entry.get("section", "")).strip()
+                mode = str(entry.get("mode", "")).strip()
+                if sec and mode:
+                    items.append(f"{sec}.{mode}")
+                continue
+            items.append(str(entry))
+    else:
+        items.append(str(raw))
+
+    out: List[Tuple[str, str]] = []
+    for token in items:
+        if not token:
+            continue
+        for part in str(token).replace(";", ",").split(","):
+            tok = part.strip()
+            if not tok:
+                continue
+            sep = None
+            for cand in (".", ":", "/"):
+                if cand in tok:
+                    sep = cand
+                    break
+            if not sep:
+                print(f"[autofix] warning: rebuild target '{tok}' missing section separator.", file=sys.stderr)
+                continue
+            sec, mode = [t.strip() for t in tok.split(sep, 1)]
+            if not sec or not mode:
+                print(f"[autofix] warning: rebuild target '{tok}' invalid.", file=sys.stderr)
+                continue
+            out.append((sec, mode))
+    return out
+
+
+def _parse_autofix_scope(raw: Any) -> str:
+    if not raw:
+        return "self"
+    val = str(raw).strip().lower()
+    if val in {"self", "upstream", "downstream", "both"}:
+        return val
+    print(f"[autofix] warning: rebuild_scope '{raw}' invalid; using 'self'.", file=sys.stderr)
+    return "self"
+
+
 def _mark_overwrite(
     cfg: Dict[str, Any],
     section: str,
@@ -1625,11 +1947,20 @@ def _mark_overwrite(
     stages_manifest: Dict[str, Any] | None = None,
     ref_mtime: float | None = None,
     guard_freshness: bool = False,
+    allow_skip_toggle: bool = True,
+    force_enable: bool = False,
 ) -> bool:
     target = _find_step_ref(cfg, section, mode)
     if target is None:
         return False
     if target.get("enabled") is False:
+        if not force_enable:
+            return False
+        target["enabled"] = True
+        changes.append(f"enabled {section}.{mode} ({reason})")
+    _ensure_section_enabled(cfg, section, changes, f"required by {section}.{mode}")
+    has_overwrite = "overwrite" in target
+    if target.get("skip_if_exists") is False and not has_overwrite and not add_overwrite:
         return False
     if guard_freshness and ref_mtime is not None:
         outputs = _autofix_step_outputs(section, mode, target, stages_manifest or {})
@@ -1640,18 +1971,22 @@ def _mark_overwrite(
                 f"{_format_ts(ref_mtime)} (outputs {_format_ts(out_mtime)})."
             )
             return False
-    has_overwrite = "overwrite" in target
-    if not has_overwrite and not add_overwrite:
-        print(
-            f"[autofix] {section}.{mode}: {reason} but no overwrite key; "
-            "rerun with --autofix-add-overwrite to force overwrite."
-        )
-        return False
-    if target.get("overwrite") is True:
-        return False
-    target["overwrite"] = True
-    changes.append(f"overwrite {section}.{mode}=true ({reason})")
-    return True
+    if has_overwrite or add_overwrite:
+        if target.get("overwrite") is True:
+            return False
+        target["overwrite"] = True
+        changes.append(f"overwrite {section}.{mode}=true ({reason})")
+        return True
+    if allow_skip_toggle:
+        if target.get("skip_if_exists") is True or "skip_if_exists" not in target:
+            target["skip_if_exists"] = False
+            changes.append(f"skip_if_exists {section}.{mode}=false ({reason})")
+            return True
+    print(
+        f"[autofix] {section}.{mode}: {reason} but no overwrite key; "
+        "use --autofix-add-overwrite or set overwrite=true in config."
+    )
+    return False
 
 
 def _autofix_config(
@@ -1659,9 +1994,30 @@ def _autofix_config(
     sections: List[str],
     out_path: Path,
     add_overwrite: bool = False,
+    manual_rebuild: List[Tuple[str, str]] | None = None,
+    rebuild_scope: str | None = None,
+    use_diagnostics_rules: bool | None = None,
+    rebuild_on_change: bool | None = None,
 ) -> None:
+    # Agent: tighten autofix rebuild rules and allow explicit manual targets without extra overwrite args.
     changes: List[str] = []
     run_name = cfg.get("run_name") or RUN_NAME
+    autofix_cfg = cfg.get("autofix", {}) if isinstance(cfg.get("autofix"), dict) else {}
+    if not add_overwrite and bool(autofix_cfg.get("add_overwrite", False)):
+        add_overwrite = True
+    cfg_targets = _parse_autofix_rebuild(autofix_cfg.get("rebuild"))
+    manual_targets = list(cfg_targets)
+    if manual_rebuild:
+        manual_targets.extend(manual_rebuild)
+    manual_scope = _parse_autofix_scope(rebuild_scope or autofix_cfg.get("rebuild_scope"))
+    if use_diagnostics_rules is None:
+        use_diagnostics_rules = bool(autofix_cfg.get("use_diagnostics_rules", False))
+    if rebuild_on_change is None:
+        rebuild_on_change = bool(autofix_cfg.get("rebuild_on_change", False))
+    log_priority = bool(autofix_cfg.get("log_priority_over_diagnostics", True))
+    only_rebuild_failed = bool(autofix_cfg.get("only_rebuild_failed", False))
+    clear_overwrite_on_success = bool(autofix_cfg.get("clear_overwrite_on_success", False)) or only_rebuild_failed
+
     stages_manifest, stages_meta = _load_stage_manifest_for_autofix(run_name)
     manifest = _load_run_manifest(run_name)
     log_path = _latest_log_path(run_name, manifest)
@@ -1685,50 +2041,117 @@ def _autofix_config(
         stages_meta.get("config_sha256") != CONFIG_SHA256
     )
     if code_changed or config_changed:
-        print(
-            f"[autofix] upstream change detected: "
-            f"code_changed={code_changed} config_changed={config_changed}"
-        )
+        if rebuild_on_change:
+            print(
+                f"[autofix] upstream change detected: "
+                f"code_changed={code_changed} config_changed={config_changed}"
+            )
+        else:
+            print("[autofix] upstream change detected; rebuild_on_change=false (ignored)")
+            code_changed = False
+            config_changed = False
     diag_checks, diag_path, diag_mtime = _load_diagnostics_checks(run_name)
-    if diag_checks:
+    log_marked: set[Tuple[str, str]] = set()
+    diag_marked: set[Tuple[str, str]] = set()
+    manual_marked: set[Tuple[str, str]] = set()
+    stale_marked: set[Tuple[str, str]] = set()
+    if log_priority:
+        log_marked = _apply_last_run_reasons(
+            cfg, run_name, stages_manifest, sections, changes, add_overwrite, log_mtime
+        )
+    if use_diagnostics_rules and diag_checks:
         diag_fails = [c for c in diag_checks if str(c.get("status")).lower() == "fail"]
-        diag_add_overwrite = add_overwrite or bool(diag_fails)
         if diag_fails and diag_path:
             print(f"[autofix] diagnostics source: {diag_path}")
+        skip_diag = set()
+        if log_priority and log_mtime and diag_mtime and log_mtime >= diag_mtime:
+            skip_diag = set(log_marked)
+            if skip_diag:
+                print("[autofix] log is newer than diagnostics; skipping diag overrides for log-flagged steps.")
         for chk in diag_fails:
             issue = str(chk.get("issue") or "").strip()
             if not issue:
                 continue
             for section, mode in _diagnostics_overwrite_targets(issue):
+                if (section, mode) in skip_diag:
+                    continue
+                diag_marked.add((section, mode))
                 _mark_overwrite(
                     cfg,
                     section,
                     mode,
                     f"diagnostics: {issue}",
                     changes,
-                    diag_add_overwrite,
+                    add_overwrite,
                     stages_manifest,
                     diag_mtime,
-                    True,
+                    False,
                 )
 
-    last_run_reasons = _collect_last_run_error_reasons(cfg, run_name, stages_manifest)
-    if last_run_reasons:
-        for (section, mode), reasons in sorted(last_run_reasons.items()):
-            reason = "last_run_error: " + ", ".join(sorted(reasons))
-            _mark_overwrite(cfg, section, mode, reason, changes, True, stages_manifest, log_mtime, True)
-            for dep in _expand_upstream_deps(section, mode):
-                _mark_overwrite(
-                    cfg,
-                    section,
-                    dep,
-                    f"upstream of {section}.{mode} ({reason})",
-                    changes,
-                    True,
-                    stages_manifest,
-                    log_mtime,
-                    True,
-                )
+    if manual_targets:
+        uniq_targets: List[Tuple[str, str]] = []
+        seen_targets: set[Tuple[str, str]] = set()
+        for target in manual_targets:
+            if target in seen_targets:
+                continue
+            seen_targets.add(target)
+            uniq_targets.append(target)
+        for section, mode in uniq_targets:
+            if _find_step_ref(cfg, section, mode) is None:
+                print(f"[autofix] warning: manual rebuild target not found: {section}.{mode}")
+                continue
+            _enable_step(cfg, section, mode, changes, "manual rebuild")
+            manual_marked.add((section, mode))
+            _mark_overwrite(
+                cfg,
+                section,
+                mode,
+                "manual_rebuild",
+                changes,
+                add_overwrite,
+                stages_manifest,
+                None,
+                False,
+                True,
+                True,
+            )
+            if manual_scope in {"upstream", "both"}:
+                for dep in _expand_upstream_deps(section, mode):
+                    _enable_step(cfg, section, dep, changes, f"manual rebuild upstream of {section}.{mode}")
+                    manual_marked.add((section, dep))
+                    _mark_overwrite(
+                        cfg,
+                        section,
+                        dep,
+                        f"manual_rebuild upstream of {section}.{mode}",
+                        changes,
+                        add_overwrite,
+                        stages_manifest,
+                        None,
+                        False,
+                        True,
+                        True,
+                    )
+            if manual_scope in {"downstream", "both"}:
+                for dep_section, dep_mode in _expand_downstream_deps(cfg, sections, section, mode):
+                    _enable_step(cfg, dep_section, dep_mode, changes, f"manual rebuild downstream of {section}.{mode}")
+                    manual_marked.add((dep_section, dep_mode))
+                    _mark_overwrite(
+                        cfg,
+                        dep_section,
+                        dep_mode,
+                        f"manual_rebuild downstream of {section}.{mode}",
+                        changes,
+                        add_overwrite,
+                        stages_manifest,
+                        None,
+                        False,
+                        True,
+                        True,
+                    )
+
+    if not log_priority:
+        _apply_last_run_reasons(cfg, run_name, stages_manifest, sections, changes, add_overwrite, log_mtime)
     pre_add_ids_stale = False
     pre_add_ids_stale_due_to_issue = False
     pre_add_sections = {"fetch", "features"}
@@ -1782,7 +2205,15 @@ def _autofix_config(
             step_for_preflight = _apply_runtime_hints(step_for_preflight)
             step_for_preflight = _apply_table_format(step_for_preflight, convert_existing=False)
             pref = preflight_step(section, step_for_preflight)
+            health_failed = False
+            outputs = _output_paths(step_for_preflight)
+            if outputs and any(p.exists() for p in outputs):
+                health_ok, _ = _outputs_health(step_for_preflight, pref.expected_output_columns or [])
+                if health_ok is False:
+                    health_failed = True
             stale_reason = _autofix_stale_reason(section, mode, step_for_preflight, stages_manifest)
+            if stale_reason == "previous_health_failed" and not health_failed:
+                stale_reason = None
             if stale_reason is None and step_for_preflight.get("skip_if_exists"):
                 outputs = _output_paths(step_for_preflight)
                 if outputs and any(p.exists() for p in outputs):
@@ -1792,10 +2223,8 @@ def _autofix_config(
                         stale_reason = "pipeline_code_changed"
                     elif config_changed:
                         stale_reason = "config_changed"
-            if stale_reason is None and step_for_preflight.get("skip_if_exists"):
-                health_ok, _ = _outputs_health(step_for_preflight, pref.expected_output_columns or [])
-                if health_ok is False:
-                    stale_reason = "output_health_failed"
+            if health_failed:
+                stale_reason = "output_health_failed"
             if (section in pre_add_sections or (section == "data_stage" and mode == "add-ids")) and (pref.errors or pref.input_issues):
                 pre_add_ids_stale = True
                 pre_add_ids_stale_due_to_issue = True
@@ -1804,13 +2233,15 @@ def _autofix_config(
                 if stale_reason in {"pipeline_code_changed", "config_changed", "pipeline_code_or_config_changed"}:
                     stale_ref = code_or_config_mtime
                 guard_freshness = stale_reason != "output_health_failed"
+                mark_add_overwrite = add_overwrite
+                stale_marked.add((section, mode))
                 _mark_overwrite(
                     cfg,
                     section,
                     mode,
                     f"stale: {stale_reason}",
                     changes,
-                    add_overwrite,
+                    mark_add_overwrite,
                     stages_manifest,
                     stale_ref,
                     guard_freshness,
@@ -1822,6 +2253,8 @@ def _autofix_config(
             if (code_changed or config_changed) and (section in pre_add_sections or (section == "data_stage" and mode == "add-ids")):
                 pre_add_ids_stale = True
             for issue in pref.input_issues:
+                missing_cols = getattr(issue, "missing_cols", None) or []
+                force_overwrite = issue.reason in {"missing_columns", "empty_file", "empty_glob"}
                 for prod in issue.spec.produced_by or ():
                     if "." not in prod:
                         continue
@@ -1831,15 +2264,31 @@ def _autofix_config(
                         continue
                     if target.get("enabled") is False:
                         target["enabled"] = True
-                        cfg.setdefault(prod_section, {})["enabled"] = True
                         changes.append(f"enabled {prod_section}.{prod_mode}")
-                    if issue.reason in {"missing_columns", "empty_file", "empty_glob"} and add_overwrite:
-                        if target.get("overwrite") is not True:
-                            target["overwrite"] = True
-                            changes.append(f"overwrite {prod_section}.{prod_mode}=true")
-
+                    _ensure_section_enabled(cfg, prod_section, changes, f"dependency for {section}.{mode}")
+                    if force_overwrite:
+                        _mark_overwrite(
+                            cfg,
+                            prod_section,
+                            prod_mode,
+                            f"upstream of {section}.{mode} ({issue.reason})",
+                            changes,
+                            add_overwrite,
+                            stages_manifest,
+                        )
+                        for dep in _expand_upstream_deps(prod_section, prod_mode):
+                            _mark_overwrite(
+                                cfg,
+                                prod_section,
+                                dep,
+                                f"upstream of {prod_section}.{prod_mode} ({issue.reason})",
+                                changes,
+                                add_overwrite,
+                                stages_manifest,
+                            )
     if pre_add_ids_stale:
         guard_freshness = not pre_add_ids_stale_due_to_issue
+        stale_marked.add(("features", "join-labels-grid"))
         _mark_overwrite(
             cfg,
             "features",
@@ -1851,6 +2300,7 @@ def _autofix_config(
             code_or_config_mtime,
             guard_freshness,
         )
+        stale_marked.add(("data_stage", "add-ids"))
         _mark_overwrite(
             cfg,
             "data_stage",
@@ -1862,6 +2312,36 @@ def _autofix_config(
             code_or_config_mtime,
             guard_freshness,
         )
+
+    if clear_overwrite_on_success:
+        keep_overwrite = set().union(log_marked, diag_marked, manual_marked, stale_marked)
+        for section in sections:
+            steps = _section_steps_for_fix(cfg, section)
+            if not steps:
+                continue
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                mode = str(step.get("mode", "")).strip()
+                if not mode:
+                    continue
+                if (section, mode) in keep_overwrite:
+                    continue
+                target = _find_step_ref(cfg, section, mode)
+                if not target:
+                    continue
+                if target.get("overwrite") is True:
+                    # Only clear overwrite for steps that are not flagged and not stale.
+                    step_for_preflight = dict(step)
+                    step_for_preflight = _apply_runtime_hints(step_for_preflight)
+                    step_for_preflight = _apply_table_format(step_for_preflight, convert_existing=False)
+                    stale_reason = _autofix_stale_reason(section, mode, step_for_preflight, stages_manifest)
+                    if stale_reason:
+                        continue
+                    target["overwrite"] = False
+                    if "skip_if_exists" in target and target.get("skip_if_exists") is not True:
+                        target["skip_if_exists"] = True
+                    changes.append(f"overwrite {section}.{mode}=false (healthy)")
 
     if not changes:
         print("[autofix] no changes applied.")
@@ -1916,7 +2396,7 @@ def run_fetch(sec: Dict[str, Any]) -> None:
         if cache_ctx and cache_ctx.get("hit"):
             _describe_outputs("fetch", step)
             continue
-        if step.get("skip_if_exists"):
+        if _should_skip_if_exists(step):
             health_ok, outputs_info = _outputs_health(step, expected_cols)
             if health_ok:
                 print(f"[fetch] skip (exists, health ok): {mode}")
@@ -1948,8 +2428,7 @@ def run_fetch(sec: Dict[str, Any]) -> None:
                 step = _handle_invalid_existing_output("fetch", mode, step, SystemExit("health_check_failed"))
 
         _describe_inputs("fetch", step)
-        args = _flatten_kv("", {k: v for k, v in step.items()
-                                if k not in ("mode", "enabled", "skip_if_exists")})
+        args = _step_cli_args(step, ("mode", "enabled", "skip_if_exists"))
         sh([sys.executable, str(mgr), mode, *args])
         _describe_outputs("fetch", step)
         health_ok, outputs_info = _outputs_health(step, expected_cols)
@@ -2003,7 +2482,7 @@ def run_features(sec: Dict[str, Any]) -> None:
             continue
 
         # Skip-if-exists still requires schema validation so downstream checks are meaningful.
-        if step.get("skip_if_exists"):
+        if _should_skip_if_exists(step):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
                 try:
@@ -2044,11 +2523,7 @@ def run_features(sec: Dict[str, Any]) -> None:
             raise SystemExit(1)
 
         _describe_inputs("features", step)
-        args = _flatten_kv(
-            "",
-            {k: v for k, v in step.items()
-             if k not in ("mode", "enabled", "skip_if_exists")}
-        )
+        args = _step_cli_args(step, ("mode", "enabled", "skip_if_exists"))
         sh([sys.executable, str(mgr), mode, *args])
         postflight_step("features", step, pref.expected_output_columns or expected_cols)
         _describe_outputs("features", step)
@@ -2102,7 +2577,7 @@ def run_data_stage(sec: Dict[str, Any]) -> None:
             _describe_outputs("data_stage", step)
             continue
 
-        if step.get("skip_if_exists"):
+        if _should_skip_if_exists(step):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
                 try:
@@ -2143,7 +2618,7 @@ def run_data_stage(sec: Dict[str, Any]) -> None:
             raise SystemExit(1)
 
         _describe_inputs("data_stage", step)
-        args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled")})
+        args = _step_cli_args(step, ("mode", "enabled", "skip_if_exists"))
         sh([sys.executable, str(mgr), mode, *args])
         postflight_step("data_stage", step, pref.expected_output_columns)
         _describe_outputs("data_stage", step)
@@ -2197,7 +2672,7 @@ def run_training(sec: Dict[str, Any]) -> None:
             _describe_outputs("training", step)
             continue
 
-        if step.get("skip_if_exists"):
+        if _should_skip_if_exists(step):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
                 try:
@@ -2238,7 +2713,7 @@ def run_training(sec: Dict[str, Any]) -> None:
             raise SystemExit(1)
 
         _describe_inputs("training", step)
-        args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled","skip_if_exists")})
+        args = _step_cli_args(step, ("mode", "enabled", "skip_if_exists"))
         sh([sys.executable, str(mgr), mode, *args])
         postflight_step("training", step, pref.expected_output_columns or expected_cols)
         _describe_outputs("training", step)
@@ -2287,7 +2762,7 @@ def run_sweep(sec: Dict[str, Any]) -> None:
         if cache_ctx and cache_ctx.get("hit"):
             _describe_outputs("sweep", step)
             continue
-        if step.get("skip_if_exists"):
+        if _should_skip_if_exists(step):
             health_ok, outputs_info = _outputs_health(step, expected_cols)
             if health_ok:
                 print(f"[sweep] skip (exists, health ok): {mode}")
@@ -2321,11 +2796,10 @@ def run_sweep(sec: Dict[str, Any]) -> None:
         _describe_inputs("sweep", step)
         if mode == "chain":
             recipe = step.get("recipe", "run+pick")
-            extra = {k: v for k, v in step.items() if k not in ("mode", "recipe","enabled")}
-            args = _flatten_kv("", extra)
+            args = _step_cli_args(step, ("mode", "recipe", "enabled"))
             sh([sys.executable, str(mgr), "chain", recipe, *args])
         else:
-            args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled")})
+            args = _step_cli_args(step, ("mode", "enabled"))
             sh([sys.executable, str(mgr), "tool", mode, *args])
         _describe_outputs("sweep", step)
         health_ok, outputs_info = _outputs_health(step, expected_cols)
@@ -2373,7 +2847,7 @@ def run_score(sec: Dict[str, Any]) -> None:
         if cache_ctx and cache_ctx.get("hit"):
             _describe_outputs("score", job)
             continue
-        if job.get("skip_if_exists"):
+        if _should_skip_if_exists(job):
             health_ok, outputs_info = _outputs_health(job, expected_cols)
             if health_ok:
                 print(f"[score] skip (exists, health ok): {mode}")
@@ -2405,7 +2879,7 @@ def run_score(sec: Dict[str, Any]) -> None:
                 job = _handle_invalid_existing_output("score", mode, job, SystemExit("health_check_failed"))
 
         _describe_inputs("score", job)
-        args = _flatten_kv("", {k:v for k,v in job.items() if k!="enabled"})
+        args = _step_cli_args(job, ("enabled",))
         sh([sys.executable, str(scorer), *args])
         _describe_outputs("score", job)
         health_ok, outputs_info = _outputs_health(job, expected_cols)
@@ -2457,7 +2931,7 @@ def run_alerts_logic(sec: Dict[str, Any]) -> None:
             _describe_outputs("alerts_logic", step)
             continue
 
-        if step.get("skip_if_exists"):
+        if _should_skip_if_exists(step):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
                 try:
@@ -2497,11 +2971,7 @@ def run_alerts_logic(sec: Dict[str, Any]) -> None:
                 print(f"[alerts_logic] preflight error: {err}", file=sys.stderr)
             raise SystemExit(1)
 
-        args = _flatten_kv(
-            "",
-            {k: v for k, v in step.items()
-             if k not in ("mode", "enabled", "skip_if_exists")}
-        )
+        args = _step_cli_args(step, ("mode", "enabled", "skip_if_exists"))
         sh([sys.executable, str(mgr), mode, *args])
         postflight_step("alerts_logic", step, pref.expected_output_columns)
         _describe_outputs("alerts_logic", step)
@@ -2559,7 +3029,7 @@ def run_eval(sec: Dict[str, Any]) -> None:
             for err in pref.errors:
                 print(f"[eval] preflight error: {err}", file=sys.stderr)
             raise SystemExit(1)
-        args = _flatten_kv("", {k: v for k, v in step.items() if k not in ("mode","enabled")})
+        args = _step_cli_args(step, ("mode", "enabled"))
         sh([sys.executable, str(mgr), mode, *args])
         postflight_step("eval", step, pref.expected_output_columns)
         _describe_outputs("eval", step)
@@ -2629,7 +3099,7 @@ def run_seeds(sec: Dict[str, Any]) -> None:
         if cache_ctx and cache_ctx.get("hit"):
             _describe_outputs("seeds", cfg)
             continue
-        if step.get("skip_if_exists"):
+        if _should_skip_if_exists(step):
             try:
                 postflight_step("seeds", step, [])
                 print(f"[seeds] skip (exists, schema ok): {name}")
@@ -2667,7 +3137,7 @@ def run_seeds(sec: Dict[str, Any]) -> None:
             for err in pref.errors:
                 print(f"[seeds] preflight error: {err}", file=sys.stderr)
             raise SystemExit(1)
-        args = _flatten_kv("", {k:v for k,v in cfg.items() if k!="enabled"})
+        args = _step_cli_args(cfg, ("enabled",))
         sh([sys.executable, str(tool), name, *args])
         postflight_step("seeds", step, pref.expected_output_columns)
         _describe_outputs("seeds", cfg)
@@ -2751,7 +3221,7 @@ def run_report(sec: Dict[str, Any]) -> None:
 
         _describe_inputs("report", step)
 
-        if step.get("skip_if_exists"):
+        if _should_skip_if_exists(step):
             outp = _candidate_out_path(step)
             if outp and outp.exists():
                 try:
@@ -2791,11 +3261,7 @@ def run_report(sec: Dict[str, Any]) -> None:
                 print(f"[report] preflight error: {err}", file=sys.stderr)
             raise SystemExit(1)
 
-        args = _flatten_kv(
-            "",
-            {k: v for k, v in step.items()
-             if k not in ("mode", "enabled", "skip_if_exists")}
-        )
+        args = _step_cli_args(step, ("mode", "enabled", "skip_if_exists"))
         if mode in {"bundle", "full", "all"}:
             sh([sys.executable, str(mgr), *args])
         else:
@@ -2867,7 +3333,7 @@ def run_misc(sec: Dict[str, Any]) -> None:
             _describe_outputs("misc", step)
             continue
 
-        if step.get("skip_if_exists"):
+        if _should_skip_if_exists(step):
             health_ok, outputs_info = _outputs_health(step, expected_cols)
             if health_ok:
                 print(f"[misc] skip (exists, health ok): {script}")
@@ -2904,11 +3370,7 @@ def run_misc(sec: Dict[str, Any]) -> None:
 
         path = _resolve_script(script)
         step = _maybe_force_keep_quantile(step, "misc", script)
-        args = _flatten_kv(
-            "",
-            {k: v for k, v in step.items()
-             if k not in ("script", "enabled", "skip_if_exists")}
-        )
+        args = _step_cli_args(step, ("script", "enabled", "skip_if_exists"))
         sh([sys.executable, str(path), *args])
         _describe_outputs("misc", step)
         health_ok, outputs_info = _outputs_health(step, expected_cols)
@@ -2981,6 +3443,36 @@ def main() -> int:
         "--autofix-add-overwrite",
         action="store_true",
         help="Allow autofix to add overwrite=true even if the step did not define it.",
+    )
+    ap.add_argument(
+        "--autofix-rebuild",
+        action="append",
+        default=None,
+        help="Manual rebuild targets for autofix (section.mode; repeatable or comma-separated).",
+    )
+    ap.add_argument(
+        "--autofix-rebuild-scope",
+        choices=["self", "upstream", "downstream", "both"],
+        default=None,
+        help="Scope for --autofix-rebuild targets (default: self).",
+    )
+    ap.add_argument(
+        "--autofix-use-diagnostics",
+        action="store_true",
+        default=None,
+        help="Allow diagnostics.json failures to trigger autofix rebuilds.",
+    )
+    ap.add_argument(
+        "--autofix-rebuild-on-change",
+        action="store_true",
+        default=None,
+        help="Allow code/config changes to trigger autofix rebuilds.",
+    )
+    ap.add_argument(
+        "--autofix-refresh",
+        action="store_true",
+        help="Update the current config in place using autofix before running "
+             "(enables dependencies/overwrite fixes). Defaults to true when using *.autofix.yaml.",
     )
     ap.add_argument(
         "--sections",
@@ -3069,14 +3561,39 @@ def main() -> int:
         "restore_overwrite": cache_cfg.get("restore_overwrite", False),
     }
 
+    wanted = [s.strip() for s in ns.sections.split(",") if s.strip()]
+    order = [s for s in SECTION_ORDER if s in wanted]
+    manual_rebuild = _parse_autofix_rebuild(ns.autofix_rebuild)
+
     if ns.autofix_config is not None:
         out_path = ns.autofix_config
         if out_path == "auto":
             out_path = str(_autofix_config_path(cfg_path))
-        wanted = [s.strip() for s in ns.sections.split(",") if s.strip()]
-        order = [s for s in SECTION_ORDER if s in wanted]
-        _autofix_config(cfg, order, Path(out_path), add_overwrite=bool(ns.autofix_add_overwrite))
+        _autofix_config(
+            cfg,
+            order,
+            Path(out_path),
+            add_overwrite=bool(ns.autofix_add_overwrite),
+            manual_rebuild=manual_rebuild,
+            rebuild_scope=ns.autofix_rebuild_scope,
+            use_diagnostics_rules=ns.autofix_use_diagnostics,
+            rebuild_on_change=ns.autofix_rebuild_on_change,
+        )
         return 0
+
+    if ns.autofix_refresh or _is_autofix_path(cfg_path):
+        # Agent: refresh autofix configs before validation to keep dependencies enabled.
+        _autofix_config(
+            cfg,
+            order,
+            cfg_path,
+            add_overwrite=bool(ns.autofix_add_overwrite),
+            manual_rebuild=manual_rebuild,
+            rebuild_scope=ns.autofix_rebuild_scope,
+            use_diagnostics_rules=ns.autofix_use_diagnostics,
+            rebuild_on_change=ns.autofix_rebuild_on_change,
+        )
+        CONFIG_SHA256 = _config_sha256(cfg_path)
 
     global FORCE_KEEP_QUANTILE
     fq = cfg.get("force_keep_quantile")
@@ -3111,9 +3628,6 @@ def main() -> int:
         print(f"[cwd] -> {wd}")
         wd.mkdir(parents=True, exist_ok=True)
         os.chdir(wd)
-
-    wanted = [s.strip() for s in ns.sections.split(",") if s.strip()]
-    order = [s for s in SECTION_ORDER if s in wanted]
 
     if ns.dry_run:
         if "fetch" in order:

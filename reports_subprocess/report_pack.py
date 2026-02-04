@@ -319,12 +319,12 @@ def _infer_features_path(cfg: Dict[str, Any]) -> Optional[str]:
 def _resolve_label_col(df: pd.DataFrame, label_col: str) -> str:
     if label_col != "auto":
         return label_col
-    for cand in ["pregen", "storm", "near_storm", "y_viable"]:
+    for cand in ["pregen", "storm", "near_storm", "y_commit", "y_viable"]:
         if cand in df.columns:
             vals = pd.to_numeric(df[cand], errors="coerce").fillna(0)
             if vals.sum() > 0:
                 return cand
-    for cand in ["pregen", "storm", "near_storm", "y_viable"]:
+    for cand in ["pregen", "storm", "near_storm", "y_commit", "y_viable"]:
         if cand in df.columns:
             return cand
     return "storm"
@@ -1311,10 +1311,14 @@ def main() -> int:
     # --- skill-by-lead ---
     skill_path = args.skill_by_lead
     if not skill_path:
-        for ext in ("parquet", "csv"):
-            candidate = Path(f"results/metrics/{args.run_name}_viability_leads.{ext}")
-            if candidate.exists():
-                skill_path = str(candidate)
+        # Prefer knee-focused leads if present, otherwise fall back to viability_leads
+        for base in (f"{args.run_name}_knee_leads", f"{args.run_name}_viability_leads"):
+            for ext in ("parquet", "csv"):
+                candidate = Path(f"results/metrics/{base}.{ext}")
+                if candidate.exists():
+                    skill_path = str(candidate)
+                    break
+            if skill_path:
                 break
     if skill_path and Path(skill_path).exists():
         skill = _read_any(skill_path)

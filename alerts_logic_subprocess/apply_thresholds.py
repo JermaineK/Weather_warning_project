@@ -261,7 +261,7 @@ def parse_args():
     ap.add_argument("--run-name", default=None, help="Optional run name for default outputs (alerts_<run>_base.parquet).")
     ap.add_argument(
         "--passthrough-cols",
-        default="row_id,ilat,ilon,cell_id,lead_h,t_to_storm_min_h",
+        default="row_id,ilat,ilon,cell_id,lead_h,t_to_storm_min_h,u10,v10",
         help="Comma list of extra columns to keep if present (e.g., row_id,ilat,ilon,lead_h).",
     )
     argv = _preprocess_norm(sys.argv[1:])

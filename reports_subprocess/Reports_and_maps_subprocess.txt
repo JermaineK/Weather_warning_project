@@ -80,7 +80,7 @@ Inputs:
 --seed-analysis (optional txt)
 --alerts-dir (presence snapshot)
 --include-conversion/--conversion-csv (optional CSV)
---viability-targets (optional parquet for t_to_storm_min_h / y_viable snapshot)
+--viability-targets (optional parquet for t_to_storm_min_h / y_commit snapshot)
 --viability-metrics (optional JSON metrics from training)
 --viability-thresholds (optional CSV from sweep)
 

@@ -39,6 +39,13 @@
         - gka_Q
         - gka_vortdiv_ratio
         - gka_dir_var
+        - gka_SAI
+        - gka_SII
+        - gka_knee_score
+        - gka_knee_cross
+        - gka_knee_state
+        - gka_knee_post_h
+        - gka_parity_lock
         - sph_center
         - sph_radial_signed
         - sph_radial_abs

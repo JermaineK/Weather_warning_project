@@ -108,6 +108,8 @@ def parse_args(argv: list[str] | None = None):
     ap.add_argument("--chunk-rows", type=int, default=0, help="Accepted for compatibility; unused here.")
     ap.add_argument("--chunksize", type=int, default=0, help="Accepted for compatibility; unused here.")
     ap.add_argument("--parquet-rows", type=int, default=0, help="Accepted for compatibility; unused here.")
+    # Agent: accept overwrite flag for pipeline compatibility (output overwrites by default).
+    ap.add_argument("--overwrite", action="store_true", help="No-op; output is overwritten if present.")
 
     # Grid identity & duplicates
     ap.add_argument("--emit-grid-index", action="store_true")

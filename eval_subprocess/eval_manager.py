@@ -206,7 +206,7 @@ def _apply_run_defaults(tool: str, run_name: str | None, extra: list[str]) -> li
         if not _has_flag(out, "--lead-hours"):
             out.extend(["--lead-hours", "24", "48", "72", "120"])
         ensure("--lead-col", "t_to_storm_min_h")
-        ensure("--target", "y_viable")
+        ensure("--target", "y_commit")
         if not _has_flag(out, "--out"):
             ensure("--out", f"results/metrics/{run_name}_viability_leads.csv")
 

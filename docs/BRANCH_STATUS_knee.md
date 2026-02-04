@@ -17,3 +17,7 @@ Current knee-lead metrics (target: y_knee_cross_240h):
 
 Interpretation note:
 - "coincident" for y_knee_cross_240h is a horizon target (future window), not at-event.
+
+Next direction:
+- Primary target switches to y_commit_240h (commit -> knee_cross -> lock_stable).
+- Metrics above are from the last y_knee_cross_240h run and will be refreshed.

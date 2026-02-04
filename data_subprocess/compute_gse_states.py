@@ -71,6 +71,8 @@ def main() -> None:
     )
     ap.add_argument("--panel", required=True, help="Input panel (CSV/Parquet).")
     ap.add_argument("--out", required=True, help="Output panel with GSE states added.")
+    # Agent: accept overwrite flag for pipeline compatibility (output overwrites by default).
+    ap.add_argument("--overwrite", action="store_true", help="No-op; output is overwritten if present.")
     ap.add_argument("--g-col", default="G_struct", help="Column for geometry/structure (G).")
     ap.add_argument("--s-col", default="S_shear", help="Column for shear/suppression (S).")
     ap.add_argument("--e-col", default="E_energy", help="Column for energy/thermo (E).")

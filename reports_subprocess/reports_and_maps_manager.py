@@ -1059,6 +1059,11 @@ def main() -> int:
     ap.add_argument("--diagnostics-metrics-json", default=None, help="Optional metrics JSON with feature list.")
     ap.add_argument("--diagnostics-feature-meta", default=None, help="Optional feature metadata JSON for causality checks.")
     ap.add_argument(
+        "--diagnostics-fast",
+        action="store_true",
+        help="Use fast diagnostics mode (reduced sampling, skip heavy checks).",
+    )
+    ap.add_argument(
         "--diagnostics-fail-on-checks",
         action="store_true",
         help="Exit non-zero if diagnostics finds any failures.",
@@ -1993,6 +1998,8 @@ def main() -> int:
             step_args += ["--feature-metadata", args.diagnostics_feature_meta]
         if args.diagnostics_fail_on_checks:
             step_args.append("--fail-on-checks")
+        if args.diagnostics_fast:
+            step_args.append("--fast")
         ok, code = run_step("run-diagnostics", script, step_args)
         if not ok and args.strict:
             return code

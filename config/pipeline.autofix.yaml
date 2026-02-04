@@ -44,11 +44,15 @@ report:
     animate_fps: 6
     diagnostics: true
     diagnostics_fail_on_checks: true
+    diagnostics_fast: true
     diagnostics_feature_meta: config/features_manifest.json
+    overwrite: false
 report_pdf: true
 autofix:
   use_diagnostics_rules: true
   rebuild_on_change: false
+  add_overwrite: true
+  only_rebuild_failed: true
 fetch:
   enabled: false
   steps:
@@ -83,7 +87,7 @@ fetch:
     suffix: oper
     overwrite: false
 features:
-  enabled: true
+  enabled: false
   steps:
   - mode: build
     enabled: true
@@ -187,7 +191,7 @@ features:
     near_time_h: 12.0
     features_chunk_rows: 400000
     chunk_hours: 72
-    overwrite: true
+    overwrite: false
     skip_if_exists: true
     health_missing_ok_cols:
     - t_to_storm_min_h
@@ -215,8 +219,8 @@ data_stage:
     knee_thr: 0.7
     lock_hours: 12
     lite: false
-    overwrite: true
-    skip_if_exists: false
+    overwrite: false
+    skip_if_exists: true
   - mode: lookup-panel
     enabled: true
     source: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
@@ -261,8 +265,8 @@ data_stage:
     lag_cols: gka_parity_lock,gka_knee_state,gka_SAI
     past_windows: 6,12,24
     past_mean_cols: gka_parity_lock,gka_SAI,gka_knee_ratio,gka_chirality,gka_parity_eta
-    past_std_cols: gka_SAI,gka_knee_ratio,gka_chirality
-    past_slope_cols: gka_SAI,gka_knee_ratio,gka_chirality
+    past_std_cols: gka_SAI,gka_knee_ratio,gka_chirality,S_shear,G_struct
+    past_slope_cols: gka_SAI,gka_knee_ratio,gka_chirality,S_shear,G_struct
     fliprate_cols: gka_parity_lock,gka_knee_state
     radius_deg: 0.0
     round_dp: 3
@@ -290,7 +294,7 @@ data_stage:
     out: data/grid_train_gse_panel_targets.parquet
     save_targets_meta: data/grid_train_gse_panel_targets.meta.json
     target_mode: knee-forecast
-    target_col: y_knee_cross_240h
+    target_col: y_commit_240h
     knee_cross_col: gka_knee_cross
     lock_col: gka_parity_lock
     lead_col: t_to_storm_min_h
@@ -310,15 +314,34 @@ data_stage:
   - mode: train-viability
     enabled: true
     train: data/grid_train_gse_panel_targets.parquet
-    target: y_knee_cross_240h
+    target: y_commit_240h
     features:
-    - gka_SII
+    - G_struct
+    - E_energy
+    - S_shear
+    - S_zeta_var
+    - S_dir_var
+    - S_churn_6h
+    - S_spike
+    - G_over_S
+    - S_over_G
+    - G_times_S
+    - G_times_S_disagree
+    - corr_G_S_past24h
+    - G_slope_6h
+    - S_slope_6h
+    - same_sign
+    - mud_high
+    - mud_low
+    - geom_high
+    - coh_high
+    - mud_high_geom_high
+    - mud_high_geom_low
     - gka_parity_eta
     - gka_chirality
     - gka_vortdiv_ratio
     - gka_F
     - gka_knee_ratio
-    - gka_knee_post_h
     - gka_SAI_lag6h
     - gka_SAI_mean_past12h
     - gka_SAI_slope_past12h
@@ -332,6 +355,9 @@ data_stage:
     - SFI
     - SFI2
     - S3
+    feature_set: GES
+    ablation_sets: G,E,S,GE,GS,ES,GES
+    ablation_out: results/metrics/coral_sea_demo_ablation.csv
     neg_pos_ratio: 3.0
     sample_frac: 0.8
     test_size: 0.2
@@ -369,11 +395,12 @@ alerts_logic:
     persist_hours: 1
     min_neighbors: 3
     normalize_lon: -180..180
+    passthrough_cols: row_id,ilat,ilon,cell_id,lead_h,t_to_storm_min_h,u10,v10
     base_out: results/alerts/alerts_coral_sea_demo_base.parquet
     thr_out: results/alerts/alerts_coral_sea_demo_thr.parquet
     out: results/alerts/alerts_coral_sea_demo_final.parquet
-    overwrite: true
-    skip_if_exists: false
+    overwrite: false
+    skip_if_exists: true
 training:
   enabled: true
   steps:
@@ -409,12 +436,14 @@ training:
     chunk_rows: 200000
     parquet_rows: 200000
     skip_if_exists: false
+    overwrite: true
   - mode: train-alert-specialist
     enabled: true
     calibrate: true
     train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state_slim.parquet
     alerts: results/alerts/alerts_coral_sea_demo_final.parquet
     label: storm
+    exclude_cols: gka_parity_lock,gka_knee_post_h
     G_thr: 0.8
     SFI_thr: 0.8
     knee_thr: 0.6
@@ -429,6 +458,7 @@ training:
     features_manifest: config/features_manifest.json
     require_feature_metadata: true
     skip_if_exists: false
+    overwrite: true
   - mode: predict-alerts
     enabled: true
     features: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet
@@ -497,9 +527,9 @@ seeds:
     out_dir: results/seedmaps
     run_name: coral_sea_demo
     normalize_lon: -180..180
-    prob_col:
-    flag_col: y_knee_cross_240h
-    thr_file:
+    prob_col: null
+    flag_col: y_commit_240h
+    thr_file: null
     thr_lead: 240
     thr_column: thr_Fbeta
     direction_col: zeta
@@ -521,8 +551,8 @@ seeds:
       labelled: data/grid_train_gse_panel_targets.parquet
       model: models/viability_model.pkl
       metrics_json: models/viability_model_metrics.json
-      target: y_genesis
-      success_col: y_genesis
+      target: y_commit_240h
+      success_col: y_commit_240h
       lead_col: t_to_storm_min_h
       leads: 24,48,72,120,240
       min_precision: 0.05
@@ -545,9 +575,11 @@ seeds:
       model_metrics: models/viability_model_metrics.json
       lead_hours: 24,48,72,120,240
       lead_col: t_to_storm_min_h
-      target: y_knee_cross_240h
-      lead_target_template: y_knee_cross_{lead}h
+      target: y_commit_240h
+      lead_target_template: y_commit_{lead}h
       out: results/metrics/coral_sea_demo_knee_leads.csv
+      regime_col: mud_high
+      regime_out: results/metrics/coral_sea_demo_viability_leads_regimes.csv
       skip_if_exists: false
     - mode: hourly-metrics
       enabled: true

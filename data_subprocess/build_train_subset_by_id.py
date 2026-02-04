@@ -251,6 +251,8 @@ def main() -> None:
         type=int,
         default=42,
     )
+    # Agent: accept overwrite flag for pipeline compatibility (writer overwrites by default).
+    ap.add_argument("--overwrite", action="store_true", help="No-op; output is overwritten if present.")
     args = ap.parse_args()
 
     src = args.labelled
@@ -372,7 +374,7 @@ def main() -> None:
     total_kept = 0
     found_ids: Set[object] = set()
 
-    print(f"[pass2] streaming full {src} and filtering by {id_col} ∈ selected_id_set")
+    print(f"[pass2] streaming full {src} and filtering by {id_col} in selected_id_set")
     for i, chunk in enumerate(_iter_full_file(src, chunksize=args.chunksize), start=1):
         if chunk is None or chunk.empty:
             continue
