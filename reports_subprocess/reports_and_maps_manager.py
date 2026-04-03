@@ -1070,6 +1070,11 @@ def main() -> int:
     )
     # Object-based reporting inputs/outputs
     ap.add_argument("--objects-in", default=None, help="Alerts/predictions table for object extraction.")
+    ap.add_argument(
+        "--objects-flow-source",
+        default=None,
+        help="Optional flow source table (expects row_id/u10/v10) for object flow enrichment.",
+    )
     ap.add_argument("--objects-out", default="results/objects/objects_by_hour.parquet", help="Object-by-hour output table.")
     ap.add_argument("--cells-out", default=None, help="Optional per-cell table with object_id.")
     ap.add_argument("--objects-mask-col", default="alert_final", help="Flag column for object candidates.")
@@ -1229,6 +1234,21 @@ def main() -> int:
                 break
         if not objects_in:
             objects_in = cand[0]
+    flow_source: Optional[str] = None
+    if args.objects_flow_source:
+        flow_source = args.objects_flow_source if Path(args.objects_flow_source).exists() else None
+    else:
+        flow_candidates = [
+            "data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet",
+            args.storm_timeseries,
+        ]
+        for cand in flow_candidates:
+            if cand and Path(cand).exists():
+                flow_source = str(cand)
+                break
+    cells_out = args.cells_out
+    if not cells_out and flow_source:
+        cells_out = str(Path(args.objects_out).with_name("object_cells_by_hour.parquet"))
     object_maps_dir = Path(args.object_maps_dir) if args.object_maps_dir else (maps_dir / "objects")
     objects_rejects_out = args.objects_rejects_out
     if objects_rejects_out is None:
@@ -1274,9 +1294,18 @@ def main() -> int:
     if not args.skip_preflight:
         report_steps: List[Dict[str, Any]] = []
         if not args.skip_objects:
-            report_steps.append({"mode": "objects-by-hour", "infile": objects_in})
+            report_steps.append({"mode": "objects-by-hour", "infile": objects_in, "cells_out": cells_out})
         if not args.skip_object_matches:
-            report_steps.append({"mode": "object-matches", "objects": args.objects_out, "tracks": ibtracs_path})
+            obj_match_step: Dict[str, Any] = {
+                "mode": "object-matches",
+                "objects": args.objects_out,
+                "tracks": ibtracs_path,
+                "flow_source": flow_source,
+            }
+            # If objects are rebuilt in this run, let preflight treat cells as produced-by runtime output.
+            if cells_out and args.skip_objects:
+                obj_match_step["cells"] = cells_out
+            report_steps.append(obj_match_step)
         if not args.skip_object_maps:
             report_steps.append({"mode": "object-maps", "matches": args.object_matches_out, "tracks": ibtracs_path, "out_dir": str(object_maps_dir)})
         if not args.skip_report_pack:
@@ -1354,8 +1383,8 @@ def main() -> int:
         ]
         if args.objects_threshold is not None:
             step_args += ["--threshold", str(args.objects_threshold)]
-        if args.cells_out:
-            step_args += ["--cells-out", args.cells_out]
+        if cells_out:
+            step_args += ["--cells-out", cells_out]
         if objects_rejects_out:
             step_args += ["--rejects-out", objects_rejects_out]
         ok, code = run_step("objects-by-hour", script, step_args)
@@ -1382,6 +1411,10 @@ def main() -> int:
             step_args += ["--adaptive-quantile", str(args.objects_adaptive_quantile)]
         if args.objects_adaptive_base_threshold is not None:
             step_args += ["--adaptive-base-threshold", str(args.objects_adaptive_base_threshold)]
+        if cells_out and (Path(cells_out).exists() or not args.skip_objects):
+            step_args += ["--cells", cells_out]
+        if flow_source:
+            step_args += ["--flow-source", flow_source]
         if args.objects_with_motion_out:
             step_args += ["--objects-out", args.objects_with_motion_out]
         if args.tracks_with_motion_out:
@@ -1983,6 +2016,7 @@ def main() -> int:
             "--run-name", args.run_name,
             "--alerts-dir", args.alerts_dir,
             "--objects-by-hour", args.objects_out,
+            "--matches-table", args.object_matches_out,
         ]
         if args.diagnostics_out:
             step_args += ["--out-dir", args.diagnostics_out]
@@ -2013,7 +2047,9 @@ def main() -> int:
         Path(matches_csv),
         Path(seed_summary),
         Path(objects_in) if objects_in else None,
+        Path(flow_source) if flow_source else None,
         Path(args.objects_out) if args.objects_out else None,
+        Path(cells_out) if cells_out else None,
         Path(args.object_matches_out) if args.object_matches_out else None,
         Path(objects_rejects_out) if objects_rejects_out else None,
     ]

@@ -185,10 +185,15 @@ def main():
         "LAT","LON",
         "USA_WIND","WMO_WIND","USA_PRES","WMO_PRES"
     ]
+    # keep_default_na=False prevents pandas silently converting the "NA" basin
+    # (North Atlantic) to NaN.  We supply na_values=[''] so that genuinely
+    # empty cells are still treated as missing.
     try:
-        df = pd.read_csv(csv_path, low_memory=False, usecols=usecols)
+        df = pd.read_csv(csv_path, low_memory=False, usecols=usecols,
+                          keep_default_na=False, na_values=[''])
     except Exception:
-        df = pd.read_csv(csv_path, low_memory=False)
+        df = pd.read_csv(csv_path, low_memory=False,
+                          keep_default_na=False, na_values=[''])
 
     # Normalize essential cols (case variants)
     for req in ["SID","NAME","BASIN","ISO_TIME","LAT","LON"]:

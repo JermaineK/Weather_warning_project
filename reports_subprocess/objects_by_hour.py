@@ -312,6 +312,9 @@ def main() -> int:
 
     needed_cols = set(base_cols)
     needed_cols.update({args.ilat_col, args.ilon_col, args.mask_col, args.score_col})
+    # Keep row_id when available so downstream flow enrichment can join to full panels.
+    if "row_id" in cols:
+        needed_cols.add("row_id")
     needed_cols.update(agg_cols)
     needed_cols = [c for c in needed_cols if c in cols]
 

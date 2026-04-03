@@ -52,6 +52,12 @@ def parse_args():
     ap.add_argument("--prob-col", default="prob_viable", help="Probability column name.")
     ap.add_argument("--flag-col-base", default="alert_base", help="Flag name after thresholding.")
     ap.add_argument("--flag-col-thr", default=None, help="Flag name after throttle (defaults to flag-col-base).")
+    ap.add_argument(
+        "--passthrough-cols",
+        "--passthrough_cols",
+        default="",
+        help="Comma-separated columns to pass through apply_thresholds output.",
+    )
     ap.add_argument("--base-out", default=None, help="Override base output path.")
     ap.add_argument("--thr-out", default=None, help="Override throttled output path.")
     ap.add_argument("--out", default=None, help="Override final output path.")
@@ -139,6 +145,9 @@ def main() -> int:
             "--overwrite",
         ],
     ]
+
+    if args.passthrough_cols:
+        steps[0].extend(["--passthrough-cols", str(args.passthrough_cols)])
 
     for cmd in steps:
         print(f"\n[viability-pipeline] step -> {' '.join(cmd)}")

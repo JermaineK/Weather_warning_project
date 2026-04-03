@@ -460,6 +460,57 @@ def _output_paths(step: Dict[str, Any]) -> List[Path]:
 def _input_paths(step: Dict[str, Any]) -> tuple[list[Path], list[str]]:
     files: List[Path] = []
     globs: List[str] = []
+    known_file_ext = {
+        ".parquet",
+        ".parq",
+        ".pq",
+        ".csv",
+        ".gz",
+        ".json",
+        ".txt",
+        ".md",
+        ".png",
+        ".gif",
+        ".pkl",
+        ".yaml",
+        ".yml",
+        ".nc",
+    }
+    known_path_prefixes = (
+        "data/",
+        "data\\",
+        "results/",
+        "results\\",
+        "models/",
+        "models\\",
+        "config/",
+        "config\\",
+        "./",
+        ".\\",
+        "../",
+        "..\\",
+    )
+    literal_keys = {
+        "normalize_lon",
+        "normalize-lon",
+        "area",
+        "hours",
+        "quantiles",
+        "lead_bins",
+        "lat_bands",
+        "leads",
+        "lead_hours",
+        "ablation_sets",
+        "vars",
+        "pl_vars",
+        "pl_levels",
+        "features",
+        "past_windows",
+        "lags",
+        "include_prefixes",
+        "drop_patterns",
+        "keep_prefixes",
+    }
 
     for k, v in step.items():
         if not isinstance(v, str) or not v.strip():
@@ -467,14 +518,25 @@ def _input_paths(step: Dict[str, Any]) -> tuple[list[Path], list[str]]:
         key = k.lower()
         if key in {"mode", "enabled", "skip_if_exists", "recipe"}:
             continue
+        if key in literal_keys:
+            continue
         if _is_output_key(k):
             continue
         if "glob" in key:
             globs.append(v)
             continue
 
-        p = Path(v)
-        looks_like_path = p.suffix or "/" in v or "\\" in v
+        vv = v.strip()
+        p = Path(vv)
+        suffix = p.suffix.lower()
+        looks_like_path = (
+            suffix in known_file_ext
+            or "/" in vv
+            or "\\" in vv
+            or "*" in vv
+            or "?" in vv
+            or vv.startswith(known_path_prefixes)
+        )
         if looks_like_path:
             files.append(p)
 
@@ -984,6 +1046,11 @@ def _diagnostics_overwrite_targets(issue: str) -> List[Tuple[str, str]]:
             ("alerts_logic", "throttle"),
             ("alerts_logic", "denoise"),
             ("alerts_logic", "viability-pipeline"),
+        ],
+        "flow direction missing in matches": [
+            ("report", "bundle"),
+            ("report", "objects-by-hour"),
+            ("report", "object-matches"),
         ],
         "time-shift test": [
             ("features", "join-labels-grid"),
@@ -1959,6 +2026,19 @@ def _mark_overwrite(
         target["enabled"] = True
         changes.append(f"enabled {section}.{mode} ({reason})")
     _ensure_section_enabled(cfg, section, changes, f"required by {section}.{mode}")
+    # Reporting manager does not support an --overwrite CLI flag.
+    # For report steps, force re-run via skip_if_exists=false instead.
+    if section == "report":
+        changed = False
+        if target.get("overwrite") is True:
+            target["overwrite"] = False
+            changes.append(f"overwrite {section}.{mode}=false ({reason}; report steps use skip_if_exists)")
+            changed = True
+        if allow_skip_toggle and (target.get("skip_if_exists") is True or "skip_if_exists" not in target):
+            target["skip_if_exists"] = False
+            changes.append(f"skip_if_exists {section}.{mode}=false ({reason})")
+            changed = True
+        return changed
     has_overwrite = "overwrite" in target
     if target.get("skip_if_exists") is False and not has_overwrite and not add_overwrite:
         return False
@@ -2087,6 +2167,18 @@ def _autofix_config(
                     diag_mtime,
                     False,
                 )
+            if issue.lower() == "flow direction missing in matches":
+                bundle = _find_step_ref(cfg, "report", "bundle")
+                if isinstance(bundle, dict):
+                    preferred_flow = "data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet"
+                    current_flow = str(bundle.get("objects_flow_source") or "").strip()
+                    if Path(preferred_flow).exists() and current_flow != preferred_flow:
+                        bundle["objects_flow_source"] = preferred_flow
+                        changes.append("set report.bundle.objects_flow_source=data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet (diagnostics: flow direction missing in matches)")
+                    cells_out = str(bundle.get("cells_out") or "").strip()
+                    if not cells_out:
+                        bundle["cells_out"] = "results/objects/object_cells_by_hour.parquet"
+                        changes.append("set report.bundle.cells_out=results/objects/object_cells_by_hour.parquet (diagnostics: flow direction missing in matches)")
 
     if manual_targets:
         uniq_targets: List[Tuple[str, str]] = []
@@ -3261,7 +3353,7 @@ def run_report(sec: Dict[str, Any]) -> None:
                 print(f"[report] preflight error: {err}", file=sys.stderr)
             raise SystemExit(1)
 
-        args = _step_cli_args(step, ("mode", "enabled", "skip_if_exists"))
+        args = _step_cli_args(step, ("mode", "enabled", "skip_if_exists", "overwrite"))
         if mode in {"bundle", "full", "all"}:
             sh([sys.executable, str(mgr), *args])
         else:

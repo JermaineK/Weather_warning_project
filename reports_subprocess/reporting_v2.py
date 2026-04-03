@@ -420,6 +420,11 @@ def _safe_storm_id(val: object) -> str:
 
 
 def _coerce_time(series: pd.Series) -> pd.Series:
+    dtype = getattr(series, "dtype", None)
+    if isinstance(dtype, pd.DatetimeTZDtype):
+        return series.dt.tz_convert(None)
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        return pd.to_datetime(series, errors="coerce")
     return pd.to_datetime(series, utc=True, errors="coerce").dt.tz_localize(None)
 
 
@@ -463,7 +468,16 @@ def _markdown_table(df: pd.DataFrame, max_rows: int = 20) -> str:
     cols = list(df.columns)
     header = "| " + " | ".join(cols) + " |"
     sep = "| " + " | ".join(["---"] * len(cols)) + " |"
-    rows = ["| " + " | ".join(str(x) for x in row) + " |" for row in df.to_numpy()]
+    def _fmt_cell(x: Any) -> str:
+        if x is None:
+            return "n/a"
+        try:
+            if pd.isna(x):
+                return "n/a"
+        except Exception:
+            pass
+        return str(x)
+    rows = ["| " + " | ".join(_fmt_cell(x) for x in row) + " |" for row in df.to_numpy()]
     return "\n".join([header, sep, *rows])
 
 
@@ -771,13 +785,76 @@ def _alert_stats_from_path(path: Path, flag_col: str) -> Dict[str, Any]:
     time_col = next((c for c in ("time", "valid_time", "datetime", "forecast_time") if c in cols), None)
     if time_col is None or flag_col not in cols:
         return {}
+    wanted = [time_col, flag_col]
+
+    def _iter_selected() -> Iterable[pd.DataFrame]:
+        if _is_parquet(path):
+            try:
+                import pyarrow.parquet as pq  # type: ignore
+
+                pf = pq.ParquetFile(path)
+                for batch in pf.iter_batches(columns=wanted, batch_size=250_000):
+                    yield batch.to_pandas()
+                return
+            except Exception:
+                pass
+        for chunk in pd.read_csv(
+            path,
+            usecols=wanted,
+            chunksize=250_000,
+            compression="infer",
+            low_memory=False,
+        ):
+            yield chunk
+
+    seen_hours: set[pd.Timestamp] = set()
+    per_hour_counts: Dict[pd.Timestamp, int] = {}
+    alerts_sum = 0
+    got_any = False
     try:
-        df = _read_any(path, columns=[time_col, flag_col])
+        for chunk in _iter_selected():
+            if chunk.empty:
+                continue
+            got_any = True
+            tvals = _coerce_time(chunk[time_col])
+            valid = tvals.notna()
+            if not valid.any():
+                continue
+            flags = pd.to_numeric(chunk[flag_col], errors="coerce").fillna(0).astype(int).loc[valid]
+            th = tvals.loc[valid].dt.floor("h")
+            alerts_sum += int(flags.sum())
+            seen_hours.update(th.dropna().tolist())
+            pos = flags > 0
+            if pos.any():
+                vc = th.loc[pos].value_counts()
+                for hour, cnt in vc.items():
+                    if isinstance(hour, pd.Timestamp) and pd.notna(hour):
+                        per_hour_counts[hour] = int(per_hour_counts.get(hour, 0) + int(cnt))
     except Exception:
+        try:
+            df = _read_any(path, columns=wanted)
+        except Exception:
+            return {}
+        if df.empty:
+            return {}
+        return _alert_stats(df, flag_col, time_col=time_col)
+
+    if not got_any:
         return {}
-    if df.empty:
-        return {}
-    return _alert_stats(df, flag_col, time_col=time_col)
+    if not per_hour_counts:
+        return {"hours": int(len(seen_hours)), "alerts": int(alerts_sum)}
+    per_hour = pd.Series(per_hour_counts, dtype="int64")
+    top_hours: Dict[str, int] = {}
+    for k, v in per_hour.sort_values(ascending=False).head(5).to_dict().items():
+        top_hours[k.isoformat() if isinstance(k, pd.Timestamp) else str(k)] = int(v)
+    return {
+        "hours": int(len(seen_hours)),
+        "alerts": int(alerts_sum),
+        "per_hour_q50": float(per_hour.quantile(0.50)),
+        "per_hour_q90": float(per_hour.quantile(0.90)),
+        "per_hour_q99": float(per_hour.quantile(0.99)),
+        "top_hours": top_hours,
+    }
 
 
 def _object_stats(objects: pd.DataFrame) -> Dict[str, Any]:
@@ -1323,21 +1400,34 @@ def main() -> int:
     if skill_path.exists():
         skill_by_lead = _read_any(skill_path)
     # Optional ablation / regime tables (look in metrics or tables dir)
-    if run_name:
-        ablation_path = Path(f"results/metrics/{run_name}_ablation.csv")
-        if ablation_path.exists():
-            ablation_metrics = _read_any(ablation_path)
-        regime_path = Path(f"results/metrics/{run_name}_viability_leads_regimes.csv")
-        if regime_path.exists():
-            regime_metrics = _read_any(regime_path)
+    if args.run_name:
+        for ablation_path in (
+            Path(f"results/metrics/{args.run_name}_ablation.parquet"),
+            Path(f"results/metrics/{args.run_name}_ablation.csv"),
+        ):
+            if ablation_path.exists():
+                ablation_metrics = _read_any(ablation_path)
+                break
+        for regime_path in (
+            Path(f"results/metrics/{args.run_name}_viability_leads_regimes.parquet"),
+            Path(f"results/metrics/{args.run_name}_viability_leads_regimes.csv"),
+        ):
+            if regime_path.exists():
+                regime_metrics = _read_any(regime_path)
+                break
     if ablation_metrics.empty:
-        ab_path = tables_dir / "ablation.csv"
-        if ab_path.exists():
-            ablation_metrics = _read_any(ab_path)
+        for ab_path in (tables_dir / "ablation.parquet", tables_dir / "ablation.csv"):
+            if ab_path.exists():
+                ablation_metrics = _read_any(ab_path)
+                break
     if regime_metrics.empty:
-        reg_path = tables_dir / "viability_leads_regimes.csv"
-        if reg_path.exists():
-            regime_metrics = _read_any(reg_path)
+        for reg_path in (
+            tables_dir / "viability_leads_regimes.parquet",
+            tables_dir / "viability_leads_regimes.csv",
+        ):
+            if reg_path.exists():
+                regime_metrics = _read_any(reg_path)
+                break
 
     # Agent: surface slow-tick diagnostics in the report without feeding any model logic.
     slowtick_summary = pd.DataFrame()

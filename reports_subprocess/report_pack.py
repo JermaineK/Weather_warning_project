@@ -460,6 +460,34 @@ def _safe_corr(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, int]:
     return pearson, spearman, n
 
 
+def _finite_or_zero(val: float) -> float:
+    try:
+        if np.isfinite(val):
+            return float(val)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _sanitize_corr_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    metric_cols = [c for c in ("pearson", "spearman", "mutual_info") if c in out.columns]
+    if not metric_cols:
+        return out
+    if "drop_reason" not in out.columns:
+        out["drop_reason"] = ""
+    for col in metric_cols:
+        vals = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        bad = vals.isna()
+        if bad.any():
+            empty_reason = out["drop_reason"].astype(str).str.strip().eq("")
+            out.loc[bad & empty_reason, "drop_reason"] = "undefined_corr"
+        out[col] = vals.fillna(0.0).astype("float64")
+    return out
+
+
 def _effect_size_deciles(x: np.ndarray, y: np.ndarray, q: float = 0.1) -> Tuple[float, float, float]:
     mask = np.isfinite(x) & np.isfinite(y)
     x = x[mask]
@@ -554,12 +582,15 @@ def _correlation_sweep(
             overall_rows.append(row)
             continue
         pearson, spearman, n = _safe_corr(x, y)
+        mi = _mutual_info(x, y)
+        if (not np.isfinite(pearson)) or (not np.isfinite(spearman)) or (not np.isfinite(mi)):
+            row["drop_reason"] = str(row.get("drop_reason", "") or "undefined_corr")
         top_mean, bot_mean, effect = _effect_size_deciles(x, y)
         row.update(
             {
-                "pearson": pearson,
-                "spearman": spearman,
-                "mutual_info": _mutual_info(x, y),
+                "pearson": _finite_or_zero(pearson),
+                "spearman": _finite_or_zero(spearman),
+                "mutual_info": _finite_or_zero(mi),
                 "n_used": n,
                 "top_decile_rate": top_mean,
                 "bottom_decile_rate": bot_mean,
@@ -591,23 +622,29 @@ def _correlation_sweep(
                             "lead_bin": str(bin_label),
                             "feature": feat,
                             "missing_frac": missing_frac,
-                            "pearson": float("nan"),
-                            "spearman": float("nan"),
-                            "mutual_info": float("nan"),
+                            "pearson": 0.0,
+                            "spearman": 0.0,
+                            "mutual_info": 0.0,
                             "n_used": 0,
+                            "drop_reason": f"missing>{max_missing}",
                         }
                     )
                     continue
                 pearson, spearman, n = _safe_corr(x, y_sub)
+                mi = _mutual_info(x, y_sub)
+                drop_reason = ""
+                if (not np.isfinite(pearson)) or (not np.isfinite(spearman)) or (not np.isfinite(mi)):
+                    drop_reason = "undefined_corr"
                 by_lead_rows.append(
                     {
                         "lead_bin": str(bin_label),
                         "feature": feat,
                         "missing_frac": missing_frac,
-                        "pearson": pearson,
-                        "spearman": spearman,
-                        "mutual_info": _mutual_info(x, y_sub),
+                        "pearson": _finite_or_zero(pearson),
+                        "spearman": _finite_or_zero(spearman),
+                        "mutual_info": _finite_or_zero(mi),
                         "n_used": n,
+                        "drop_reason": drop_reason,
                     }
                 )
 
@@ -632,23 +669,29 @@ def _correlation_sweep(
                             "lat_band": str(band),
                             "feature": feat,
                             "missing_frac": missing_frac,
-                            "pearson": float("nan"),
-                            "spearman": float("nan"),
-                            "mutual_info": float("nan"),
+                            "pearson": 0.0,
+                            "spearman": 0.0,
+                            "mutual_info": 0.0,
                             "n_used": 0,
+                            "drop_reason": f"missing>{max_missing}",
                         }
                     )
                     continue
                 pearson, spearman, n = _safe_corr(x, y_sub)
+                mi = _mutual_info(x, y_sub)
+                drop_reason = ""
+                if (not np.isfinite(pearson)) or (not np.isfinite(spearman)) or (not np.isfinite(mi)):
+                    drop_reason = "undefined_corr"
                 by_lat_rows.append(
                     {
                         "lat_band": str(band),
                         "feature": feat,
                         "missing_frac": missing_frac,
-                        "pearson": pearson,
-                        "spearman": spearman,
-                        "mutual_info": _mutual_info(x, y_sub),
+                        "pearson": _finite_or_zero(pearson),
+                        "spearman": _finite_or_zero(spearman),
+                        "mutual_info": _finite_or_zero(mi),
                         "n_used": n,
+                        "drop_reason": drop_reason,
                     }
                 )
 
@@ -1291,6 +1334,12 @@ def main() -> int:
                 lat_bands,
                 float(args.corr_max_missing),
             )
+            corr_overall = _sanitize_corr_table(corr_overall)
+            corr_by_lead = _sanitize_corr_table(corr_by_lead)
+            corr_by_lat = _sanitize_corr_table(corr_by_lat)
+            corr_by_month = _sanitize_corr_table(corr_by_month)
+            corr_resid = _sanitize_corr_table(corr_resid)
+            corr_perm = _sanitize_corr_table(corr_perm)
             if not corr_overall.empty:
                 corr_overall.to_csv(out_dir / "correlations_overall.csv", index=False)
                 top = corr_overall.copy()

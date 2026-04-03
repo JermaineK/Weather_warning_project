@@ -23,7 +23,7 @@ report:
     patches_csv: results/seedmaps/coral_sea_demo_seed_patches.csv
     matches_csv: results/seedmaps/coral_sea_demo_seed_track_matches.csv
     seed_summary: results/seedmaps/coral_sea_demo_seed_summary.txt
-    seed_analysis: results/seedmaps/coral_sea_demo_seed_analysis.txt
+    seed_analysis: null
     conversion_csv: results/seedmaps/coral_sea_demo_conversion_rates.csv
     alerts_dir: results/alerts
     viability_thresholds: results/sweeps/viability_best_thresholds.csv
@@ -32,21 +32,23 @@ report:
     storm_timeseries: data/storm_timeseries_panel.parquet
     ibtracs: data/tracks/tracks_subset.csv
     ibtracs_normalize_lon: -180..180
-    union_seeds_per_hour: true
-    seeds_ibtracs_per_hour: true
-    seed_track_per_hour: true
-    seed_track_per_storm_gifs: true
+    union_seeds_per_hour: false
+    seeds_ibtracs_per_hour: false
+    seed_track_per_hour: false
+    seed_track_per_storm_gifs: false
     seed_track_max_direction_arrows: 400
     per_hour_step: 2
     per_hour_max_frames: 150
-    animate: true
+    animate: false
     animate_format: gif
     animate_fps: 6
     diagnostics: true
     diagnostics_fail_on_checks: true
     diagnostics_fast: true
     diagnostics_feature_meta: config/features_manifest.json
-    overwrite: false
+    skip_if_exists: false
+    objects_flow_source: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+    cells_out: results/objects/object_cells_by_hour.parquet
 report_pdf: true
 autofix:
   use_diagnostics_rules: true
@@ -233,8 +235,8 @@ data_stage:
     - lat
     - lon
     - storm
-    keep_prefixes: gka_,sph_,SFI,S3,zeta,div,msl_,dG_,dE_,G_,E_
-    drop_patterns: storm*,track*,t_to_*,near_storm,row_id,time,time_hr,*_point,*_window,vmax*,dist*track*
+    keep_prefixes: sph_,SFI,S3,zeta,div,msl_,dG_,dE_,G_,E_
+    drop_patterns: storm*,track*,t_to_*,near_storm,row_id,time,time_hr,*_point,*_window,vmax*,dist*track*,gka_*,
     out: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state_slim.parquet
     chunk_rows: 200000
     overwrite: false
@@ -247,7 +249,7 @@ data_stage:
     lead_col: t_to_storm_min_h
     max_lead_h: 240
     quiet_mult: 2.0
-    max_rows: 20000000
+    max_rows: null
     chunksize: 500000
     seed: 42
     skip_if_exists: false
@@ -371,8 +373,8 @@ data_stage:
     val_keys_out: models/viability_val_keys.parquet
     features_manifest: config/features_manifest.json
     require_feature_metadata: true
-    overwrite: true
-    skip_if_exists: false
+    overwrite: false
+    skip_if_exists: true
   - mode: storm-timeseries
     enabled: false
     labelled_with_id: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
@@ -408,6 +410,7 @@ training:
     enabled: true
     train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state_slim.parquet
     label: storm
+    exclude_cols: gka_parity_lock,gka_knee_post_h
     train_end: '2025-03-31'
     val_end: '2025-05-30'
     include_prefixes:
@@ -436,7 +439,6 @@ training:
     chunk_rows: 200000
     parquet_rows: 200000
     skip_if_exists: false
-    overwrite: true
   - mode: train-alert-specialist
     enabled: true
     calibrate: true
@@ -458,7 +460,6 @@ training:
     features_manifest: config/features_manifest.json
     require_feature_metadata: true
     skip_if_exists: false
-    overwrite: true
   - mode: predict-alerts
     enabled: true
     features: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state.parquet

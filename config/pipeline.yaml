@@ -26,7 +26,7 @@ report:
       patches-csv: results/seedmaps/coral_sea_demo_seed_patches.csv
       matches-csv: results/seedmaps/coral_sea_demo_seed_track_matches.csv
       seed-summary: results/seedmaps/coral_sea_demo_seed_summary.txt
-      seed-analysis: results/seedmaps/coral_sea_demo_seed_analysis.txt
+      seed-analysis:
       conversion-csv: results/seedmaps/coral_sea_demo_conversion_rates.csv
       alerts-dir: results/alerts
       viability-thresholds: results/sweeps/viability_best_thresholds.csv
@@ -35,14 +35,14 @@ report:
       storm-timeseries: data/storm_timeseries_panel.parquet
       ibtracs: data/tracks/tracks_subset.csv
       ibtracs-normalize-lon: *norm
-      union-seeds-per-hour: true
-      seeds-ibtracs-per-hour: true
-      seed-track-per-hour: true
-      seed-track-per-storm-gifs: true
+      union-seeds-per-hour: false
+      seeds-ibtracs-per-hour: false
+      seed-track-per-hour: false
+      seed-track-per-storm-gifs: false
       seed-track-max-direction-arrows: 400
       per-hour-step: 2
       per-hour-max-frames: 150
-      animate: true
+      animate: false
       animate-format: gif
       animate-fps: 6
       diagnostics: true
@@ -271,12 +271,12 @@ data_stage:
         - lat
         - lon
         - storm
-      keep-prefixes: "gka_,sph_,SFI,S3,zeta,div,msl_,dG_,dE_,G_,E_"
-      drop-patterns: "storm*,track*,t_to_*,near_storm,row_id,time,time_hr,*_point,*_window,vmax*,dist*track*"
+      keep-prefixes: "sph_,SFI,S3,zeta,div,msl_,dG_,dE_,G_,E_"
+      drop-patterns: "storm*,track*,t_to_*,near_storm,row_id,time,time_hr,*_point,*_window,vmax*,dist*track*,gka_*,"
       out: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state_slim.parquet
       chunk-rows: 200000
-      overwrite: false
-      skip_if_exists: true
+      overwrite: true
+      skip_if_exists: false
 
     # 2.2 Build training subset keyed by row_id, using t_to_storm_min_h
     - mode: subset-by-id
@@ -287,7 +287,7 @@ data_stage:
       lead-col: t_to_storm_min_h
       max-lead-h: 240
       quiet-mult: 2.0
-      max-rows: 20000000
+      max-rows: 
       chunksize: 500000
       seed: 42
       skip_if_exists: false
@@ -468,6 +468,7 @@ training:
       enabled: true
       train: data/grid_labelled_FMA_gka_realthermo_sph_ms_id_state_slim.parquet
       label: storm
+      exclude-cols: gka_parity_lock,gka_knee_post_h
       train-end: "2025-03-31"
       val-end: "2025-05-30"
       include_prefixes:

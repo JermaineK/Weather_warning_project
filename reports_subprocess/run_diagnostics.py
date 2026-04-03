@@ -251,6 +251,57 @@ def _sample_table(path: Path, columns: Optional[List[str]], n: int, seed: int) -
     return _sample_csv(path, columns, n, seed)
 
 
+def _column_has_finite(path: Path, col: str, chunk_rows: int = 200_000) -> Optional[bool]:
+    if not path.exists():
+        return None
+    if _is_parquet(path):
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+
+            pf = pq.ParquetFile(path)
+            if col not in pf.schema.names:
+                return None
+            for batch in pf.iter_batches(columns=[col], batch_size=chunk_rows):
+                s = pd.to_numeric(batch.to_pandas()[col], errors="coerce")
+                if np.isfinite(s.to_numpy(dtype=float, copy=False)).any():
+                    return True
+            return False
+        except Exception:
+            pass
+    try:
+        for chunk in pd.read_csv(
+            path,
+            usecols=[col],
+            chunksize=chunk_rows,
+            compression="infer",
+            low_memory=False,
+        ):
+            s = pd.to_numeric(chunk[col], errors="coerce")
+            if np.isfinite(s.to_numpy(dtype=float, copy=False)).any():
+                return True
+        return False
+    except ValueError:
+        return None
+    except Exception:
+        return None
+
+
+def _flow_direction_health(matches_path: Optional[Path]) -> Tuple[Optional[bool], str]:
+    if matches_path is None or not matches_path.exists():
+        return None, "matches table missing"
+    cols = [c for c, _ in _read_schema(matches_path)]
+    needed = {"obj_flow_bearing_deg", "obj_flow_speed_kmh"}
+    if not needed.issubset(set(cols)):
+        return None, "flow columns missing in matches table"
+    has_bearing = _column_has_finite(matches_path, "obj_flow_bearing_deg")
+    has_speed = _column_has_finite(matches_path, "obj_flow_speed_kmh")
+    if has_bearing is None and has_speed is None:
+        return None, "unable to scan flow columns"
+    if bool(has_bearing) or bool(has_speed):
+        return False, "flow direction metrics populated"
+    return True, "obj_flow_bearing_deg and obj_flow_speed_kmh are all-missing"
+
+
 def _row_count(path: Path) -> int:
     if not path.exists():
         return 0
@@ -1267,6 +1318,7 @@ def main() -> int:
 
     # Slowtick identical check
     slowtick_identical, slowtick_note = _slowtick_identical(slowtick_dir)
+    flow_missing, flow_note = _flow_direction_health(matches_table_path)
 
     # Time-shift test (Phase 3.1)
     time_shift_result = None
@@ -1444,6 +1496,28 @@ def main() -> int:
             "detected": None,
             "status": "skip",
             "evidence": slowtick_note or "slowtick data missing",
+        })
+
+    if flow_missing is True:
+        checks.append({
+            "issue": "flow direction missing in matches",
+            "detected": True,
+            "status": "fail",
+            "evidence": flow_note,
+        })
+    elif flow_missing is False:
+        checks.append({
+            "issue": "flow direction missing in matches",
+            "detected": False,
+            "status": "pass",
+            "evidence": flow_note,
+        })
+    else:
+        checks.append({
+            "issue": "flow direction missing in matches",
+            "detected": None,
+            "status": "skip",
+            "evidence": flow_note,
         })
 
     if time_shift_result:

@@ -249,7 +249,10 @@ def main() -> None:
 
     # drop patterns (but preserve explicitly requested columns)
     drop_patterns = [p.strip() for p in str(args.drop_patterns).split(",") if p.strip()]
-    if drop_patterns and keep_cols:
+    if drop_patterns:
+        # If keep_cols is empty, start from full schema so drop_patterns can still prune.
+        if not keep_cols:
+            keep_cols = _peek_columns(args.source)
         keep_cols = [
             c
             for c in keep_cols

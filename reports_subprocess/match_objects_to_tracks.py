@@ -37,6 +37,131 @@ def _read_any(path: str | Path) -> pd.DataFrame:
     return pd.read_csv(p, low_memory=False)
 
 
+def _iter_selected(path: str | Path, columns: List[str], chunk_rows: int = 250_000) -> Iterable[pd.DataFrame]:
+    p = Path(path)
+    if _is_parquet(p):
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+
+            pf = pq.ParquetFile(p)
+            for batch in pf.iter_batches(columns=columns, batch_size=int(chunk_rows)):
+                yield batch.to_pandas()
+            return
+        except Exception:
+            pass
+        yield pd.read_parquet(p, columns=columns)
+        return
+    for chunk in pd.read_csv(
+        p,
+        usecols=columns,
+        chunksize=int(chunk_rows),
+        compression="infer",
+        low_memory=False,
+    ):
+        yield chunk
+
+
+def _enrich_object_flow_from_source(
+    obj: pd.DataFrame,
+    cells_path: Optional[str],
+    flow_source: Optional[str],
+    chunk_rows: int = 250_000,
+) -> pd.DataFrame:
+    out = obj.copy()
+    if not flow_source or not cells_path:
+        return out
+    cells_p = Path(cells_path)
+    flow_p = Path(flow_source)
+    if not cells_p.exists() or not flow_p.exists():
+        return out
+    try:
+        cells = _read_any(cells_p)
+    except Exception as exc:
+        print(f"[match] warning: unable to read cells table for flow enrichment: {exc}")
+        return out
+    if cells.empty:
+        return out
+    if "object_id" not in cells.columns or "row_id" not in cells.columns:
+        print("[match] warning: skipping flow enrichment (cells table missing object_id/row_id).")
+        return out
+
+    key_df = cells[["row_id", "object_id"]].copy()
+    key_df["row_id"] = pd.to_numeric(key_df["row_id"], errors="coerce")
+    key_df = key_df.dropna(subset=["row_id", "object_id"]).drop_duplicates(subset=["row_id"])
+    if key_df.empty:
+        return out
+    key_df["row_id"] = key_df["row_id"].astype(np.int64)
+    row_to_obj = key_df.set_index("row_id")["object_id"]
+    key_ids = set(row_to_obj.index.to_numpy(dtype=np.int64, copy=False).tolist())
+
+    try:
+        if _is_parquet(flow_p):
+            try:
+                import pyarrow.parquet as pq  # type: ignore
+
+                flow_cols = list(pq.ParquetFile(flow_p).schema.names)
+            except Exception:
+                flow_cols = []
+        else:
+            flow_cols = list(pd.read_csv(flow_p, nrows=0).columns)
+    except Exception:
+        flow_cols = []
+    required = {"row_id", "u10", "v10"}
+    if not required.issubset(set(flow_cols)):
+        print("[match] warning: flow-source missing row_id/u10/v10; skipping flow enrichment.")
+        return out
+
+    u_sum = pd.Series(dtype="float64")
+    v_sum = pd.Series(dtype="float64")
+    u_cnt = pd.Series(dtype="float64")
+    v_cnt = pd.Series(dtype="float64")
+
+    chunk_size = int(chunk_rows) if chunk_rows and int(chunk_rows) > 0 else 250_000
+    for chunk in _iter_selected(flow_p, ["row_id", "u10", "v10"], chunk_rows=chunk_size):
+        if chunk.empty:
+            continue
+        rid = pd.to_numeric(chunk["row_id"], errors="coerce")
+        sub = chunk.loc[rid.notna(), ["row_id", "u10", "v10"]].copy()
+        if sub.empty:
+            continue
+        sub["row_id"] = pd.to_numeric(sub["row_id"], errors="coerce").astype(np.int64)
+        sub = sub.loc[sub["row_id"].isin(key_ids)]
+        if sub.empty:
+            continue
+        sub["object_id"] = sub["row_id"].map(row_to_obj)
+        sub = sub.dropna(subset=["object_id"])
+        if sub.empty:
+            continue
+        sub["u10"] = pd.to_numeric(sub["u10"], errors="coerce")
+        sub["v10"] = pd.to_numeric(sub["v10"], errors="coerce")
+        grp = sub.groupby("object_id", sort=False)
+        u_sum = u_sum.add(grp["u10"].sum(min_count=1), fill_value=0.0)
+        v_sum = v_sum.add(grp["v10"].sum(min_count=1), fill_value=0.0)
+        u_cnt = u_cnt.add(grp["u10"].count(), fill_value=0.0)
+        v_cnt = v_cnt.add(grp["v10"].count(), fill_value=0.0)
+
+    if u_sum.empty and v_sum.empty:
+        return out
+    u_mean = (u_sum / u_cnt.replace(0, np.nan)).rename("obj_u10_mean")
+    v_mean = (v_sum / v_cnt.replace(0, np.nan)).rename("obj_v10_mean")
+    flow_means = pd.concat([u_mean, v_mean], axis=1).reset_index()
+    out = out.merge(flow_means, on="object_id", how="left", suffixes=("", "_flowsrc"))
+
+    for col in ("obj_u10_mean", "obj_v10_mean"):
+        src = f"{col}_flowsrc"
+        if src not in out.columns:
+            continue
+        if col not in out.columns:
+            out[col] = out[src]
+        else:
+            cur = pd.to_numeric(out[col], errors="coerce")
+            out[col] = cur.where(cur.notna(), pd.to_numeric(out[src], errors="coerce"))
+        out = out.drop(columns=[src])
+    filled = int(pd.to_numeric(out.get("obj_u10_mean", pd.Series(dtype=float)), errors="coerce").notna().sum())
+    print(f"[match] flow enrichment: populated obj_u10_mean for {filled:,} object rows")
+    return out
+
+
 def _norm_lon(series: pd.Series, mode: str) -> pd.Series:
     x = pd.to_numeric(series, errors="coerce")
     if mode == "none":
@@ -309,7 +434,9 @@ def main() -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--objects", required=True, help="objects_by_hour table (CSV/Parquet).")
+    ap.add_argument("--cells", default=None, help="Optional per-cell objects table (for flow enrichment).")
     ap.add_argument("--tracks", required=True, help="IBTrACS subset (CSV/Parquet).")
+    ap.add_argument("--flow-source", default=None, help="Optional panel with row_id/u10/v10 for flow enrichment.")
     ap.add_argument("--out", default="results/matches/storm_object_matches.parquet", help="Matched pairs output.")
     ap.add_argument("--objects-out", default=None, help="Optional objects table with motion columns.")
     ap.add_argument("--tracks-out", default=None, help="Optional tracks table with motion columns.")
@@ -383,6 +510,12 @@ def main() -> int:
         time_col=args.time_col,
     )
     obj = _add_directionality(obj)
+    obj = _enrich_object_flow_from_source(
+        obj,
+        args.cells,
+        args.flow_source,
+        chunk_rows=int(args.chunk_rows) if args.chunk_rows else 250_000,
+    )
     obj = _add_flow_direction(obj)
     obj = _add_motion_uncertainty(obj, args.motion_uncertainty_hours, args.time_col)
     if "obj_flow_bearing_deg" in obj.columns and obj["obj_flow_bearing_deg"].notna().sum() == 0:
