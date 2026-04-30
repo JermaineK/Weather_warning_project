@@ -77,4 +77,9 @@ Both criteria must be met for the result to be labelled **SUPPORTED**.
 
 ## Source file hash
 
-*(Added in next commit after Task-1 was merged to this branch.)*
+SHA-256 of `features_subprocess/compute_gka_features.py` at Task-1 commit
+(`01a378a`):
+
+```
+b79bd4be67c7df02d398ce25cf938b8f69090f01856ad4630145370397b6e854
+```
