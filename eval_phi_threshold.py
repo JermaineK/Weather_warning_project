@@ -202,7 +202,7 @@ def evaluate(args) -> dict:
     # filter: lead window
     lead_vals = [int(x) for x in str(args.lead_window).split(",")]
     if "lead_h" in df.columns:
-        df = df[(df["lead_h"] >= lead_window[0]) & (df["lead_h"] <= lead_window[1])]
+        df = df[(df["lead_h"] >= lead_vals[0]) & (df["lead_h"] <= lead_vals[1])]
         print(f"[phi-eval] lead_h filter {lead_vals} -> {len(df):,} rows")
     else:
         print(f"[phi-eval] 'lead_h' not found; skipping lead-window filter", file=sys.stderr)
