@@ -100,7 +100,7 @@ def week_chunks(start, end, days):
 
 
 # base columns needed to construct the theory-driven phi feature on the fly
-PHI_BASE = ["gka_relax", "gka_A_overlap", "gka_kappa"]
+PHI_BASE_DEFAULT = ["gka_relax", "gka_A_overlap", "gka_kappa"]
 
 
 def load_join(args, t0, t1, signals, extra_cols=()):
@@ -122,20 +122,26 @@ def load_join(args, t0, t1, signals, extra_cols=()):
     return m
 
 
-def build_phi(m: pd.DataFrame) -> pd.DataFrame:
+def build_phi(m: pd.DataFrame, relax_col="gka_relax", agree_col="gka_A_overlap",
+              vzeta_col=None, kappa_col="gka_kappa") -> pd.DataFrame:
     """gka_phi = (1/(|relax|+eps)) * agree / (V_zeta+eps), robust-scaled (median/MAD).
 
-    V_zeta = 7-step centered rolling variance of gka_kappa (=zeta) per (ilat,ilon).
-    Mirrors compute_gka_features.add_gka_features but built from precomputed
-    GKA columns (relax=gka_relax, agree=gka_A_overlap). Scaled per chunk.
+    V_zeta is either a precomputed vorticity-variance column (vzeta_col, e.g.
+    zeta_std3h -> squared) or a 7-step centered rolling variance of kappa_col per
+    (ilat,ilon). relax_col/agree_col select which relax/agree fields to use
+    (raw `drelax_dt`/`agree`, or the GKA proxies). Scaled per chunk.
     """
-    m = m.sort_values(["ilat", "ilon", "time"])
-    vz = (m.groupby(["ilat", "ilon"], sort=False)["gka_kappa"]
-            .rolling(7, center=True, min_periods=3).var()
-            .reset_index(level=[0, 1], drop=True))
-    vzv = np.where(np.isfinite(vz.to_numpy(float)), vz.to_numpy(float), 0.0)
-    relax = pd.to_numeric(m["gka_relax"], errors="coerce").to_numpy(float)
-    agree = pd.to_numeric(m["gka_A_overlap"], errors="coerce").to_numpy(float)
+    if vzeta_col is not None:
+        std = pd.to_numeric(m[vzeta_col], errors="coerce").to_numpy(float)
+        vzv = np.where(np.isfinite(std), std, 0.0) ** 2
+    else:
+        m = m.sort_values(["ilat", "ilon", "time"])
+        vz = (m.groupby(["ilat", "ilon"], sort=False)[kappa_col]
+                .rolling(7, center=True, min_periods=3).var()
+                .reset_index(level=[0, 1], drop=True))
+        vzv = np.where(np.isfinite(vz.to_numpy(float)), vz.to_numpy(float), 0.0)
+    relax = pd.to_numeric(m[relax_col], errors="coerce").to_numpy(float)
+    agree = pd.to_numeric(m[agree_col], errors="coerce").to_numpy(float)
     phi_raw = (1.0 / (np.abs(relax) + 1e-6)) * agree / (vzv + 1e-6)
     med = np.nanmedian(phi_raw)
     mad = np.nanmean(np.abs(phi_raw - med)) + 1e-6
@@ -146,14 +152,19 @@ def build_phi(m: pd.DataFrame) -> pd.DataFrame:
 def collect(args, signals):
     rng = np.random.default_rng(0)
     keep = list(signals) + (["gka_phi"] if args.build_phi else [])
-    extra = PHI_BASE if args.build_phi else ()
+    if args.build_phi:
+        extra = [args.phi_relax, args.phi_agree]
+        extra += [args.phi_vzeta] if args.phi_vzeta else ["gka_kappa"]
+    else:
+        extra = ()
     frames = []
     for t0, t1 in week_chunks(args.start, args.end, args.chunk_days):
         m = load_join(args, t0, t1, signals, extra_cols=extra)
         if m.empty:
             continue
         if args.build_phi:
-            m = build_phi(m)
+            m = build_phi(m, relax_col=args.phi_relax, agree_col=args.phi_agree,
+                          vzeta_col=(args.phi_vzeta or None))
         spiral = m[m["pregen"] == 1]
         if spiral.empty:
             continue
@@ -277,8 +288,11 @@ def parse_args():
     ap.add_argument("--lead-grid", required=True)
     ap.add_argument("--signals", default="gka_SII,gka_SAI,gka_score,gka_kappa,gka_chirality")
     ap.add_argument("--build-phi", action="store_true",
-                    help="Construct theory-driven gka_phi on the fly from gka_relax/gka_A_overlap/"
-                         "rolling-var(gka_kappa) and add it to the signal set.")
+                    help="Construct theory-driven gka_phi on the fly and add it to the signal set.")
+    ap.add_argument("--phi-relax", default="gka_relax", help="relax column for phi (e.g. drelax_dt).")
+    ap.add_argument("--phi-agree", default="gka_A_overlap", help="agree column for phi (e.g. agree).")
+    ap.add_argument("--phi-vzeta", default="", help="precomputed V_zeta std column (e.g. zeta_std3h); "
+                                                    "empty = rolling var of gka_kappa.")
     ap.add_argument("--start", default="2025-02-01")
     ap.add_argument("--end", default="2025-04-30")
     ap.add_argument("--train-end", default="2025-03-31")
