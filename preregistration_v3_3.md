@@ -95,4 +95,8 @@ lands *above null with guards passing*.
 
 ## Source file hash
 
-*(Added in the sealing commit that immediately follows this one.)*
+SHA-256 of `storm_geometric_validation.py` at its adding commit (`9bf121b`):
+
+```
+59978d021381de3e44abd11459c095352686ecf2d6e89e1482825c5a41ee73f7
+```
