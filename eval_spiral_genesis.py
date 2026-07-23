@@ -99,10 +99,15 @@ def week_chunks(start, end, days):
         t += pd.Timedelta(days=days)
 
 
-def load_join(args, t0, t1, signals):
+# base columns needed to construct the theory-driven phi feature on the fly
+PHI_BASE = ["gka_relax", "gka_A_overlap", "gka_kappa"]
+
+
+def load_join(args, t0, t1, signals, extra_cols=()):
     F = [("time", ">=", t0), ("time", "<", t1)]
-    gka = pd.read_parquet(args.gka_grid,
-                          columns=["time", "ilat", "ilon", "lat", "lon"] + signals, filters=F)
+    want = ["time", "ilat", "ilon", "lat", "lon"] + list(signals) + list(extra_cols)
+    want = list(dict.fromkeys(want))  # dedupe, preserve order
+    gka = pd.read_parquet(args.gka_grid, columns=want, filters=F)
     if gka.empty:
         return gka
     pg = pd.read_parquet(args.pregen_grid, columns=["time", "ilat", "ilon", "pregen"], filters=F)
@@ -117,13 +122,38 @@ def load_join(args, t0, t1, signals):
     return m
 
 
+def build_phi(m: pd.DataFrame) -> pd.DataFrame:
+    """gka_phi = (1/(|relax|+eps)) * agree / (V_zeta+eps), robust-scaled (median/MAD).
+
+    V_zeta = 7-step centered rolling variance of gka_kappa (=zeta) per (ilat,ilon).
+    Mirrors compute_gka_features.add_gka_features but built from precomputed
+    GKA columns (relax=gka_relax, agree=gka_A_overlap). Scaled per chunk.
+    """
+    m = m.sort_values(["ilat", "ilon", "time"])
+    vz = (m.groupby(["ilat", "ilon"], sort=False)["gka_kappa"]
+            .rolling(7, center=True, min_periods=3).var()
+            .reset_index(level=[0, 1], drop=True))
+    vzv = np.where(np.isfinite(vz.to_numpy(float)), vz.to_numpy(float), 0.0)
+    relax = pd.to_numeric(m["gka_relax"], errors="coerce").to_numpy(float)
+    agree = pd.to_numeric(m["gka_A_overlap"], errors="coerce").to_numpy(float)
+    phi_raw = (1.0 / (np.abs(relax) + 1e-6)) * agree / (vzv + 1e-6)
+    med = np.nanmedian(phi_raw)
+    mad = np.nanmean(np.abs(phi_raw - med)) + 1e-6
+    m["gka_phi"] = (phi_raw - med) / mad
+    return m
+
+
 def collect(args, signals):
     rng = np.random.default_rng(0)
+    keep = list(signals) + (["gka_phi"] if args.build_phi else [])
+    extra = PHI_BASE if args.build_phi else ()
     frames = []
     for t0, t1 in week_chunks(args.start, args.end, args.chunk_days):
-        m = load_join(args, t0, t1, signals)
+        m = load_join(args, t0, t1, signals, extra_cols=extra)
         if m.empty:
             continue
+        if args.build_phi:
+            m = build_phi(m)
         spiral = m[m["pregen"] == 1]
         if spiral.empty:
             continue
@@ -133,7 +163,7 @@ def collect(args, signals):
         def sub(df, label):
             if len(df) > args.max_per_chunk:
                 df = df.iloc[rng.choice(len(df), args.max_per_chunk, replace=False)]
-            out = df[signals + ["time"]].copy()
+            out = df[keep + ["time"]].copy()
             out["y"] = label
             return out
 
@@ -152,6 +182,8 @@ def main():
     args = parse_args()
     signals = [s.strip() for s in args.signals.split(",") if s.strip()]
     df = collect(args, signals)
+    if args.build_phi and "gka_phi" not in signals:
+        signals = signals + ["gka_phi"]
     y = df["y"].to_numpy(float)
     print(f"\n[spiral] pooled tighten={int(y.sum()):,}  fizzle={int((1-y).sum()):,}")
 
@@ -244,6 +276,9 @@ def parse_args():
     ap.add_argument("--pregen-grid", required=True)
     ap.add_argument("--lead-grid", required=True)
     ap.add_argument("--signals", default="gka_SII,gka_SAI,gka_score,gka_kappa,gka_chirality")
+    ap.add_argument("--build-phi", action="store_true",
+                    help="Construct theory-driven gka_phi on the fly from gka_relax/gka_A_overlap/"
+                         "rolling-var(gka_kappa) and add it to the signal set.")
     ap.add_argument("--start", default="2025-02-01")
     ap.add_argument("--end", default="2025-04-30")
     ap.add_argument("--train-end", default="2025-03-31")
