@@ -117,6 +117,13 @@ def render(args):
     gen_t = genesis_time(tr, args.genesis_thresh)
     print(f"[viz] {name} ({args.storm_id})  genesis(>= {args.genesis_thresh:.0f}kt) = {gen_t}")
 
+    # default the time window from the track span if not explicitly given
+    if args.start is None:
+        args.start = (tr["time"].iloc[0] - pd.Timedelta(hours=args.pre_h)).strftime("%Y-%m-%d %H:%M")
+    if args.end is None:
+        args.end = (tr["time"].iloc[-1] + pd.Timedelta(hours=6)).strftime("%Y-%m-%d %H:%M")
+    print(f"[viz] window {args.start} -> {args.end}")
+
     # bbox: pad around the track unless user forced one
     if args.bbox:
         bbox = tuple(float(x) for x in args.bbox.split(","))
@@ -215,12 +222,14 @@ def parse_args():
     ap.add_argument("--tracks", required=True, help="Tracks parquet (storm_id/time/lat/lon/vmax/name).")
     ap.add_argument("--storm-id", required=True)
     ap.add_argument("--signal", default="G_persist_24h")
+    ap.add_argument("--pre-h", type=float, default=72.0,
+                    help="Hours before the first track point to start (when --start omitted).")
     ap.add_argument("--negate", action="store_true",
                     help="Plot -signal (e.g. cyclonic vorticity = -zeta in the Southern Hemisphere).")
     ap.add_argument("--smooth-sigma", type=float, default=0.0,
                     help="Gaussian spatial smoothing in grid cells (NaN-aware). 0 = off.")
-    ap.add_argument("--start", required=True)
-    ap.add_argument("--end", required=True)
+    ap.add_argument("--start", default=None, help="Window start (default: first track point - pre_h).")
+    ap.add_argument("--end", default=None, help="Window end (default: last track point + 6h).")
     ap.add_argument("--step-h", type=int, default=3)
     ap.add_argument("--bbox", default=None, help="latS,latN,lonW,lonE (default: pad around track).")
     ap.add_argument("--pad-deg", type=float, default=6.0)
