@@ -86,8 +86,15 @@ IB_LAT  = ["lat","latitude","usalat","wmolat"]
 IB_LON  = ["lon","longitude","usalon","wmolon"]
 IB_VMAX = ["wmowind","usawind","vmax","maxwind","wind"]
 
+def _read_any(path):
+    """CSV or Parquet, by extension (orchestrator may pass either)."""
+    if str(path).lower().endswith((".parquet", ".parq", ".pq")):
+        return pd.read_parquet(path)
+    return pd.read_csv(path, low_memory=False)
+
+
 def load_ibtracs(path, normalize_lon_mode, start=None, end=None, time_offset_h=0.0, area=None):
-    df = pd.read_csv(path, low_memory=False)
+    df = _read_any(path)
     name_col = pick_col_fuzzy(df, [canon(c) for c in IB_NAME])
     t_col    = pick_col_fuzzy(df, [canon(c) for c in IB_TIME])
     lat_col  = pick_col_fuzzy(df, [canon(c) for c in IB_LAT])
@@ -126,7 +133,7 @@ SEED_TIME_CANDS = ["seedstart","seedtime","starttime","time","start","start_time
 SEED_NAME_CANDS = ["name","stormname","seedname"]
 
 def load_seeds(path, normalize_lon_mode, override_lat=None, override_lon=None, override_time=None):
-    m = pd.read_csv(path, low_memory=False)
+    m = _read_any(path)
 
     lat_col  = override_lat  or pick_col_fuzzy(m, [canon(c) for c in SEED_LAT_CANDS])
     lon_col  = override_lon  or pick_col_fuzzy(m, [canon(c) for c in SEED_LON_CANDS])
