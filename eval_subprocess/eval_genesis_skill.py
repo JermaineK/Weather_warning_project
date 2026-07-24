@@ -182,6 +182,10 @@ def main() -> int:
         base = out_dir / f"{args.run_name}_genesis_skill"
     Path(f"{base}.json").write_text(json.dumps(summary, indent=2, default=str))
     res.to_csv(f"{base}.csv", index=False)
+    if args.out and Path(args.out).suffix.lower() in (".parquet", ".pq", ".parq"):
+        # honor the exact declared output path (orchestrator table_format may
+        # rewrite the extension to parquet; postflight checks that precise file)
+        res.to_parquet(args.out, index=False)
     print(f"[genesis-skill] overall LOSO AUC mean={summary['overall_loso_auc_mean']:.3f} "
           f"over {len(storms)} storms")
     print(f"[genesis-skill] wrote {base}.json / .csv")
