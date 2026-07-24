@@ -118,6 +118,10 @@ def score_crop(m, feats, w, mu, sd):
 
 def main() -> int:
     args = parse_args()
+    if args.skip_if_exists and args.out and Path(args.out).exists():
+        print(f"[genesis-skill] skip: output exists ({args.out}); "
+              f"remove it or set skip_if_exists: false to re-run.")
+        return 0
     feats = [f.strip() for f in args.features.split(",") if f.strip()]
     leads = [int(x) for x in args.leads.split(",")]
     crops = load_storm_crops(args, feats)
@@ -229,7 +233,9 @@ def parse_args():
     ap.add_argument("--max-neg", type=int, default=40000)
     ap.add_argument("--n-boot", type=int, default=2000)
     ap.add_argument("--l2", type=float, default=1.0)
-    # orchestrator compatibility (ignored)
+    # orchestrator compatibility
+    ap.add_argument("--skip-if-exists", dest="skip_if_exists", action="store_true",
+                    help="Exit successfully without re-running if --out already exists.")
     ap.add_argument("--chunk-rows", type=int, default=0)
     ap.add_argument("--parquet-rows", type=int, default=0)
     ap.add_argument("--quiet", action="store_true")
