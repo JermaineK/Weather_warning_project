@@ -65,14 +65,15 @@ eval:
     out: results/metrics/geomval_demo_genesis_skill.csv
     leads: 6,12,24,36,48
     n_boot: 2000
-    skip_if_exists: false
+    skip_if_exists: true
   - mode: per-storm
-    enabled: false
+    enabled: true
     matches: results/seedmaps/geomval_demo_seed_track_matches.csv
     ibtracs: data/tracks/tracks_geomval.parquet
     normalize_lon: -180..180
     area: -5,125,-35,175
     out_dir: results/per_storm_geomval
+    save_per_storm_csv: true
 seeds:
   enabled: true
   from_alerts:
@@ -110,3 +111,4 @@ seeds:
     chunk_rows: 400000
     structure_radius_km: 50
     points_format: both
+    flag_col: any_alert

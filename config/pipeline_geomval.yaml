@@ -106,16 +106,17 @@ eval:
       out: results/metrics/geomval_demo_genesis_skill.csv
       leads: "6,12,24,36,48"
       n-boot: 2000
-      skip_if_exists: false
+      skip_if_exists: true    # LOSO is deterministic; skip when output exists
 
-    # Optional per-storm map overlays once seed/track matches exist
+    # Per-storm map overlays from the seed/track matches
     - mode: per-storm
-      enabled: false
+      enabled: true
       matches: results/seedmaps/geomval_demo_seed_track_matches.csv
       ibtracs: data/tracks/tracks_geomval.parquet
       normalize-lon: *norm
       area: *area
       out-dir: results/per_storm_geomval
+      save-per-storm-csv: true
 
 # ---------------------------------------------------------------------
 # 4) Seed maps + effectiveness vs IBTrACS (existing machinery)
@@ -157,6 +158,7 @@ seeds:
     chunk-rows: 400000
     structure-radius-km: 50
     points-format: both
+    flag-col: any_alert     # gate conversion/outcomes to FIRED alerts, not the whole union
 
 # report bundle intentionally omitted: it depends on the viability stack.
 # Genesis maps/GIFs: python viz_genesis_hotspot.py --grid <labelled> --tracks <tracks> ...
