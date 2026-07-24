@@ -110,6 +110,7 @@ HERE = Path(__file__).resolve().parent
 SCRIPT_MAP: Dict[str, str] = {
     # Core evals
     "viability-leads":  "eval_viability_leads.py",
+    "genesis-skill":     "eval_genesis_skill.py",
     "hits":              "eval_alert_hits.py",
     "leadtime":          "eval_leadtime_grid.py",
     "leadtime-progress": "eval_leadtime_grid_progress.py",
