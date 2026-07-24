@@ -323,6 +323,9 @@ def main():
     ap.add_argument("--overlay-prob", default=None, help="Numeric seed column to color by (e.g., prob).")
     # optional per-storm CSV export of plotted rows
     ap.add_argument("--save-per-storm-csv", action="store_true")
+    # Orchestrator-injected compatibility flags (unused)
+    ap.add_argument("--chunk-rows", type=int, default=None, help="Unused (compatibility with orchestrator hints).")
+    ap.add_argument("--parquet-rows", type=int, default=None, help="Unused (compatibility with orchestrator hints).")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
