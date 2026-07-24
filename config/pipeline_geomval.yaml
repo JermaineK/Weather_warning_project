@@ -86,6 +86,8 @@ alerts_logic:
       features: "gka_shear_quench,gka_msl_nd,gka_SII,gka_knee_ratio"
       trigger-feature: acc48
       false-alarm: 0.10
+      shape-filter: build-or-sustained   # halves false positives, keeps ~90% of 24-72h early warnings
+      sustained-quantile: 0.60
       stripes: 12
       overwrite: true
       skip_if_exists: false

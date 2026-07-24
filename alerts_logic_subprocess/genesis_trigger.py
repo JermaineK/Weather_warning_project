@@ -178,6 +178,34 @@ def main() -> int:
     trig = pd.to_numeric(alerts[args.trigger_feature], errors="coerce")
     alerts["alert_genesis"] = ((trig >= thr).fillna(False)).astype("int8")
 
+    # shape diagnostics: is the signal building / still surging at alert time?
+    alerts["build"] = (alerts["acc24"] - alerts["acc48"]).astype("float32")
+    alerts["surge"] = (alerts["prob_genesis"] - alerts["acc24"]).astype("float32")
+
+    # optional shape filter (see analysis in PR): false positives are typically
+    # FLAT and NOT SUSTAINED; genuine long-lead alerts sit in the dip phase of
+    # the build->dip->surge cycle, so the safe rule is the disjunction
+    # "building OR sustained-high", never "building" alone.
+    shape_info = {"shape_filter": args.shape_filter}
+    if args.shape_filter != "none":
+        fired = alerts["alert_genesis"] == 1
+        sustained_thr = float(pd.to_numeric(
+            alerts.loc[fired, "acc48"], errors="coerce").quantile(args.sustained_quantile)) \
+            if fired.any() else float("nan")
+        if args.shape_filter == "build":
+            keep = alerts["build"] > 0
+        else:  # build-or-sustained
+            keep = (alerts["build"] > 0) | (alerts["acc48"] >= sustained_thr)
+        n_before = int(fired.sum())
+        alerts["alert_genesis"] = (fired & keep).astype("int8")
+        n_after = int(alerts["alert_genesis"].sum())
+        shape_info.update({"sustained_quantile": args.sustained_quantile,
+                           "sustained_threshold": sustained_thr,
+                           "alerts_before_filter": n_before,
+                           "alerts_after_filter": n_after})
+        print(f"[genesis-trigger] shape filter '{args.shape_filter}': "
+              f"{n_before:,} -> {n_after:,} alerts")
+
     n_alert = int(alerts["alert_genesis"].sum())
     hit = alerts[(alerts["alert_genesis"] == 1)]
     hit_rate = float((hit["near_storm"] == 1).mean()) if len(hit) else float("nan")
@@ -200,6 +228,7 @@ def main() -> int:
         "area": args.area, "l2": args.l2,
         "n_alert_cells": n_alert, "n_spiral_rows": int(len(alerts)),
         "alert_near_storm_fraction": hit_rate,
+        **shape_info,
         **fit_info,
     }
     card_path = Path(args.model_card or (str(outp) + ".model_card.json"))
@@ -221,6 +250,13 @@ def parse_args():
     ap.add_argument("--area", default=None, help='latN,lonW,latS,lonE crop (matches pipeline defaults.area).')
     ap.add_argument("--trigger-feature", default="acc48", choices=["prob_genesis", "acc24", "acc48"])
     ap.add_argument("--false-alarm", type=float, default=0.10)
+    ap.add_argument("--shape-filter", default="none",
+                    choices=["none", "build", "build-or-sustained"],
+                    help="Post-threshold false-positive filter. 'build-or-sustained' keeps alerts "
+                         "that are building (acc24>acc48) OR sustained-high; 'build' alone kills "
+                         "dip-phase long-lead alerts and is not recommended.")
+    ap.add_argument("--sustained-quantile", type=float, default=0.60,
+                    help="acc48 quantile (among fired alerts) for the sustained-high backstop.")
     ap.add_argument("--l2", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-train-rows", type=int, default=2_000_000)
