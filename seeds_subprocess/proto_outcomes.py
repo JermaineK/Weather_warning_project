@@ -556,6 +556,9 @@ def main():
     )
     ap.add_argument("--chunk-rows", type=int, default=0, help="Optional chunk size for CSV inputs (0=off).")
     ap.add_argument("--max-rows", type=int, default=None, help="Optional cap on seed rows (sample if larger).")
+    ap.add_argument("--flag-col", default=None,
+                    help="Optional seed flag column (e.g. any_alert); keep only rows where it is > 0 "
+                         "so outcomes/conversion reflect fired alerts, not the whole union.")
     # preprocess normalize-lon to handle tokens like "-180..180"
     argv = []
     skip = False
@@ -578,6 +581,14 @@ def main():
 
     # ---- load seeds
     s = read_csv_chunked(args.seeds, args.chunk_rows, args.max_rows)
+    if args.flag_col:
+        if args.flag_col in s.columns:
+            n0 = len(s)
+            s = s[pd.to_numeric(s[args.flag_col], errors="coerce").fillna(0) > 0]
+            print(f"[info] flag gate {args.flag_col}>0: {n0:,} -> {len(s):,} seed rows")
+        else:
+            print(f"[warn] --flag-col '{args.flag_col}' not in seeds; no gate applied.",
+                  file=sys.stderr)
     if args.max_rows and len(s) > args.max_rows:
         s = s.sample(n=int(args.max_rows), random_state=42)
         print(f"[info] seeds sampled to {len(s):,} rows (max_rows={args.max_rows})")
