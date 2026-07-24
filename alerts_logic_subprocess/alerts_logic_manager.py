@@ -80,6 +80,8 @@ HERE = Path(__file__).resolve().parent
 # Dash/underscore aliases are handled in find_script, so this map can stay small.
 SCRIPT_MAP: Dict[str, str] = {
     "viability-pipeline": "viability_pipeline.py",
+    # spiral-conditioned genesis trigger (geom-val early-warning model)
+    "genesis-trigger":    "genesis_trigger.py",
     # core rule appliers / discovery
     "apply":              "apply_rules.py",
     "apply-rules":        "apply_rules.py",
