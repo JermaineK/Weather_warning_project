@@ -103,7 +103,7 @@ eval:
       labelled: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
       tracks: data/tracks/tracks_geomval.parquet
       run-name: geomval_demo
-      out-dir: results/metrics
+      out: results/metrics/geomval_demo_genesis_skill.csv
       leads: "6,12,24,36,48"
       n-boot: 2000
       skip_if_exists: false

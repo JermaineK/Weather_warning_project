@@ -49,6 +49,8 @@ alerts_logic:
     features: gka_shear_quench,gka_msl_nd,gka_SII,gka_knee_ratio
     trigger_feature: acc48
     false_alarm: 0.1
+    shape_filter: build-or-sustained
+    sustained_quantile: 0.6
     stripes: 12
     overwrite: true
     skip_if_exists: false
@@ -60,7 +62,7 @@ eval:
     labelled: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
     tracks: data/tracks/tracks_geomval.parquet
     run_name: geomval_demo
-    out_dir: results/metrics
+    out: results/metrics/geomval_demo_genesis_skill.csv
     leads: 6,12,24,36,48
     n_boot: 2000
     skip_if_exists: false
@@ -83,7 +85,7 @@ seeds:
     area: -5,125,-35,175
     out_dir: results/seedmaps
     chunk_rows: 400000
-    write_parquet: false
+    write_parquet: true
   starts:
     enabled: true
     seeds: results/seedmaps/geomval_demo_union_byhour.csv
@@ -95,7 +97,7 @@ seeds:
     radius_deg: 4.0
     time_tol_hours: 18
     min_run_hours: 30
-    save_parquet: false
+    save_parquet: true
     chunk_rows: 400000
   outcomes:
     enabled: true

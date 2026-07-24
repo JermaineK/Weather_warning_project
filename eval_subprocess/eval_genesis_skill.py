@@ -173,9 +173,13 @@ def main() -> int:
         "per_lead": res.to_dict(orient="records"),
     }
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    base = out_dir / f"{args.run_name}_genesis_skill"
+    if args.out:  # canonical output path (pipeline contract); csv/png are siblings
+        base = str(Path(args.out).with_suffix(""))
+        Path(base).parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        base = out_dir / f"{args.run_name}_genesis_skill"
     Path(f"{base}.json").write_text(json.dumps(summary, indent=2, default=str))
     res.to_csv(f"{base}.csv", index=False)
     print(f"[genesis-skill] overall LOSO AUC mean={summary['overall_loso_auc_mean']:.3f} "
@@ -209,6 +213,8 @@ def parse_args():
     ap.add_argument("--tracks", required=True)
     ap.add_argument("--run-name", default="run")
     ap.add_argument("--out-dir", default="results/metrics")
+    ap.add_argument("--out", default=None,
+                    help="Canonical JSON output path (overrides run-name/out-dir naming).")
     ap.add_argument("--features", default=",".join(DEFAULT_FEATURES))
     ap.add_argument("--leads", default="6,12,24,36,48")
     ap.add_argument("--lead-tol", type=int, default=3)

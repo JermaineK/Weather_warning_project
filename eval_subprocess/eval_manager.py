@@ -200,7 +200,12 @@ def _apply_run_defaults(tool: str, run_name: str | None, extra: list[str]) -> li
             return
         out.extend([flag, *map(str, vals)])
 
-    if tool == "viability-leads":
+    if tool == "genesis-skill":
+        ensure("--run-name", run_name)
+        if not _has_flag(out, "--out"):
+            ensure("--out", f"results/metrics/{run_name}_genesis_skill.csv")
+
+    elif tool == "viability-leads":
         ensure("--panel", "data/grid_train_gse_panel_targets.parquet")
         ensure("--model", "models/viability_model.pkl")
         ensure("--model-metrics", "models/viability_model_metrics.json")
