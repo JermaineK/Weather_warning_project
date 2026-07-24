@@ -319,6 +319,8 @@ def main():
     ap.add_argument("--area", default=None, help='"latN,lonW,latS,lonE"')
     ap.add_argument("--time-offset-hours", type=float, default=0.0)
     ap.add_argument("--out-dir", default="results/per_storm"); ap.add_argument("--dpi", type=int, default=160)
+    ap.add_argument("--out", default=None,
+                    help="Optional index-manifest path (csv/parquet); default <out-dir>/per_storm_index.csv.")
     ap.add_argument("--merge-gap-hours", type=float, default=48.0)
     ap.add_argument("--merge-max-km", type=float, default=500.0)
     ap.add_argument("--min-points", type=int, default=3)
@@ -358,6 +360,7 @@ def main():
 
     storms = sorted(tracks_m["name"].dropna().unique().tolist())
     wrote = 0
+    index_rows = []
     for nm in storms:
         nm_clean = sanitize_name(nm)
         tdf = tracks_m.loc[tracks_m["name"] == nm].copy()
@@ -371,6 +374,9 @@ def main():
         ok = plot_one(nm, tdf, sdf, str(out_png), dpi=args.dpi, overlay_col=args.overlay_prob)
         if ok:
             wrote += 1
+            index_rows.append({"storm": nm, "figure": str(out_png),
+                               "n_track_points": int(len(tdf)),
+                               "n_seed_points": int(len(sdf))})
             if args.save_per_storm_csv:
                 # Save what was actually used for the plot
                 used_csv = out_dir / f"{nm_clean}_plotdata.csv"
@@ -381,7 +387,19 @@ def main():
                 both = pd.concat([use_t, use_s], ignore_index=True, sort=False)
                 both.to_csv(used_csv, index=False)
 
-    print(f"[per-storm] Wrote {wrote} figure(s) to {out_dir}")
+    # index manifest (also serves as the pipeline step's canonical output file)
+    idx = pd.DataFrame(index_rows, columns=["storm", "figure", "n_track_points", "n_seed_points"])
+    if args.out:
+        idx_path = Path(args.out)
+        idx_path.parent.mkdir(parents=True, exist_ok=True)
+        if idx_path.suffix.lower() in (".parquet", ".parq", ".pq"):
+            idx.to_parquet(idx_path, index=False)
+        else:
+            idx.to_csv(idx_path, index=False)
+    else:
+        idx_path = out_dir / "per_storm_index.csv"
+        idx.to_csv(idx_path, index=False)
+    print(f"[per-storm] Wrote {wrote} figure(s) to {out_dir}; index -> {idx_path}")
 
 if __name__ == "__main__":
     main()

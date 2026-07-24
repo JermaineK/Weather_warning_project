@@ -116,6 +116,7 @@ eval:
       normalize-lon: *norm
       area: *area
       out-dir: results/per_storm_geomval
+      out: results/per_storm_geomval/per_storm_index.csv
       save-per-storm-csv: true
 
 # ---------------------------------------------------------------------

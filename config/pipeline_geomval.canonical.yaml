@@ -73,6 +73,7 @@ eval:
     normalize_lon: -180..180
     area: -5,125,-35,175
     out_dir: results/per_storm_geomval
+    out: results/per_storm_geomval/per_storm_index.csv
     save_per_storm_csv: true
 seeds:
   enabled: true
