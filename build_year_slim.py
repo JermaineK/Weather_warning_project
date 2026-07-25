@@ -88,6 +88,28 @@ def free_gb() -> float:
     return shutil.disk_usage(".").free / 1073741824
 
 
+def prune_columns(src: Path, dst: Path, drop: list[str], batch_rows: int = 400_000) -> None:
+    """Stream-copy a parquet dropping columns whose dtype drifts across chunks
+    (e.g. all-null S3_src/time_hr become `null` in some batches and string in
+    others, which breaks ParquetWriter's fixed schema)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(str(src))
+    keep = [c for c in pf.schema.names if c not in drop]
+    dropped = [c for c in pf.schema.names if c in drop]
+    writer = None
+    try:
+        for batch in pf.iter_batches(batch_size=batch_rows, columns=keep):
+            table = pa.Table.from_batches([batch])
+            if writer is None:
+                writer = pq.ParquetWriter(str(dst), table.schema)
+            writer.write_table(table)
+    finally:
+        if writer is not None:
+            writer.close()
+    print(f"[year] pruned {dropped} -> {dst.name}", flush=True)
+
+
 def main() -> int:
     a = parse_args()
     Y = a.year
@@ -184,6 +206,13 @@ def main() -> int:
         "--infile", f_sph, "--outfile", f_ms,
         "--parquet-rows", "250000", "--overwrite"], dry)
     drop(f_sph, keep)
+
+    # 9b) prune schema-unstable columns that would break the labelling writer
+    f_ms_p = out_dir / "grid_sph_ms_pruned.parquet"
+    if not dry:
+        prune_columns(f_ms, f_ms_p, ["S3_src", "time_hr"])
+        drop(f_ms, keep)
+        f_ms = f_ms_p
 
     # 10) labels (pregen / near_storm / t_to_storm_min_h)
     sh([sys.executable, FEAT / "join_labels_grid.py",
