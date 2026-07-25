@@ -127,7 +127,7 @@ def main() -> int:
     # 1) base grid from ERA5 single-level
     sh([sys.executable, FEAT / "build_features_grid.py",
         "--nc-glob", nc_glob, "--out", f_eoi,
-        "--normalize-lon", "-180..180", f"--area={a.area}",
+        "--normalize-lon=-180..180", f"--area={a.area}",
         "--export-uv", "--with-vortdiv",
         "--require-vars", "u10,v10,msl,t2m",
         "--dedup", "time_lat_lon", "--emit-grid-index", "--overwrite"], dry)
@@ -143,7 +143,7 @@ def main() -> int:
     sh([sys.executable, FEAT / "features_bulk_shear.py",
         "--pl-glob", pl_glob, "--out", f_shear,
         "--low-pair", "1000,925", "--deep-pair", "1000,500",
-        "--normalize-lon", "-180..180", f"--area={a.area}", "--overwrite"], dry)
+        "--normalize-lon=-180..180", f"--area={a.area}", "--overwrite"], dry)
 
     # 4) join shear onto the windowed grid
     sh([sys.executable, FEAT / "features_join_features.py",
@@ -168,14 +168,14 @@ def main() -> int:
     sh([sys.executable, FEAT / "integrate_era5_thermo.py",
         "--features", f_gka, "--thermo-glob", nc_glob, "--out", f_therm,
         "--nearest", "--nearest-maxdeg", "0.4",
-        "--normalize-lon", "-180..180", "--overwrite"], dry)
+        "--normalize-lon=-180..180", "--overwrite"], dry)
     drop(f_gka, keep)
 
     # 8) spherical feedback (SFI / SFI2)
     sh([sys.executable, FEAT / "compute_spherical_feedback.py",
         "--infile", f_therm, "--out", f_sph,
         "--neighbor-step", "0.0", "--radius-cells", "2",
-        "--normalize-lon", "-180..180", f"--area={a.area}",
+        "--normalize-lon=-180..180", f"--area={a.area}",
         "--lead-hours", "24", "--overwrite"], dry)
     drop(f_therm, keep)
 
@@ -188,7 +188,7 @@ def main() -> int:
     # 10) labels (pregen / near_storm / t_to_storm_min_h)
     sh([sys.executable, FEAT / "join_labels_grid.py",
         "--features", f_ms, "--labels", tracks, "--out", f_lab,
-        "--normalize-lon", "-180..180",
+        "--normalize-lon=-180..180",
         "--pregen_future_h", "240.0", "--pregen-step", "1",
         "--storm_radius_deg", "1.0", "--storm_time_h", "3.0",
         "--near_radius_deg", "5.0", "--near_time_h", "12.0",
