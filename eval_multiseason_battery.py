@@ -166,9 +166,10 @@ def main() -> int:
             per_lead[k][L] = {c: auc_roc(tight[c].to_numpy(float)[msk],
                                          fiz[c].to_numpy(float)) for c in FEAT_OUT}
 
-        # C. shape filter on fired alerts (threshold = 90th pct of fizzle A48)
-        thr = float(np.nanquantile(fiz["A48"].to_numpy(float), 0.90))
-        fired = sp[pd.to_numeric(sp["A48"], errors="coerce") >= thr]
+        # C. shape filter on fired alerts (threshold = 90th pct of fizzle trigger)
+        tf = a.trigger_feature
+        thr = float(np.nanquantile(fiz[tf].to_numpy(float), 0.90))
+        fired = sp[pd.to_numeric(sp[tf], errors="coerce") >= thr]
         if len(fired) > 50:
             yf = fired["y"].to_numpy(int)
             sustained = float(np.nanquantile(fired["A48"].to_numpy(float), 0.60))
@@ -260,7 +261,8 @@ def main() -> int:
         m_, l_, h_, n_ = boot_ci(d, rng, a.n_boot)
         rep["shape_filter"] = {"precision_gain_mean": m_, "ci": [l_, h_], "n_storms": n_,
                                "mean_kept_frac": float(sh["kept_frac"].mean()),
-                               "mean_recall_kept": float(sh["recall_kept"].mean())}
+                               "mean_recall_kept": float(sh["recall_kept"].mean()),
+                               "trigger_feature": a.trigger_feature}
         print(f"\n[C] shape filter precision gain = {m_:+.3f} 95%CI[{l_:+.3f},{h_:+.3f}] "
               f"n={n_} storms; keeps {sh['kept_frac'].mean():.1%} of alerts, "
               f"{sh['recall_kept'].mean():.1%} of true positives")
@@ -324,6 +326,9 @@ def parse_args():
     ap.add_argument("--genesis-thresh-kt", type=float, default=34.0)
     ap.add_argument("--genesis-radius", type=float, default=3.0, help="deg from genesis point")
     ap.add_argument("--genesis-max-lead", type=float, default=72.0, help="max hours before genesis")
+    ap.add_argument("--trigger-feature", choices=["s", "A24", "A48"], default="s",
+                    help="which score fires an alert for the shape-filter test "
+                         "(s = instantaneous prob_genesis).")
     ap.add_argument("--certain-quantile", type=float, default=0.99)
     ap.add_argument("--min-bin", type=int, default=30)
     ap.add_argument("--pre-h", type=float, default=120.0)

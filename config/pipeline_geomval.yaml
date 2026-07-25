@@ -84,10 +84,12 @@ alerts_logic:
       end: *end
       area: *area
       features: "gka_shear_quench,gka_msl_nd,gka_SII,gka_knee_ratio"
-      trigger-feature: acc48
+      # Instantaneous score. Strict-genesis, leave-one-season-out validation over
+      # 24 storms / 5 seasons found trailing accumulation gives no advantage at any
+      # lead, and the shape filter is n.s. under instantaneous firing.
+      trigger-feature: prob_genesis
       false-alarm: 0.10
-      shape-filter: build-or-sustained   # halves false positives, keeps ~90% of 24-72h early warnings
-      sustained-quantile: 0.60
+      shape-filter: none
       stripes: 12
       overwrite: true
       skip_if_exists: false

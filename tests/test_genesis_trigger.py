@@ -73,6 +73,10 @@ def test_genesis_trigger_end_to_end(tmp_path):
 
     # model card written and self-consistent
     card = json.loads((tmp_path / "alerts.parquet.model_card.json").read_text())
-    assert card["trigger_feature"] == "acc48"
+    # default trigger is the INSTANTANEOUS score: strict-genesis, leave-one-season-out
+    # validation over 24 storms found trailing accumulation gives no advantage at any
+    # lead (24h dAUC -0.037, CI [-0.078, +0.006]).
+    assert card["trigger_feature"] == "prob_genesis"
+    assert card["shape_filter"] == "none"
     assert len(card["w"]) == len(card["features"]) + 1  # bias + coefs
     assert np.isfinite(card["threshold"])

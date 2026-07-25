@@ -10,8 +10,11 @@ Pipeline-facing implementation of the validated early-warning trigger
      on pregen==1 spiral cells) on the configured TRAIN window.
   2. Score every cell-hour: prob_genesis (instantaneous) + causal trailing
      accumulations acc24/acc48 per (ilat,ilon).
-  3. Threshold the trigger feature (default acc48) at a false-alarm quantile
-     computed on train-window fizzle spirals.
+  3. Threshold the trigger feature (default prob_genesis, the instantaneous
+     score) at a false-alarm quantile computed on train-window fizzle spirals.
+     Trailing accumulations acc24/acc48 are still emitted as diagnostics, but
+     strict-genesis multi-season validation found they give no skill advantage
+     at any lead, so they are NOT the default trigger.
   4. Emit alert cells (pregen==1 rows) in the repo's standard alerts schema:
      time, lat, lon, prob_genesis, alert_genesis (+ acc24/acc48/lead passthrough)
      so seeds.from_alerts / starts / outcomes consume them unchanged.
@@ -248,13 +251,18 @@ def parse_args():
     ap.add_argument("--start", default=None, help="Window start (default: whole file).")
     ap.add_argument("--end", default=None, help="Window end (default: whole file).")
     ap.add_argument("--area", default=None, help='latN,lonW,latS,lonE crop (matches pipeline defaults.area).')
-    ap.add_argument("--trigger-feature", default="acc48", choices=["prob_genesis", "acc24", "acc48"])
+    ap.add_argument("--trigger-feature", default="prob_genesis",
+                    choices=["prob_genesis", "acc24", "acc48"],
+                    help="Score that fires an alert. Default prob_genesis (instantaneous): "
+                         "strict-genesis multi-season validation found trailing accumulation "
+                         "gives NO advantage at any lead (24h dAUC -0.037 CI[-0.078,+0.006]).")
     ap.add_argument("--false-alarm", type=float, default=0.10)
     ap.add_argument("--shape-filter", default="none",
                     choices=["none", "build", "build-or-sustained"],
-                    help="Post-threshold false-positive filter. 'build-or-sustained' keeps alerts "
-                         "that are building (acc24>acc48) OR sustained-high; 'build' alone kills "
-                         "dip-phase long-lead alerts and is not recommended.")
+                    help="Post-threshold false-positive filter. NOT RECOMMENDED with the default "
+                         "instantaneous trigger: under strict-genesis labels its precision gain is "
+                         "+0.015 CI[-0.000,+0.029] (n.s.). It was only significant when alerts were "
+                         "fired on acc48, which is itself unsupported.")
     ap.add_argument("--sustained-quantile", type=float, default=0.60,
                     help="acc48 quantile (among fired alerts) for the sustained-high backstop.")
     ap.add_argument("--l2", type=float, default=1.0)
