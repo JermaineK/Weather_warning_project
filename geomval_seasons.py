@@ -164,3 +164,87 @@ def train_keys_for(crops: dict[str, dict], held_key: str, cv: str = "season") ->
         return [k for k in crops if k != held_key]
     held_season = crops[held_key]["season"]
     return [k for k in crops if crops[k]["season"] != held_season]
+
+
+# ---------------------------------------------------------------------------
+# Strict genesis labelling
+# ---------------------------------------------------------------------------
+# `near_storm` is generous: any cell within ~5 deg / 12h of ANY track point of a
+# tracked system, including a fully mature storm. That inflates apparent skill
+# and lets "lead 0" mean "inside a hurricane" rather than "about to form".
+#
+# The strict label instead targets the GENESIS EVENT itself:
+#     genesis := first track time at which vmax >= thresh_kt (default 34 kt, TS)
+#     positive := spiral cell within radius_deg of the GENESIS POINT,
+#                 at a time in [t_g - max_lead_h, t_g)      (strictly BEFORE)
+#     negative := spiral cell that is not positive for any storm AND has
+#                 near_storm == 0  (i.e. never part of a tracked system) -> fizzle
+#     excluded := post-genesis cells, cells near a mature storm, and storms that
+#                 never reached TS intensity (ambiguous outcome)
+#
+# This removes the mature-storm inflation and makes "lead" mean time-to-formation.
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1)
+    a = (np.sin(dlat / 2) ** 2
+         + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon / 2) ** 2)
+    return 2 * R * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+
+def genesis_events(tr: pd.DataFrame, thresh_kt: float = 34.0) -> pd.DataFrame:
+    """First TS-intensity crossing per storm: (storm_id, name, season, t_g, lat_g, lon_g)."""
+    rows = []
+    for sid, g in tr.groupby(tr["storm_id"].astype(str)):
+        g = g.sort_values("time")
+        v = pd.to_numeric(g.get("vmax"), errors="coerce")
+        if v is None or not (v >= thresh_kt).any():
+            continue
+        i = (v >= thresh_kt).idxmax()
+        r = g.loc[i]
+        rows.append({
+            "storm_id": sid,
+            "name": str(r["name"]) if "name" in g.columns else sid,
+            "season": int(r["season"]) if "season" in g.columns else int(r["time"].year),
+            "t_g": r["time"], "lat_g": float(r["lat"]), "lon_g": float(r["lon"]),
+        })
+    return pd.DataFrame(rows)
+
+
+def add_strict_labels(df: pd.DataFrame, events: pd.DataFrame,
+                      radius_deg: float = 3.0, max_lead_h: float = 72.0):
+    """Add gen_pos / gen_lead_h / gen_storm. Returns (df, n_pos).
+
+    A cell may fall in more than one genesis window; the nearest-in-time one wins.
+    """
+    n = len(df)
+    gen_pos = np.zeros(n, dtype=np.int8)
+    gen_lead = np.full(n, np.nan)
+    gen_storm = np.array([""] * n, dtype=object)
+    if events.empty:
+        return df.assign(gen_pos=gen_pos, gen_lead_h=gen_lead, gen_storm=gen_storm), 0
+
+    t = pd.to_datetime(df["time"]).to_numpy()
+    lat = pd.to_numeric(df["lat"], errors="coerce").to_numpy(float)
+    lon = pd.to_numeric(df["lon"], errors="coerce").to_numpy(float)
+    radius_km = radius_deg * 111.32
+
+    for ev in events.itertuples(index=False):
+        lead = (np.datetime64(ev.t_g) - t) / np.timedelta64(1, "h")
+        in_time = (lead > 0) & (lead <= max_lead_h)
+        if not in_time.any():
+            continue
+        d = np.full(n, np.inf)
+        d[in_time] = haversine_km(lat[in_time], lon[in_time], ev.lat_g, ev.lon_g)
+        hit = in_time & (d <= radius_km)
+        if not hit.any():
+            continue
+        # nearest-in-time genesis wins where windows overlap
+        better = hit & (np.isnan(gen_lead) | (lead < gen_lead))
+        gen_pos[better] = 1
+        gen_lead[better] = lead[better]
+        gen_storm[better] = f"{ev.season}:{ev.name}"
+
+    out = df.assign(gen_pos=gen_pos, gen_lead_h=gen_lead, gen_storm=gen_storm)
+    return out, int(gen_pos.sum())

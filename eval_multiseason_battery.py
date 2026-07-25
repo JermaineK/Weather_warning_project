@@ -38,7 +38,9 @@ import matplotlib.pyplot as plt
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from eval_spiral_genesis import auc_roc, fit_logistic, predict  # noqa: E402
-from geomval_seasons import load_storm_crops, train_keys_for     # noqa: E402
+from geomval_seasons import (load_storm_crops, train_keys_for,     # noqa: E402
+                             read_tracks, resolve_files,
+                             genesis_events, add_strict_labels)
 
 CURATED = ["gka_shear_quench", "gka_msl_nd", "gka_SII", "gka_knee_ratio"]
 WINDOWS = [24, 48]
@@ -63,9 +65,9 @@ def fit_on(crops, keys, feats, l2=1.0):
     Xs, ys = [], []
     for k in keys:
         d = crops[k]["df"]
-        sp = d[d["pregen"] == 1]
+        sp = d[d["pregen"] == 1] if "pregen" in d.columns else d
         Xs.append(sp[feats].apply(pd.to_numeric, errors="coerce").to_numpy(float))
-        ys.append((sp["near_storm"].to_numpy(float) == 1).astype(float))
+        ys.append(sp["y"].to_numpy(float))
     X = np.vstack(Xs); y = np.concatenate(ys)
     fin = np.all(np.isfinite(X), axis=1)
     X, y = X[fin], y[fin]
@@ -96,6 +98,41 @@ def main() -> int:
              "pdrop_nd", "t2m_anom_local", "gka_SAI"]
     crops = load_storm_crops(a.panels, a.tracks, feats, extra_cols=extra,
                              pre_h=a.pre_h, pad_deg=a.pad_deg, max_cells=a.max_cells)
+
+    # STRICT GENESIS relabel: target the formation event, not proximity to a
+    # mature track. Positives = cells within --genesis-radius of the genesis
+    # POINT at lead in (0, --genesis-max-lead]; negatives = spiral cells never
+    # part of any tracked system; everything else is censored out.
+    if a.label == "strict_genesis":
+        ev_all = genesis_events(read_tracks(resolve_files(a.tracks)), a.genesis_thresh_kt)
+        print(f"[strict] {len(ev_all)} genesis events "
+              f"(vmax>={a.genesis_thresh_kt:.0f}kt) from {len(crops)} tracked storms")
+        kept = {}
+        for k, rec in crops.items():
+            df, npos = add_strict_labels(rec["df"], ev_all,
+                                         radius_deg=a.genesis_radius,
+                                         max_lead_h=a.genesis_max_lead)
+            sp = df[df["pregen"] == 1]
+            pos = sp[sp["gen_pos"] == 1]
+            neg = sp[(sp["gen_pos"] == 0) & (sp["near_storm"] == 0)]
+            if len(pos) < a.min_bin or len(neg) < a.min_bin:
+                print(f"[strict] {k:22s} dropped (pos={len(pos)}, fizzle={len(neg)})")
+                continue
+            keep_df = pd.concat([pos, neg], ignore_index=True)
+            keep_df["y"] = (keep_df["gen_pos"] == 1).astype(int)
+            keep_df["lead_col"] = keep_df["gen_lead_h"]
+            rec = dict(rec); rec["df"] = keep_df
+            kept[k] = rec
+            print(f"[strict] {k:22s} pos={len(pos):,} fizzle={len(neg):,}")
+        if len(kept) < 4:
+            raise SystemExit(f"[strict] only {len(kept)} storms usable; relax radius/lead.")
+        crops = kept
+    else:
+        for k, rec in crops.items():
+            d = rec["df"]
+            d["y"] = (d["near_storm"] == 1).astype(int)
+            d["lead_col"] = d["t_to_storm_min_h"]
+
     keys = list(crops)
     seasons = sorted({crops[k]["season"] for k in keys})
     rng = np.random.default_rng(1)
@@ -109,8 +146,8 @@ def main() -> int:
             continue
         w, mu, sd = fit
         m = score_df(crops[k]["df"].copy(), feats, w, mu, sd)
-        sp = m[m["pregen"] == 1]
-        tight, fiz = sp[sp["near_storm"] == 1], sp[sp["near_storm"] == 0]
+        sp = m[m["pregen"] == 1] if "pregen" in m.columns else m
+        tight, fiz = sp[sp["y"] == 1], sp[sp["y"] == 0]
         if len(fiz) > a.max_neg:
             fiz = fiz.iloc[rng.choice(len(fiz), a.max_neg, replace=False)]
         if not len(tight) or not len(fiz):
@@ -120,7 +157,7 @@ def main() -> int:
         overall[k] = auc_roc(tight["s"].to_numpy(float), fiz["s"].to_numpy(float))
 
         # B. early warning by lead
-        tt = pd.to_numeric(tight["t_to_storm_min_h"], errors="coerce").to_numpy(float)
+        tt = pd.to_numeric(tight["lead_col"], errors="coerce").to_numpy(float)
         per_lead[k] = {}
         for L in LEADS:
             msk = (tt >= L - LEAD_TOL) & (tt <= L + LEAD_TOL)
@@ -133,7 +170,7 @@ def main() -> int:
         thr = float(np.nanquantile(fiz["A48"].to_numpy(float), 0.90))
         fired = sp[pd.to_numeric(sp["A48"], errors="coerce") >= thr]
         if len(fired) > 50:
-            yf = (fired["near_storm"].to_numpy(float) == 1).astype(int)
+            yf = fired["y"].to_numpy(int)
             sustained = float(np.nanquantile(fired["A48"].to_numpy(float), 0.60))
             keep = ((fired["build"] > 0) |
                     (fired["A48"] >= sustained)).fillna(False).to_numpy()
@@ -171,7 +208,11 @@ def main() -> int:
 
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
     rep: dict = {"n_storms": len(overall), "seasons": seasons, "cv": a.cv,
-                 "features": feats}
+                 "label": a.label, "features": feats}
+    if a.label == "strict_genesis":
+        rep["genesis_def"] = {"thresh_kt": a.genesis_thresh_kt,
+                              "radius_deg": a.genesis_radius,
+                              "max_lead_h": a.genesis_max_lead}
 
     # ---- A ----
     ov = np.array(list(overall.values()), float)
@@ -189,7 +230,7 @@ def main() -> int:
             rows.append({"lead_h": L, "feature": c, "auc_mean": m_,
                          "ci_lo": l_, "ci_hi": h_, "n_storms": n_})
     lead_df = pd.DataFrame(rows)
-    lead_df.to_csv(out / "multiseason_leads.csv", index=False)
+    lead_df.to_csv(out / f"multiseason_{a.label}_leads.csv", index=False)
     print("\n[B] early-warning skill by lead (per-storm mean, 95% CI, n storms):")
     for L in LEADS:
         sub = lead_df[lead_df.lead_h == L]
@@ -214,7 +255,7 @@ def main() -> int:
     # ---- C ----
     if shape_rows:
         sh = pd.DataFrame(shape_rows)
-        sh.to_csv(out / "multiseason_shape_filter.csv", index=False)
+        sh.to_csv(out / f"multiseason_{a.label}_shape_filter.csv", index=False)
         d = (sh["precision_filtered"] - sh["precision_all"]).to_numpy(float)
         m_, l_, h_, n_ = boot_ci(d, rng, a.n_boot)
         rep["shape_filter"] = {"precision_gain_mean": m_, "ci": [l_, h_], "n_storms": n_,
@@ -236,7 +277,7 @@ def main() -> int:
             prows.append({"attribute": c, "auc": au,
                           "auc_orientation_free": max(au, 1 - au) if np.isfinite(au) else np.nan})
         pdf = pd.DataFrame(prows).sort_values("auc_orientation_free", ascending=False)
-        pdf.to_csv(out / "multiseason_precursor.csv", index=False)
+        pdf.to_csv(out / f"multiseason_{a.label}_precursor.csv", index=False)
         rep["precursor"] = {"lookback_h": [BACK_LO, BACK_HI],
                             "n_precursor": int(len(pre)), "n_background": int(len(bg)),
                             "attributes": pdf.to_dict("records")}
@@ -244,7 +285,7 @@ def main() -> int:
               f"(n_pre={len(pre):,}, n_bg={len(bg):,}):")
         print(pdf.head(8).to_string(index=False))
 
-    (out / "multiseason_battery.json").write_text(json.dumps(rep, indent=2, default=str))
+    (out / f"multiseason_{a.label}_battery.json").write_text(json.dumps(rep, indent=2, default=str))
     print(f"\n[battery] wrote {out/'multiseason_battery.json'} (+ csvs)")
 
     # plot
@@ -265,7 +306,7 @@ def main() -> int:
     ax.set_title(f"Multi-season genesis trigger: {len(overall)} storms, "
                  f"{len(seasons)} seasons")
     ax.grid(alpha=0.3); ax.legend()
-    fig.tight_layout(); fig.savefig(out / "multiseason_leads.png"); plt.close(fig)
+    fig.tight_layout(); fig.savefig(out / f"multiseason_{a.label}_leads.png"); plt.close(fig)
     print(f"[battery] wrote {out/'multiseason_leads.png'}")
     return 0
 
@@ -277,6 +318,12 @@ def parse_args():
     ap.add_argument("--out-dir", default="results/metrics")
     ap.add_argument("--features", default=",".join(CURATED))
     ap.add_argument("--cv", choices=["season", "storm"], default="season")
+    ap.add_argument("--label", choices=["near_storm", "strict_genesis"], default="near_storm",
+                    help="near_storm = proximity to any track point (generous); "
+                         "strict_genesis = pre-formation cells near the genesis point only.")
+    ap.add_argument("--genesis-thresh-kt", type=float, default=34.0)
+    ap.add_argument("--genesis-radius", type=float, default=3.0, help="deg from genesis point")
+    ap.add_argument("--genesis-max-lead", type=float, default=72.0, help="max hours before genesis")
     ap.add_argument("--certain-quantile", type=float, default=0.99)
     ap.add_argument("--min-bin", type=int, default=30)
     ap.add_argument("--pre-h", type=float, default=120.0)
