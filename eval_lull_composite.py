@@ -62,8 +62,14 @@ def composite(series_by_event, lead_grid):
     """Mean trajectory across events; returns (mean, per-event matrix)."""
     rows = []
     for ev, tr in series_by_event.items():
-        rows.append(np.interp(lead_grid, tr["lead"], tr["val"],
-                              left=np.nan, right=np.nan))
+        # np.interp requires ASCENDING x; trajectories are stored descending
+        # (72h -> 0h), so sort before interpolating or every point returns NaN.
+        o = np.argsort(tr["lead"])
+        x, y = np.asarray(tr["lead"])[o], np.asarray(tr["val"])[o]
+        m = np.isfinite(x) & np.isfinite(y)
+        if m.sum() < 2:
+            continue
+        rows.append(np.interp(lead_grid, x[m], y[m], left=np.nan, right=np.nan))
     M = np.vstack(rows) if rows else np.empty((0, len(lead_grid)))
     with np.errstate(invalid="ignore"):
         return np.nanmean(M, axis=0), M
