@@ -87,6 +87,44 @@ def _ilat_stripes(path: str, n_stripes: int):
     return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:]) if b > a]
 
 
+def _load_cape(nc_glob: str, lat_lo: float, lat_hi: float) -> pd.DataFrame | None:
+    """Tidy (time,lat,lon,cape) for a latitude band, read from ERA5 CAPE netCDFs.
+
+    Loaded per ilat stripe so the full-domain CAPE field is never held at once.
+    Returns None if nothing matches, so the caller can fail loudly rather than
+    silently dropping the gate.
+    """
+    import glob as _glob
+    import xarray as xr
+    paths = sorted(_glob.glob(nc_glob, recursive=True))
+    if not paths:
+        return None
+    frames = []
+    for pth in paths:
+        ds = xr.open_dataset(pth)
+        tname = "valid_time" if "valid_time" in ds.coords else "time"
+        latn = "latitude" if "latitude" in ds.coords else "lat"
+        lonn = "longitude" if "longitude" in ds.coords else "lon"
+        if "cape" not in ds.data_vars:
+            ds.close(); continue
+        lat_vals = ds[latn].values
+        keep = (lat_vals >= lat_lo - 0.13) & (lat_vals <= lat_hi + 0.13)
+        if not keep.any():
+            ds.close(); continue
+        sub = ds[["cape"]].isel({latn: np.where(keep)[0]})
+        df = sub.to_dataframe().reset_index()
+        ds.close()
+        df = df.rename(columns={tname: "time", latn: "lat", lonn: "lon"})
+        df["time"] = pd.to_datetime(df["time"])
+        df["lat"] = pd.to_numeric(df["lat"], errors="coerce").round(2)
+        df["lon"] = pd.to_numeric(df["lon"], errors="coerce").round(2)
+        frames.append(df[["time", "lat", "lon", "cape"]])
+    if not frames:
+        return None
+    out = pd.concat(frames, ignore_index=True)
+    return out.drop_duplicates(subset=["time", "lat", "lon"])
+
+
 def fit_trigger_model(args, feats):
     """Fit the curated model on train-window spiral rows (tighten vs fizzle)."""
     F = [("time", "<=", pd.Timestamp(args.train_end))]
@@ -134,6 +172,18 @@ def score_stripes(args, feats, w, mu, sd):
         m = _area_mask(m, args.area)
         if m.empty:
             continue
+        if args.cape_nc_glob:
+            m["lat"] = pd.to_numeric(m["lat"], errors="coerce").round(2)
+            m["lon"] = pd.to_numeric(m["lon"], errors="coerce").round(2)
+            cp = _load_cape(args.cape_nc_glob, float(m["lat"].min()), float(m["lat"].max()))
+            if cp is None:
+                raise SystemExit(f"[genesis-trigger] --cape-nc-glob matched no usable "
+                                 f"CAPE files: {args.cape_nc_glob}")
+            before = len(m)
+            m = m.merge(cp, on=["time", "lat", "lon"], how="left")
+            if len(m) != before:
+                raise SystemExit("[genesis-trigger] CAPE join changed row count; "
+                                 "duplicate keys in the CAPE source.")
         X = m[feats].apply(pd.to_numeric, errors="coerce").to_numpy(float)
         fin = np.all(np.isfinite(X), axis=1)
         s = np.full(len(m), np.nan)
@@ -151,7 +201,8 @@ def score_stripes(args, feats, w, mu, sd):
             if len(v):
                 thr_samples.append(v.to_numpy(float))
             keep = list(dict.fromkeys(
-                KEY_COLS + ["prob_genesis", "acc24", "acc48"] + LABEL_COLS))
+                KEY_COLS + ["prob_genesis", "acc24", "acc48"] + LABEL_COLS
+                + (["cape"] if "cape" in sp.columns else [])))
             out_frames.append(sp[keep])
         print(f"[genesis-trigger] stripe {k}/{len(stripes)} ilat[{a},{b}) "
               f"rows={len(m):,} spiral={len(sp):,}")
@@ -180,6 +231,36 @@ def main() -> int:
     thr = float(np.quantile(fiz_vals, 1.0 - args.false_alarm))
     trig = pd.to_numeric(alerts[args.trigger_feature], errors="coerce")
     alerts["alert_genesis"] = ((trig >= thr).fillna(False)).astype("int8")
+
+    # ---- CAPE gate (opt-in) ----
+    # Cell-level, matched-alert-rate validation (eval_cape_gate_cells.py, 24 storms,
+    # season-blocked, strict genesis labels): a PERMISSIVE gate gives a small but
+    # robust precision gain (+0.008..+0.017, CI excludes 0 at every alert rate
+    # tested, c* = 30th pct of fit-season cape ~ 12 J/kg) at no lead cost.
+    # An AGGRESSIVE gate HURTS (c* = 70th pct ~ 370 J/kg: -0.06, CI excludes 0).
+    # Off by default because it needs a CAPE source the base pipeline does not build.
+    cape_info = {"cape_gate": bool(args.cape_min is not None or args.cape_min_quantile is not None)}
+    if cape_info["cape_gate"]:
+        if "cape" not in alerts.columns:
+            raise SystemExit("[genesis-trigger] CAPE gate requested but no 'cape' column; "
+                             "pass --cape-nc-glob or a labelled grid containing cape.")
+        cv = pd.to_numeric(alerts["cape"], errors="coerce")
+        if args.cape_min is not None:
+            c_star = float(args.cape_min)
+        else:
+            train_c = cv[alerts["time"] <= pd.Timestamp(args.train_end)].dropna()
+            c_star = float(train_c.quantile(args.cape_min_quantile))
+        n_before = int(alerts["alert_genesis"].sum())
+        alerts["alert_genesis"] = ((alerts["alert_genesis"] == 1)
+                                   & (cv >= c_star).fillna(False)).astype("int8")
+        n_after = int(alerts["alert_genesis"].sum())
+        cape_info.update({"cape_c_star": c_star,
+                          "cape_min_quantile": args.cape_min_quantile,
+                          "alerts_before_cape_gate": n_before,
+                          "alerts_after_cape_gate": n_after,
+                          "cape_coverage": float(cv.notna().mean())})
+        print(f"[genesis-trigger] CAPE gate cape>={c_star:.1f} J/kg: "
+              f"{n_before:,} -> {n_after:,} alerts (coverage {cv.notna().mean():.1%})")
 
     # shape diagnostics: is the signal building / still surging at alert time?
     alerts["build"] = (alerts["acc24"] - alerts["acc48"]).astype("float32")
@@ -232,6 +313,7 @@ def main() -> int:
         "n_alert_cells": n_alert, "n_spiral_rows": int(len(alerts)),
         "alert_near_storm_fraction": hit_rate,
         **shape_info,
+        **cape_info,
         **fit_info,
     }
     card_path = Path(args.model_card or (str(outp) + ".model_card.json"))
@@ -263,6 +345,14 @@ def parse_args():
                          "instantaneous trigger: under strict-genesis labels its precision gain is "
                          "+0.015 CI[-0.000,+0.029] (n.s.). It was only significant when alerts were "
                          "fired on acc48, which is itself unsupported.")
+    ap.add_argument("--cape-nc-glob", default=None,
+                    help="Glob of ERA5 CAPE netCDFs (e.g. 'data_era5/extracted/2025/**/"
+                         "era5_2025*_cape.nc'); joined per ilat stripe on (time,lat,lon).")
+    ap.add_argument("--cape-min", type=float, default=None,
+                    help="Absolute CAPE gate in J/kg. Validated permissive setting ~12 "
+                         "(+0.008..+0.017 precision, CI excludes 0). Aggressive gates hurt.")
+    ap.add_argument("--cape-min-quantile", type=float, default=None,
+                    help="CAPE gate as a quantile of train-window cape (0.30 validated).")
     ap.add_argument("--sustained-quantile", type=float, default=0.60,
                     help="acc48 quantile (among fired alerts) for the sustained-high backstop.")
     ap.add_argument("--l2", type=float, default=1.0)
