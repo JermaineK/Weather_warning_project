@@ -59,6 +59,10 @@ VAR_ALIASES = {
     "tp": "total_precipitation",
     "sshf": "surface_sensible_heat_flux",
     "slhf": "surface_latent_heat_flux",
+    # convective energy (tests the GSE "Energy" leg with real CAPE rather than
+    # the msl/t2m-derived E_energy proxy, which showed no discrimination)
+    "cape": "convective_available_potential_energy",
+    "cin":  "convective_inhibition",
     # pressure-level aliases (handy)
     "u": "u_component_of_wind",
     "v": "v_component_of_wind",
@@ -282,7 +286,7 @@ def main():
                 req["variable"] = job["vars"]
                 if job["kind"] == "pl":
                     req["pressure_level"] = job["levels"]
-                print("\n[dry-run]", job["kind"], "request JSON ↓")
+                print("\n[dry-run]", job["kind"], "request JSON")
                 print(json.dumps({"dataset": job["dataset"], "request": req}, indent=2))
             # Only first month for dry-run
             return
