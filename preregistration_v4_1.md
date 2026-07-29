@@ -161,4 +161,17 @@ operating point.
 
 ## Source file hash
 
-*(Added in the sealing commit that immediately follows this one.)*
+The V4.1 design rests on results and code below. `eval_lull_composite.py` is
+hashed specifically because the fixed values of `D` and `W` are justified from
+its output, so that justification cannot be silently revised.
+
+| file | SHA-256 |
+|---|---|
+| `eval_lull_composite.py` | `2c4b02a6c347f3f592fb46d6c85a974c49228b4660136cff028670556e794725` |
+| `v4_sector_detector.py` | `965a1df1f59dd449211ce97a089a4d52a3495c7078f91a87704437177aea9130` |
+| `geomval_seasons.py` | `831d1c7217267518da2ed56fc1ae5021f9c71de08018204ab19ef14f2f711280` |
+| `eval_multiseason_battery.py` | `6192415806ee8aca7720c54e4d00ae6e0f5be7c440d97788d258669cbcee6675` |
+| `eval_spiral_genesis.py` | `cc9ee70ec340b29a2e490f7f614d376c117d16372583aeb6959dbd47b9efed0e` |
+
+Fitted parameters will be hashed in `results/metrics/v4_1_params.json` at the
+freeze step, before any test-season evaluation.
