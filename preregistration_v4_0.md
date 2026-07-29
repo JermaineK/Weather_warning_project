@@ -160,4 +160,18 @@ and to reporting the number of contributing events at every operating point.
 
 ## Source file hash
 
-*(Added in the sealing commit that immediately follows this one.)*
+The V4.0 hypothesis rests on results produced by the scripts below. Their
+SHA-256 values are recorded so the evidence base is reproducible and cannot
+be silently revised after the fact.
+
+| file | SHA-256 |
+|---|---|
+| `eval_lull_composite.py` | `2c4b02a6c347f3f592fb46d6c85a974c49228b4660136cff028670556e794725` |
+| `eval_multiseason_battery.py` | `6192415806ee8aca7720c54e4d00ae6e0f5be7c440d97788d258669cbcee6675` |
+| `eval_calibration.py` | `58fd0bcb05268f4ed269b6390e21dc2f9620661349638773f2bdbf5f875c5af3` |
+| `geomval_seasons.py` | `831d1c7217267518da2ed56fc1ae5021f9c71de08018204ab19ef14f2f711280` |
+| `eval_spiral_genesis.py` | `cc9ee70ec340b29a2e490f7f614d376c117d16372583aeb6959dbd47b9efed0e` |
+
+Detector implementation and fitted parameters will be hashed separately in
+`results/metrics/v4_params.json` at the freeze step, before any test-season
+evaluation.
