@@ -130,4 +130,25 @@ More seasons fix small-N and selection bias. They do **not** fix:
 
 ## Source file hash
 
-*(Added in the sealing commit that immediately follows this one.)*
+The configuration under test and the code that will evaluate it are hashed so
+neither can be silently revised between this registration and the result.
+
+| file | SHA-256 |
+|---|---|
+| `v4_sector_detector.py` | `965a1df1f59dd449211ce97a089a4d52a3495c7078f91a87704437177aea9130` |
+| `v4_1_detector.py` | `77322bc866bf0f10f1dc487d89dc9910b08a9c2c33783dff0669267a7ef5d2ea` |
+| `eval_cape_gate_cells.py` | `283a5a9ee59aebcb2894d634311db2980b551e8a0043dd4e129dccdf78024dbc` |
+| `geomval_seasons.py` | `831d1c7217267518da2ed56fc1ae5021f9c71de08018204ab19ef14f2f711280` |
+| `eval_spiral_genesis.py` | `cc9ee70ec340b29a2e490f7f614d376c117d16372583aeb6959dbd47b9efed0e` |
+| `RECOMMENDED_CONFIGURATION.md` | `a552439b9e0bd5d2da28f9a10c344ed67c1760e630089e0ee88c41ef45b79e62` |
+
+Frozen V4.1 parameters carried over unchanged (`results/metrics/v4_1_params.json`, self_sha256 `d2b689e4dc310b34f1cb3d7854dd7a13c771c7008940bc408b4f413c7a12cda5`):
+
+```
+{
+  "c_star": 393.68124999999986,
+  "g_star": 0.005,
+  "h_star": 1.136738336086273
+}
+```
+
