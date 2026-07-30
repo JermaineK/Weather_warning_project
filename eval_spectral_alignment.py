@@ -41,6 +41,17 @@ PRE-STATED CRITERIA (fixed before the first run; see git history)
   strong ~24 h cycle, and the control composite exists to absorb it.
   INCONCLUSIVE if fewer than 10 events yield a usable detrended series.
 
+  BAND-EDGE RULE (added in V5.1, because V5.0 showed why it is needed).
+  The band is set by WINDOW LENGTH, never by where a signal appears: a window of
+  H hours resolves periods to ~H/2 (two cycles minimum). V5.0 used H=72 -> 6-36 h;
+  V5.1 uses H=120 -> 6-60 h. In V5.0 the excess power rose monotonically to the
+  36 h edge (+0.047 at 32 h -> +0.094 at 36 h) with 6/32 events peaking exactly at
+  the edge — the signature of power leaking in from OUTSIDE the band, so T1
+  "passed" on an artifact. From V5.1: if the strongest excess falls in the top 10%
+  of the band, or >25% of per-event peaks sit in the top bin, T1 is recorded as
+  OUT-OF-BAND (edge-pinned) and does NOT count toward SUPPORTED. Automatic, so the
+  failure mode cannot recur silently.
+
 USAGE
     python eval_spectral_alignment.py \\
         --panels "data/genesis_*_slim_cape.parquet" \\
@@ -70,7 +81,9 @@ from geomval_seasons import (load_storm_crops, read_tracks, resolve_files,    # 
                              genesis_events, add_strict_labels, haversine_km)
 
 CURATED = ["gka_shear_quench", "gka_msl_nd", "gka_SII", "gka_knee_ratio"]
-BAND_LO_H, BAND_HI_H = 6.0, 36.0     # resolvable band, fixed in advance
+BAND_LO_H_DEFAULT, BAND_HI_H_DEFAULT = 6.0, 60.0  # V5.1: window 120h -> ~H/2
+EDGE_FRAC = 0.10            # top 10% of the band counts as "edge"
+EDGE_PEAK_FRAC_MAX = 0.25   # >25% of per-event peaks in top bin -> edge-pinned
 DIURNAL_LO, DIURNAL_HI = 20.0, 28.0  # flagged as confound unless it beats control
 MIN_EVENTS = 10
 DETREND_ORDER = 2
@@ -141,6 +154,10 @@ def main() -> int:
             d["s"] = sc
             scored[k] = {"df": d, "season": s}
 
+    BAND_LO_H, BAND_HI_H = float(a.band_lo), float(a.band_hi)
+    if BAND_HI_H > a.back_h / 2.0 + 1e-9:
+        raise SystemExit(f'[spectral] band_hi {BAND_HI_H:.0f}h exceeds back_h/2 '
+                         f'({a.back_h/2:.0f}h): fewer than 2 cycles in window.')
     periods = np.linspace(BAND_LO_H, BAND_HI_H, a.n_periods)
     rows, spec_pre, spec_ctl = [], [], []
 
@@ -194,7 +211,8 @@ def main() -> int:
     res = pd.DataFrame(rows)
     Sp = np.vstack(spec_pre); Sc = np.vstack(spec_ctl)
     rng = np.random.default_rng(0)
-    print(f"[spectral] {len(res)} events, band {BAND_LO_H:.0f}-{BAND_HI_H:.0f}h, "
+    print(f"[spectral] {len(res)} events, window {a.back_h:.0f}h, "
+          f"band {BAND_LO_H:.0f}-{BAND_HI_H:.0f}h, "
           f"{a.n_periods} period bins, detrend order {DETREND_ORDER}")
 
     # ---- T1: excess power vs control, per period ----
@@ -206,13 +224,28 @@ def main() -> int:
                         "significant": bool(np.isfinite(lo) and lo > 0)})
     t1 = pd.DataFrame(t1_rows)
     sig = t1[t1["significant"]]
-    T1 = bool(len(sig))
-    print(f"\n[T1] excess power vs control: "
-          f"{'PASS' if T1 else 'FAIL'} ({len(sig)}/{len(t1)} period bins significant)")
-    if T1:
-        b = sig.sort_values("excess_mean", ascending=False).iloc[0]
-        print(f"     strongest: {b.period_h:.1f}h  excess={b.excess_mean:+.4f} "
-              f"[{b.ci_lo:+.4f},{b.ci_hi:+.4f}]")
+    edge_lo = BAND_HI_H - EDGE_FRAC * (BAND_HI_H - BAND_LO_H)
+    top_bin = float(periods[-1])
+    peak_at_edge_frac = float((res["peak_period_h"] >= top_bin - 1e-6).mean())
+    strongest = (sig.sort_values("excess_mean", ascending=False).iloc[0]
+                 if len(sig) else None)
+    edge_pinned = bool((strongest is not None and strongest.period_h >= edge_lo)
+                       or peak_at_edge_frac > EDGE_PEAK_FRAC_MAX)
+    T1 = bool(len(sig)) and not edge_pinned
+    label = ("PASS" if T1 else
+             ("OUT-OF-BAND (edge-pinned)" if (edge_pinned and len(sig)) else "FAIL"))
+    print(f"\n[T1] excess power vs control: {label} "
+          f"({len(sig)}/{len(t1)} period bins significant)")
+    if strongest is not None:
+        print(f"     strongest: {strongest.period_h:.1f}h  "
+              f"excess={strongest.excess_mean:+.4f} "
+              f"[{strongest.ci_lo:+.4f},{strongest.ci_hi:+.4f}]")
+    print(f"     edge check: edge zone >= {edge_lo:.1f}h; {peak_at_edge_frac:.0%} of "
+          f"per-event peaks in top bin (limit {EDGE_PEAK_FRAC_MAX:.0%}) -> "
+          f"{'EDGE-PINNED' if edge_pinned else 'in-band'}")
+    if edge_pinned:
+        print("     => power is leaking from periods BEYOND the band; T1 does NOT "
+              "count toward SUPPORTED. A longer window is required to test it.")
 
     # ---- T2: clustering of per-event peak periods ----
     pk = res["peak_period_h"].to_numpy(float)
@@ -264,8 +297,12 @@ def main() -> int:
          "diurnal_peak_fraction": peaks_in_diurnal,
          "diurnal_excess_significant": diurnal_sig,
          "verdict": verdict,
-         "out_of_band_note": "periods > 36h are not resolvable in a 72h window and "
-                             "were not tested"}, indent=2, default=str))
+         "window_h": float(a.back_h),
+         "T1_edge_pinned": bool(edge_pinned),
+         "peak_at_edge_fraction": peak_at_edge_frac,
+         "edge_zone_from_h": float(edge_lo),
+         "out_of_band_note": (f"periods > {BAND_HI_H:.0f}h are not resolvable in a "
+                              f"{a.back_h:.0f}h window and were not tested")}, indent=2, default=str))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.8), dpi=120)
     ax1.plot(t1.period_h, Sp.mean(0), "-", color="#c1121f", lw=2, label="pre-genesis")
@@ -290,8 +327,13 @@ def parse_args():
     ap.add_argument("--genesis-thresh-kt", type=float, default=34.0)
     ap.add_argument("--genesis-radius", type=float, default=3.0)
     ap.add_argument("--control-radius", type=float, default=5.0)
-    ap.add_argument("--back-h", type=float, default=72.0)
-    ap.add_argument("--n-periods", type=int, default=31)
+    ap.add_argument("--back-h", type=float, default=120.0,
+                    help="Lookback window; sets the resolvable band (~H/2).")
+    ap.add_argument("--band-lo", type=float, default=BAND_LO_H_DEFAULT)
+    ap.add_argument("--band-hi", type=float, default=BAND_HI_H_DEFAULT,
+                    help="Upper band edge; must be <= back_h/2. Set by window "
+                         "length, never chosen from results.")
+    ap.add_argument("--n-periods", type=int, default=37)
     ap.add_argument("--min-cells", type=int, default=20)
     ap.add_argument("--pre-h", type=float, default=120.0)
     ap.add_argument("--pad-deg", type=float, default=6.0)
