@@ -21,10 +21,11 @@ WHY THIS IS NOT ALREADY ANSWERED
 
 PRE-STATED CRITERIA (fixed before the first run; see git history)
 
-  Resolvable band. A 72 h window at 1 h resolution resolves periods ~6-36 h.
-  Periods > 36 h are indistinguishable from the trend and are NOT tested. If the
-  hypothesis predicts alignment gaps > 36 h at storm scale, THIS DATA CANNOT TEST
-  IT and the result must be reported as out-of-band, not as a null.
+  Resolvable band. Determined by the lookback window (--back-h) at 1 h resolution:
+  periods up to ~H/2 (two cycles minimum), enforced in code. Periods beyond the
+  band are indistinguishable from the trend and are NOT tested — if the hypothesis
+  predicts alignment gaps beyond the band, THIS DATA CANNOT TEST IT and the result
+  must be reported as out-of-band, never as a null. See the BAND-EDGE RULE below.
 
   T1 EXCESS POWER — pre-genesis periodogram power exceeds the matched control's at
      some period in band, bootstrap-over-events 95% CI excluding zero.
