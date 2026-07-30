@@ -94,8 +94,12 @@ comparison is:
 The recommended configuration fires **later** because its score threshold (90th
 percentile of fit-season `G`) is high, so it triggers closer to formation. The
 lead difference is a consequence of threshold placement, not of the CAPE gate
-itself. **A like-for-like comparison at matched precision or matched lead has not
-been run** and would be needed to state the trade precisely.
+itself — confirmed in §2b, where holding the alert rate fixed leaves the gate's
+lead effect at +0.2 to +0.7 h.
+
+A **matched-alert-rate** comparison has now been run (§2b). Comparisons at
+**matched precision** or **matched lead** have not, and would be needed to state
+the precision/lead trade with full precision.
 
 ---
 
