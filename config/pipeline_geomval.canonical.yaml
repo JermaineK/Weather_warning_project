@@ -1,0 +1,115 @@
+run_name: geomval_demo
+workdir: .
+table_format: parquet
+force_keep_quantile: 1.0
+defaults:
+  start: '2025-02-01'
+  end: '2025-05-01'
+  hours: 0..23
+  normalize_lon: -180..180
+  area: -5,125,-35,175
+fetch:
+  enabled: true
+  steps:
+  - mode: ibtracs
+    enabled: true
+    start: '2025-02-01'
+    end: '2025-05-01'
+    area: -5,125,-35,175
+    normalize_lon: -180..180
+    out: data/tracks/tracks_geomval.parquet
+  - mode: era5
+    enabled: false
+    start: '2025-02-01'
+    end: '2025-05-01'
+    hours: 0..23
+    area: -5,125,-35,175
+    vars: u10 v10 msl t2m
+    target_dir: data_era5/extracted
+    suffix: oper
+    overwrite: false
+features:
+  enabled: false
+  steps: []
+data_stage:
+  enabled: false
+  steps: []
+alerts_logic:
+  enabled: true
+  steps:
+  - mode: genesis-trigger
+    enabled: true
+    labelled: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+    out: results/alerts/alerts_geomval_demo_final.parquet
+    model_card: results/alerts/alerts_geomval_demo_model_card.json
+    train_end: '2025-03-31'
+    start: '2025-02-01'
+    end: '2025-05-01'
+    area: -5,125,-35,175
+    features: gka_shear_quench,gka_msl_nd,gka_SII,gka_knee_ratio
+    trigger_feature: acc48
+    false_alarm: 0.1
+    shape_filter: build-or-sustained
+    sustained_quantile: 0.6
+    stripes: 12
+    overwrite: true
+    skip_if_exists: false
+eval:
+  enabled: true
+  steps:
+  - mode: genesis-skill
+    enabled: true
+    labelled: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+    tracks: data/tracks/tracks_geomval.parquet
+    run_name: geomval_demo
+    out: results/metrics/geomval_demo_genesis_skill.csv
+    leads: 6,12,24,36,48
+    n_boot: 2000
+    skip_if_exists: true
+  - mode: per-storm
+    enabled: true
+    matches: results/seedmaps/geomval_demo_seed_track_matches.csv
+    ibtracs: data/tracks/tracks_geomval.parquet
+    normalize_lon: -180..180
+    area: -5,125,-35,175
+    out_dir: results/per_storm_geomval
+    out: results/per_storm_geomval/per_storm_index.csv
+    save_per_storm_csv: true
+seeds:
+  enabled: true
+  from_alerts:
+    enabled: true
+    alerts: results/alerts/alerts_geomval_demo_final.parquet
+    prob_col: prob_genesis
+    flag_col: alert_genesis
+    run_name: geomval_demo
+    normalize_lon: -180..180
+    area: -5,125,-35,175
+    out_dir: results/seedmaps
+    chunk_rows: 400000
+    write_parquet: true
+  starts:
+    enabled: true
+    seeds: results/seedmaps/geomval_demo_union_byhour.csv
+    tracks: data/tracks/tracks_geomval.parquet
+    out_dir: results/seedmaps
+    run_name: geomval_demo
+    normalize_lon: -180..180
+    area: -5,125,-35,175
+    radius_deg: 4.0
+    time_tol_hours: 18
+    min_run_hours: 30
+    save_parquet: true
+    chunk_rows: 400000
+  outcomes:
+    enabled: true
+    seeds: results/seedmaps/geomval_demo_union_byhour.csv
+    ibtracs: data/tracks/tracks_geomval.parquet
+    run_name: geomval_demo
+    out_dir: results/seedmaps
+    normalize_lon: -180..180
+    lookahead_hours: 120
+    chunk_rows: 400000
+    structure_radius_km: 50
+    points_format: both
+    flag_col: any_alert

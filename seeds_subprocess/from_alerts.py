@@ -225,8 +225,8 @@ def main():
         pd.DataFrame(columns=["time","lat","lon","prob_max","any_alert","n_hits"]).to_csv(union_path, index=False)
         pd.DataFrame(columns=["lat","lon","time_start"]).to_csv(starts_path, index=False)
         if args.write_parquet:
-            pd.DataFrame(columns=["time","lat","lon","prob_max","any_alert","n_hits"]).to_parquet(str(union_path)+".parquet", index=False)
-            pd.DataFrame(columns=["lat","lon","time_start"]).to_parquet(str(starts_path)+".parquet", index=False)
+            pd.DataFrame(columns=["time","lat","lon","prob_max","any_alert","n_hits"]).to_parquet(union_path.with_suffix(".parquet"), index=False)
+            pd.DataFrame(columns=["lat","lon","time_start"]).to_parquet(starts_path.with_suffix(".parquet"), index=False)
         print(f"[write] {union_path} rows=0")
         print(f"[write] {starts_path} rows=0")
         return
@@ -304,8 +304,9 @@ def main():
     starts.to_csv(out_starts, index=False, date_format="%Y-%m-%d %H:%M:%S")
 
     if args.write_parquet:
-        agg.to_parquet(str(out_union) + ".parquet", index=False)
-        starts.to_parquet(str(out_starts) + ".parquet", index=False)
+        # canonical sibling names (<stem>.parquet) so table_format contracts resolve
+        agg.to_parquet(Path(out_union).with_suffix(".parquet"), index=False)
+        starts.to_parquet(Path(out_starts).with_suffix(".parquet"), index=False)
 
     print(f"[write] {out_union} rows={len(agg)}")
     print(f"[write] {out_starts} rows={len(starts)}")

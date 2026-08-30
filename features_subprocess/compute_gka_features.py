@@ -5,10 +5,23 @@ compute_gka_features.py — alias-aware, CSV/Parquet compatible, memory-safe η
 
 Adds classic light-form GKA features and first-order geometric-kernel responses.
 
+Features produced
+-----------------
+  gka_kappa       : curvature proxy (zeta)
+  gka_tau         : torsion proxy (-div)
+  gka_parity_eta  : rolling sign(zeta) mean per grid cell (parity-odd local η)
+  gka_A_overlap   : agreement/overlap proxy
+  gka_F           : freedom-of-movement (logistic squash of shear z-score)
+  gka_phi         : composite Φ = (1/(|relax|+ε)) · agree / (V_ζ+ε), robust-scaled
+                    (V_ζ = 7-step centered rolling variance of zeta per (lat,lon), min_periods=3)
+  gka_msl_nd      : MSL dimensionless (median/MAD)
+  gka_knee_ratio  : S / S3 or S / median(S)
+  gka_chirality, gka_Q, gka_dir_var, gka_vortdiv_ratio, gka_SAI, gka_SII
+
 Highlights:
   • Streams CSV (.csv/.csv.gz) in chunks; handles Parquet in-memory.
   • Verbose error reporting with tracebacks.
-  • Robust alias binding for columns (u/v/zeta/div/msl/S/S3/etc).
+  • Robust alias binding for columns (u/v/zeta/div/msl/relax/S/S3/etc).
   • Memory-safe parity-eta using integer keys (prefers ilat/ilon when present).
   • Guards: --disable-eta, --eta-max-rows, --eta-window.
 
@@ -48,7 +61,7 @@ except Exception:
 
 NEW_COLS = [
     "gka_kappa","gka_tau","gka_parity_eta","gka_A_overlap",
-    "gka_F","gka_msl_nd","gka_knee_ratio",
+    "gka_F","gka_phi","gka_msl_nd","gka_knee_ratio",
     "gka_chirality","gka_Q","gka_dir_var","gka_vortdiv_ratio",
     "gka_SAI","gka_SII",
 ]
@@ -60,6 +73,7 @@ ALIASES: Dict[str, List[str]] = {
     "div":  ["div", "div_mean"],
     "msl":  ["msl", "mean_sea_level_pressure", "MSL", "mslp"],
     "agree":["agree", "agreement", "overlap"],
+    "relax":["relax", "relaxation", "relax_rate"],
     "shear":["shear", "shear_proxy", "sh", "shear10_def"],
     "S":    ["S"],
     "S3":   ["S3", "S_mean3h"],
@@ -114,7 +128,7 @@ def _robust01(arr: np.ndarray, q_low: float = 0.05, q_high: float = 0.95) -> np.
 
 def print_bindings(bind: Dict[str, Optional[str]]):
     print("\n[GKA] Column bindings:")
-    for k in ("S","S3","agree","div","msl","shear","u","v","zeta"):
+    for k in ("S","S3","agree","div","msl","relax","shear","u","v","zeta"):
         v = bind.get(k)
         print(f"  {k:5s} ->  {v if v else '(missing)'}")
 
@@ -181,6 +195,29 @@ def _roll_group_eta(sign_series: pd.Series,
     return m.to_numpy()
 
 
+def _roll_group_var(value_series: pd.Series,
+                    lat: pd.Series,
+                    lon: pd.Series,
+                    ilat: Optional[pd.Series] = None,
+                    ilon: Optional[pd.Series] = None,
+                    window: int = 7) -> np.ndarray:
+    """Rolling variance of values per (lat,lon) group, centered window, min_periods=3.
+
+    NaN variance (e.g. single-point groups) is filled with 0.
+    """
+    keys = _group_codes(lat, lon, ilat=ilat, ilon=ilon)
+    s = pd.Series(value_series.to_numpy(), index=np.arange(len(value_series)))
+    v = (
+        s.groupby(keys, sort=False)
+         .rolling(window, min_periods=3, center=True)
+         .var()
+         .reset_index(level=0, drop=True)
+    )
+    arr = v.to_numpy()
+    arr = np.where(np.isfinite(arr), arr, 0.0)
+    return arr
+
+
 # ---------------- feature computation ----------------
 
 def _compute_chunk_features(df: pd.DataFrame,
@@ -200,6 +237,7 @@ def _compute_chunk_features(df: pd.DataFrame,
     zeta  = _pick_series(out, bind, "zeta")
     divv  = _pick_series(out, bind, "div")
     agree = _pick_series(out, bind, "agree")
+    relax = _pick_series(out, bind, "relax")
     msl   = _pick_series(out, bind, "msl")
     shear = _pick_series(out, bind, "shear")
     S     = _pick_series(out, bind, "S")
@@ -261,6 +299,29 @@ def _compute_chunk_features(df: pd.DataFrame,
         out["gka_F"] = 1/(1+np.exp(z))
     else:
         out["gka_F"] = 0.0
+
+    # 4b) composite Phi: (1/(|relax|+1e-6)) * agree / (V_zeta + 1e-6), robust-scaled
+    if relax is None:
+        print("[GKA] warning: 'relax' column not found; gka_phi set to NaN", file=sys.stderr)
+        out["gka_phi"] = np.nan
+    else:
+        r_arr = _safe_num(relax).to_numpy(float)
+        a_arr = _safe_num(agree).to_numpy(float) if agree is not None else np.zeros(len(out), dtype=float)
+        zeta_for_var = zeta
+        if zeta_for_var is not None:
+            v_zeta = _roll_group_var(
+                _safe_num(zeta_for_var),
+                out["lat"], out["lon"],
+                out["ilat"] if "ilat" in out.columns else None,
+                out["ilon"] if "ilon" in out.columns else None,
+                window=7,
+            )
+        else:
+            v_zeta = np.zeros(len(out), dtype=float)
+        phi_raw = (1.0 / (np.abs(r_arr) + 1e-6)) * a_arr / (v_zeta + 1e-6)
+        phi_med = np.nanmedian(phi_raw)
+        phi_mad = np.nanmean(np.abs(phi_raw - phi_med)) + 1e-6
+        out["gka_phi"] = (phi_raw - phi_med) / phi_mad
 
     # 5) msl dimensionless (median/MAD)
     if msl is not None:

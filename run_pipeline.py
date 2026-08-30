@@ -3490,6 +3490,55 @@ def run_misc(sec: Dict[str, Any]) -> None:
             health_ok,
         )
 
+# ---------------- phi-eval hook ----------------
+
+def _run_phi_eval(features_sec: Dict[str, Any]) -> None:
+    """Run eval_phi_threshold.py on the GKA features output after the features stage."""
+    # Find the GKA step output: look for step mode containing 'gka' first,
+    # then fall back to the last step with any resolvable output path.
+    gka_out: Path | None = None
+    steps = [s for s in features_sec.get("steps", []) if s is not None]
+    for step in steps:
+        mode = str(step.get("mode", ""))
+        if "gka" in mode.lower():
+            p = _candidate_out_path(step)
+            if p:
+                gka_out = p
+                break
+    if gka_out is None:
+        for step in reversed(steps):
+            p = _candidate_out_path(step)
+            if p:
+                gka_out = p
+                break
+
+    if gka_out is None or not gka_out.exists():
+        print(
+            f"[phi-eval] cannot locate GKA output file "
+            f"(resolved={gka_out}); skipping --run-phi-eval.",
+            file=sys.stderr,
+        )
+        return
+
+    eval_script = HERE / "eval_phi_threshold.py"
+    if not eval_script.exists():
+        print(f"[phi-eval] eval_phi_threshold.py not found at {eval_script}; skipping.", file=sys.stderr)
+        return
+
+    out_dir = gka_out.parent / "phi_eval"
+    cmd = [
+        sys.executable, str(eval_script),
+        "--infile",   str(gka_out),
+        "--out-dir",  str(out_dir),
+        "--label-col", "pregen",
+        "--lead-window", "24,48",
+        "--train-end",   "2025-03-31",
+        "--n-boot",      "1000",
+    ]
+    print(f"\n[phi-eval] running phi threshold evaluation on {gka_out}")
+    sh(cmd, check=False)
+
+
 # ---------------- main ----------------
 
 SECTION_ORDER = [
@@ -3570,6 +3619,12 @@ def main() -> int:
         "--sections",
         default=",".join(SECTION_ORDER),
         help=f"Comma list to limit which sections run, in order. Default: {','.join(SECTION_ORDER)}"
+    )
+    ap.add_argument(
+        "--run-phi-eval",
+        action="store_true",
+        default=False,
+        help="After the GKA features step, run eval_phi_threshold.py on the produced labelled grid.",
     )
     ns = ap.parse_args()
 
@@ -3756,6 +3811,8 @@ def main() -> int:
 
     if "fetch" in order:        run_fetch(cfg.get("fetch", {}))
     if "features" in order:     run_features(cfg.get("features", {}))
+    if ns.run_phi_eval and "features" in order:
+        _run_phi_eval(cfg.get("features", {}))
     if "data_stage" in order:   run_data_stage(cfg.get("data_stage", {}))
     if "training" in order:     run_training(cfg.get("training", {}))
     if "sweep" in order:        run_sweep(cfg.get("sweep", {}))

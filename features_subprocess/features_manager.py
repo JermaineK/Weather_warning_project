@@ -37,6 +37,7 @@ HERE = Path(__file__).resolve().parent
 # --------------------------------------------------------------------
 ROUTING: Dict[str, str] = {
     "build":              "build_features_grid.py",
+    "storm-window-subset": "storm_window_subset.py",
     "patch":              "features_patch.py",
     "gka":                "compute_gka_features.py",
     "gka-ms":             "compute_gka_multiscale.py",
@@ -61,6 +62,7 @@ ROUTING: Dict[str, str] = {
 FLAG_MAPS: Dict[str, Dict[str, str]] = {
     # Most other tools already speak kebab; no rewrites needed.
     "build": {},
+    "storm-window-subset": {},
     "patch": {},
     "gka": {},
     "gka-ms": {},

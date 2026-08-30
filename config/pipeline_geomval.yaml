@@ -1,0 +1,167 @@
+# =====================================================================
+# pipeline_geomval.yaml — spiral-conditioned genesis trigger pipeline
+#
+# Purpose: run the validated geom-val early-warning trigger end-to-end for a
+# configurable AREA and TIME PERIOD, then map the resulting alert cells/seeds
+# and report their effectiveness against IBTrACS.
+#
+# Flow:
+#   fetch(ibtracs)  ->  [features chain: enable for a NEW area/period]
+#   alerts_logic.genesis-trigger : labelled grid -> alert cells + model card
+#   eval.genesis-skill           : LOSO validation metrics (json/csv/png)
+#   seeds.from_alerts/starts/outcomes : seed maps + conversion/effectiveness
+#
+# To retarget area/period: change the anchors below, set fetch era5 steps and
+# features/data_stage enabled: true (ERA5 download + feature build is hours of
+# compute), then rerun. With existing artifacts the run starts at alerts_logic.
+# =====================================================================
+run_name: geomval_demo
+workdir: .
+table_format: parquet
+force_keep_quantile: 1.0
+
+defaults:
+  start: &start "2025-02-01"
+  end:   &end   "2025-05-01"
+  hours: &hours "0..23"
+  normalize_lon: &norm "-180..180"
+  area: &area "-5,125,-35,175"    # latN,lonW,latS,lonE
+
+# ---------------------------------------------------------------------
+# 0) Fetch — ibtracs is cheap (cached CSV) and keeps tracks in sync with
+#    the anchors; ERA5 steps only needed for a NEW area/period.
+# ---------------------------------------------------------------------
+fetch:
+  enabled: true
+  steps:
+    - mode: ibtracs
+      enabled: true
+      start: *start
+      end: *end
+      area: *area
+      normalize_lon: *norm
+      out: data/tracks/tracks_geomval.parquet
+
+    - mode: era5
+      enabled: false            # enable for a new area/period
+      start: *start
+      end: *end
+      hours: *hours
+      area: *area
+      vars: "u10 v10 msl t2m"
+      target_dir: data_era5/extracted
+      suffix: oper
+      overwrite: false
+
+# ---------------------------------------------------------------------
+# 1) Features — full chain lives in config/pipeline.yaml; disabled here
+#    because the labelled grid already exists for the default domain.
+#    For a new area/period run pipeline.yaml features+data_stage first
+#    (or copy those sections here) to rebuild:
+#      data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+# ---------------------------------------------------------------------
+features:
+  enabled: false
+  steps: []
+
+data_stage:
+  enabled: false
+  steps: []
+
+# ---------------------------------------------------------------------
+# 2) Genesis trigger -> alert cells (standard alerts schema)
+# ---------------------------------------------------------------------
+alerts_logic:
+  enabled: true
+  steps:
+    - mode: genesis-trigger
+      enabled: true
+      labelled: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+      out: results/alerts/alerts_geomval_demo_final.parquet
+      model-card: results/alerts/alerts_geomval_demo_model_card.json
+      train-end: "2025-03-31"
+      start: *start
+      end: *end
+      area: *area
+      features: "gka_shear_quench,gka_msl_nd,gka_SII,gka_knee_ratio"
+      # Instantaneous score. Strict-genesis, leave-one-season-out validation over
+      # 24 storms / 5 seasons found trailing accumulation gives no advantage at any
+      # lead, and the shape filter is n.s. under instantaneous firing.
+      trigger-feature: prob_genesis
+      false-alarm: 0.10
+      shape-filter: none
+      stripes: 12
+      overwrite: true
+      skip_if_exists: false
+
+# ---------------------------------------------------------------------
+# 3) LOSO skill validation of the trigger
+# ---------------------------------------------------------------------
+eval:
+  enabled: true
+  steps:
+    - mode: genesis-skill
+      enabled: true
+      labelled: data/grid_labelled_FMA_gka_realthermo_sph_ms_id.parquet
+      tracks: data/tracks/tracks_geomval.parquet
+      run-name: geomval_demo
+      out: results/metrics/geomval_demo_genesis_skill.csv
+      leads: "6,12,24,36,48"
+      n-boot: 2000
+      skip_if_exists: true    # LOSO is deterministic; skip when output exists
+
+    # Per-storm map overlays from the seed/track matches
+    - mode: per-storm
+      enabled: true
+      matches: results/seedmaps/geomval_demo_seed_track_matches.csv
+      ibtracs: data/tracks/tracks_geomval.parquet
+      normalize-lon: *norm
+      area: *area
+      out-dir: results/per_storm_geomval
+      out: results/per_storm_geomval/per_storm_index.csv
+      save-per-storm-csv: true
+
+# ---------------------------------------------------------------------
+# 4) Seed maps + effectiveness vs IBTrACS (existing machinery)
+# ---------------------------------------------------------------------
+seeds:
+  enabled: true
+  from_alerts:
+    enabled: true
+    alerts: results/alerts/alerts_geomval_demo_final.parquet
+    prob-col: prob_genesis
+    flag-col: alert_genesis
+    run-name: geomval_demo
+    normalize-lon: *norm
+    area: *area
+    out-dir: results/seedmaps
+    chunk-rows: 400000
+    write-parquet: true
+  starts:
+    enabled: true
+    seeds: results/seedmaps/geomval_demo_union_byhour.csv
+    tracks: data/tracks/tracks_geomval.parquet
+    out-dir: results/seedmaps
+    run-name: geomval_demo
+    normalize-lon: *norm
+    area: *area
+    radius-deg: 4.0
+    time-tol-hours: 18
+    min-run-hours: 30
+    save-parquet: true
+    chunk-rows: 400000
+  outcomes:
+    enabled: true
+    seeds: results/seedmaps/geomval_demo_union_byhour.csv
+    ibtracs: data/tracks/tracks_geomval.parquet
+    run-name: geomval_demo
+    out-dir: results/seedmaps
+    normalize-lon: *norm
+    lookahead-hours: 120
+    chunk-rows: 400000
+    structure-radius-km: 50
+    points-format: both
+    flag-col: any_alert     # gate conversion/outcomes to FIRED alerts, not the whole union
+
+# report bundle intentionally omitted: it depends on the viability stack.
+# Genesis maps/GIFs: python viz_genesis_hotspot.py --grid <labelled> --tracks <tracks> ...

@@ -110,6 +110,7 @@ HERE = Path(__file__).resolve().parent
 SCRIPT_MAP: Dict[str, str] = {
     # Core evals
     "viability-leads":  "eval_viability_leads.py",
+    "genesis-skill":     "eval_genesis_skill.py",
     "hits":              "eval_alert_hits.py",
     "leadtime":          "eval_leadtime_grid.py",
     "leadtime-progress": "eval_leadtime_grid_progress.py",
@@ -199,7 +200,12 @@ def _apply_run_defaults(tool: str, run_name: str | None, extra: list[str]) -> li
             return
         out.extend([flag, *map(str, vals)])
 
-    if tool == "viability-leads":
+    if tool == "genesis-skill":
+        ensure("--run-name", run_name)
+        if not _has_flag(out, "--out"):
+            ensure("--out", f"results/metrics/{run_name}_genesis_skill.csv")
+
+    elif tool == "viability-leads":
         ensure("--panel", "data/grid_train_gse_panel_targets.parquet")
         ensure("--model", "models/viability_model.pkl")
         ensure("--model-metrics", "models/viability_model_metrics.json")
