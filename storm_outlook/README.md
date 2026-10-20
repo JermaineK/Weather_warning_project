@@ -21,7 +21,7 @@ Free for non-commercial use under the [PolyForm Noncommercial License 1.0.0](LIC
 Overall, in 2017–19 forecasts the outlook alerted **84.9% of storms at least a day ahead** (just short of the 85% target set before the alert level was chosen; no tested level met it), with about 330 false-alarm regions per January–September season worldwide. Official outlooks are considerably more accurate. The first fully independent check is October–December 2026.
 
 ## How it works
-1. Downloads 35 fields from the **NOAA GEFS v12 control forecast** (00 UTC; 3, 24, 48, 96, 120 h) by HTTP byte range from NOAA's free public bucket: about 25 MB and 25 s per day.
+1. Downloads 35 fields from the **NOAA GEFS v12 control forecast** (00 UTC; 3, 24, 48, 96, 120 h) by HTTP byte range from NOAA's free public bucket: about 6 MB and 25 s per day.
 2. Computes 33 features at 2,301 ocean points:
    - low-level spin;
    - deep wind shear;
