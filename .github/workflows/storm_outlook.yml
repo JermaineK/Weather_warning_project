@@ -1,0 +1,43 @@
+# Daily storm formation outlook. Runs after the 00 UTC GEFS forecast is complete and publishes
+# the map to the 'outlook-site' branch (enable GitHub Pages on that branch).
+name: storm-outlook
+on:
+  schedule:
+    - cron: "40 6 * * *"      # 06:40 UTC daily
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency: storm-outlook
+jobs:
+  outlook:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: storm_outlook
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libeccodes-dev
+          pip install -q -r storm_outlook/requirements.txt
+      - name: Previous output (keeps region ages)
+        run: |
+          if git ls-remote --exit-code --heads origin outlook-site; then
+            git clone -q --depth 1 --branch outlook-site "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" site_out
+          else
+            mkdir site_out && git -C site_out init -q -b outlook-site
+          fi
+      - name: Run outlook
+        run: |
+          cp storm_outlook/site/index.html site_out/
+          python storm_outlook/outlook.py --out site_out
+      - name: Publish
+        run: |
+          cd site_out
+          git config user.name "storm-outlook-bot"; git config user.email "storm-outlook-bot@users.noreply.github.com"
+          git add -A && git commit -q -m "outlook $(date -u +%F)" || echo "no change"
+          git push -q "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:outlook-site

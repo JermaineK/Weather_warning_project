@@ -1,0 +1,84 @@
+{
+ "version": "1.0.0 (frozen 2026-10-20)",
+ "platt": {
+  "y03": [
+   -0.25326804220870597,
+   0.8904674128092487
+  ],
+  "y45": [
+   -0.5888666090079945,
+   0.8594624074070486
+  ]
+ },
+ "gate_reach": 1e-06,
+ "storm_mask_deg": 5.0,
+ "storm_min_kt": 34.0,
+ "neighbour_offsets": {
+  "bands": [
+   [
+    5,
+    6
+   ],
+   [
+    6,
+    7
+   ],
+   [
+    7,
+    8
+   ],
+   [
+    8,
+    10
+   ]
+  ],
+  "logodds": [
+   -1.9987221107288367,
+   -1.3312033930383713,
+   -0.9423433662943215,
+   -0.5877986761721508
+  ]
+ },
+ "alert_mask_deg": 10.0,
+ "west_poleward": {
+  "min_kt": 50.0,
+  "r_min_km": 800.0,
+  "r_max_km": 2500.0
+ },
+ "alert_point": {
+  "p03": 0.05,
+  "p45": 0.02,
+  "scale": 1.0
+ },
+ "cluster": {
+  "min_points": 6,
+  "min_age_days": 3,
+  "link_deg": 5.0
+ },
+ "levels": {
+  "orange": {
+   "min_points": 12,
+   "min_age_days": 5
+  },
+  "red": {
+   "min_points": 25,
+   "min_age_days": 8,
+   "min_peak_p03": 0.35
+  }
+ },
+ "verification_2017_2019": {
+  "storms_alerted_24h": 0.849,
+  "false_alarm_regions_per_season": 328,
+  "became_storm": {
+   "yellow": 0.4,
+   "orange": 0.52,
+   "red": 0.82
+  },
+  "note": "Operating point s=1 is the closest scanned value to the pre-registered target (>=85% of storms alerted >=24 h ahead); it reaches 84.9%, just below the target, and no scanned value met it (see OPERATING_POINT_PREREG.md)."
+ },
+ "sources": {
+  "gefs": "https://noaa-gefs-pds.s3.amazonaws.com",
+  "tcvitals": "https://noaa-gfs-bdp-pds.s3.amazonaws.com",
+  "ibtracs_active": "https://www.ncei.noaa.gov/data/international-best-track-archive-for-climate-stewardship-ibtracs/v04r01/access/csv/ibtracs.ACTIVE.list.v04r01.csv"
+ }
+}

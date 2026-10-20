@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storm formation outlook (experimental)</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+ body{margin:0;font:14px/1.4 system-ui,sans-serif} #map{position:absolute;top:64px;bottom:0;width:100%}
+ header{height:64px;padding:6px 12px;box-sizing:border-box;background:#1f2d3d;color:#fff}
+ header b{font-size:16px} header small{display:block;opacity:.85}
+ .legend{background:#fff;padding:6px 8px;border-radius:4px;line-height:1.5}
+ .sw{display:inline-block;width:12px;height:12px;margin-right:6px;vertical-align:-1px}
+</style>
+</head>
+<body>
+<header><b>Storm formation outlook</b> <span id="issued"></span>
+<small>Experimental research product, not an official warning. Follow your national meteorological service. Where new tropical cyclones may form in the next 5 days.</small></header>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map=L.map('map',{worldCopyJump:true}).setView([10,150],3);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:7,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+const col={yellow:'#f2c400',orange:'#ef7d00',red:'#d62728'};
+const rate={yellow:'about 4 in 10',orange:'about 5 in 10',red:'about 8 in 10'};
+fetch('outlook.geojson',{cache:'no-store'}).then(r=>r.json()).then(g=>{
+  document.getElementById('issued').textContent='— issued '+g.issued+' (storm positions: '+g.storm_source+')';
+  L.geoJSON(g,{
+    filter:f=>f.properties.kind==='chance_0_3d',
+    pointToLayer:(f,ll)=>L.circleMarker(ll,{radius:3,stroke:false,fillColor:'#3b6ea8',fillOpacity:Math.min(0.9,f.properties.value*3)})
+  }).addTo(map);
+  L.geoJSON(g,{
+    filter:f=>f.properties.kind==='alert',
+    style:f=>({color:col[f.properties.level],weight:1,fillOpacity:0.35}),
+    onEachFeature:(f,l)=>{const p=f.properties;l.bindPopup(`<b>${p.level} region</b><br>${p.size} grid points, tracked ${p.age_days} days<br>peak chance 0–3 days: ${Math.round(p.peak_chance_0_3d*100)}%<br>peak chance 3–5 days: ${Math.round(p.peak_chance_3_5d*100)}%<br>regions like this became storms ${rate[p.level]} times (2017–19 test)`)}
+  }).addTo(map);
+  L.geoJSON(g,{
+    filter:f=>f.properties.kind==='active_storm',
+    pointToLayer:(f,ll)=>L.circleMarker(ll,{radius:6,color:'#000',weight:2,fillColor:'#fff',fillOpacity:1}),
+    onEachFeature:(f,l)=>l.bindPopup(`<b>${f.properties.name}</b> (${f.properties.id})<br>${f.properties.wind_kt} kt`)
+  }).addTo(map);
+});
+const lg=L.control({position:'bottomleft'});
+lg.onAdd=()=>{const d=L.DomUtil.create('div','legend');d.innerHTML=
+ '<span class="sw" style="background:#f2c400"></span>yellow: persistent alert region<br>'+
+ '<span class="sw" style="background:#ef7d00"></span>orange: large, ≥ 5 days<br>'+
+ '<span class="sw" style="background:#d62728"></span>red: very large, ≥ 8 days, strong<br>'+
+ '<span class="sw" style="background:#3b6ea8;border-radius:6px"></span>chance of formation, 0–3 days<br>'+
+ '<span class="sw" style="background:#fff;border:2px solid #000;border-radius:6px"></span>active storm';return d};
+lg.addTo(map);
+</script>
+</body>
+</html>
