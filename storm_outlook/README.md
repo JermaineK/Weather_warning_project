@@ -57,7 +57,17 @@ Yes, through checking rather than silently retuning itself.
 
 The first run processes the 4 previous days, so regions have their history. The page uses OpenStreetMap tiles and Leaflet from a public CDN; for heavy public traffic, use a tile provider that permits it.
 
-## Run it locally
+## Run it on your own computer (resumes after shutdown)
+```
+python run_local.py --out C:/storm_outlook_data                 # catch up to the newest forecast, verify, exit
+python run_local.py --out C:/storm_outlook_data --loop          # or stay running and update daily
+python -m http.server -d C:/storm_outlook_data                  # view the map at http://localhost:8000
+```
+- **How it resumes:** each day's `state.json` is written last, and its date is the only record of progress. On start the runner processes every day after that date, in order, up to the newest complete forecast. A day interrupted mid-way is simply redone; all files are written atomically. NOAA keeps past GEFS forecasts online, so days missed while the computer was off are filled in.
+- **Tested:** a run killed partway through and restarted gave output identical to an uninterrupted run.
+- **Windows, fully automatic:** `powershell -ExecutionPolicy Bypass -File install_windows_task.ps1 -Out C:\storm_outlook_data` registers a scheduled task. It runs daily after the forecast arrives and at every log-on, so the outlook catches up after a shutdown. Remove it with `Unregister-ScheduledTask -TaskName StormOutlook`.
+
+## Run a single day
 ```
 conda install -c conda-forge python-eccodes numpy scipy requests      # or: apt install libeccodes-dev && pip install -r requirements.txt
 python outlook.py --out site            # today's 00 UTC outlook (after ~06 UTC)

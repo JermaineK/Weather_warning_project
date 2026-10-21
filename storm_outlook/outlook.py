@@ -24,6 +24,14 @@ R_EARTH = 6.371e6
 SES = requests.Session()
 
 
+def _write_json(path, obj, **kw):
+    """Write atomically: a crash mid-write never leaves a half-written file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, **kw)
+    os.replace(tmp, path)
+
+
 # ---------------------------------------------------------------- data access
 def get(url, headers=None, tries=6):
     for k in range(tries):
@@ -285,6 +293,9 @@ def run(day, outdir, feat=None, storms=None):
     os.makedirs(outdir, exist_ok=True)
     state_path = os.path.join(outdir, "state.json")
     prev = json.load(open(state_path)) if os.path.exists(state_path) else None
+    if prev is not None and prev["date"] >= f"{day:%Y-%m-%d}":
+        print(f"{day:%Y-%m-%d}: already done (state is at {prev['date']}); skipped")
+        return None
     if storms is None:
         storms, source = fetch_storms(day)
     else:
@@ -294,12 +305,15 @@ def run(day, outdir, feat=None, storms=None):
     p03_map, a03, a45 = probabilities(feat, day, storms)
     regs = regions(a03, a45, day, prev)
     gj = geojson(day, regs, storms, p03_map, source)
-    for name in ("outlook.geojson", f"outlook_{day:%Y%m%d}.geojson"):
-        json.dump(gj, open(os.path.join(outdir, name), "w"), separators=(",", ":"))
-    json.dump(dict(date=f"{day:%Y-%m-%d}", regions=regs), open(state_path, "w"), separators=(",", ":"))
+    for name in (f"outlook_{day:%Y%m%d}.geojson", "outlook.geojson"):
+        _write_json(os.path.join(outdir, name), gj, separators=(",", ":"))
     os.makedirs(os.path.join(outdir, "archive"), exist_ok=True)   # inputs kept for the yearly reviewed refit
-    np.savez_compressed(os.path.join(outdir, "archive", f"features_{day:%Y%m%d}.npz"), X=feat.astype(np.float32),
+    fa = os.path.join(outdir, "archive", f"features_{day:%Y%m%d}")
+    np.savez_compressed(fa + ".tmp.npz", X=feat.astype(np.float32),
                         storms=np.array([[s["lat"], s["lon"], s["kt"]] for s in storms], dtype=np.float32).reshape(-1, 3))
+    os.replace(fa + ".tmp.npz", fa + ".npz")
+    # state is written last: its date is the single record of the last completed day (used to resume)
+    _write_json(state_path, dict(date=f"{day:%Y-%m-%d}", regions=regs), separators=(",", ":"))
     for f in os.listdir(outdir):                      # keep 400 days of daily outlooks (verification needs a season)
         if f.startswith("outlook_") and f.endswith(".geojson"):
             try:
