@@ -297,10 +297,13 @@ def run(day, outdir, feat=None, storms=None):
     for name in ("outlook.geojson", f"outlook_{day:%Y%m%d}.geojson"):
         json.dump(gj, open(os.path.join(outdir, name), "w"), separators=(",", ":"))
     json.dump(dict(date=f"{day:%Y-%m-%d}", regions=regs), open(state_path, "w"), separators=(",", ":"))
-    for f in os.listdir(outdir):                      # keep 60 days of daily files
+    os.makedirs(os.path.join(outdir, "archive"), exist_ok=True)   # inputs kept for the yearly reviewed refit
+    np.savez_compressed(os.path.join(outdir, "archive", f"features_{day:%Y%m%d}.npz"), X=feat.astype(np.float32),
+                        storms=np.array([[s["lat"], s["lon"], s["kt"]] for s in storms], dtype=np.float32).reshape(-1, 3))
+    for f in os.listdir(outdir):                      # keep 400 days of daily outlooks (verification needs a season)
         if f.startswith("outlook_") and f.endswith(".geojson"):
             try:
-                if (day - datetime.strptime(f[8:16], "%Y%m%d").replace(tzinfo=timezone.utc)).days > 60:
+                if (day - datetime.strptime(f[8:16], "%Y%m%d").replace(tzinfo=timezone.utc)).days > 400:
                     os.remove(os.path.join(outdir, f))
             except ValueError:
                 pass

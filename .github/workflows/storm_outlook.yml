@@ -35,6 +35,10 @@ jobs:
         run: |
           cp storm_outlook/site/index.html site_out/
           python storm_outlook/outlook.py --out site_out
+      - name: Verify past outlooks against confirmed storms
+        continue-on-error: true
+        run: |
+          cd storm_outlook && python verify.py --out ../site_out
       - name: Publish
         run: |
           cd site_out

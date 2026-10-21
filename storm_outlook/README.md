@@ -38,6 +38,16 @@ Overall, in 2017–19 forecasts the outlook alerted **84.9% of storms at least a
 
 Every constant is in `config.json`. The method and its tests are documented in the parent project.
 
+## Does it learn from confirmed storms?
+Yes, through checking rather than silently retuning itself.
+- **Every day (automatic):** `verify.py` matches past outlooks with storms confirmed in IBTrACS. It scores hits, misses and false alarms, writes `verification.json` and `verification_storms.csv`, and shows a live scorecard on the map.
+  - It raises a **drift flag** if performance leaves the range seen in 2017–19, for example if a NOAA data change breaks something.
+  - On June–September 2026 it reproduced the research scoring exactly: 48 storms, 85% alerted at least 24 h ahead.
+- **Every day (automatic):** the inputs are archived (`archive/features_*.npz`, about 240 kB a day, about 90 MB a year) so the model can be re-examined later.
+- **Once a year (human-reviewed):** `refit_review.py` fits a candidate recalibration on the archive and scores it on the most recent months. It writes `refit_proposal.json` and never edits the model. A change should be adopted only by pull request, after a pre-registered blind check.
+
+**Why the model does not retune itself:** I tested monthly self-recalibration from all confirmed outcomes, in a simulated deployment over 2017–19 and live 2026. In both it was slightly *worse* than the frozen model (log-loss +0.1% and +0.6%). The probability errors are S-shaped (too high at both ends, too low in the middle), and a small automatic adjustment can't fix both ends at once. Storms are also rare, about 80–90 a year worldwide, so monthly retraining would mostly chase noise. Learning only from "hits" would be worse still: it would push probabilities up everywhere, because misses and false alarms are what keep them honest.
+
 ## Host your own copy (free)
 1. **Fork** this repository, or copy the `storm_outlook/` folder and `.github/workflows/storm_outlook.yml` into a new repository.
 2. In **Settings → Actions → General**, allow workflows, and give them read and write permission.

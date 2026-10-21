@@ -39,6 +39,17 @@ fetch('outlook.geojson',{cache:'no-store'}).then(r=>r.json()).then(g=>{
     onEachFeature:(f,l)=>l.bindPopup(`<b>${f.properties.name}</b> (${f.properties.id})<br>${f.properties.wind_kt} kt`)
   }).addTo(map);
 });
+const sc=L.control({position:'topright'});
+sc.onAdd=()=>{const d=L.DomUtil.create('div','legend');d.id='score';d.innerHTML='Live scorecard: not enough verified days yet';return d};
+sc.addTo(map);
+fetch('verification.json',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(v=>{
+  if(!v||!v.storms_scored) return;
+  const pc=x=>x==null?'–':Math.round(x*100)+'%', ref=v.reference_2017_2019;
+  document.getElementById('score').innerHTML=`<b>Live scorecard</b> (${v.period})<br>`+
+   `storms alerted ≥ 24 h ahead: ${pc(v.storms_alerted_24h)} of ${v.storms_scored} (2017–19: ${pc(ref.storms_alerted_24h)})<br>`+
+   `alert regions that became storms: ${pc(v.became_storm.yellow)} (2017–19: ${pc(ref.became_storm.yellow)})`+
+   (v.drift_flags.length?`<br><b style="color:#c0504d">Check: ${v.drift_flags.join('; ')}</b>`:'');
+});
 const lg=L.control({position:'bottomleft'});
 lg.onAdd=()=>{const d=L.DomUtil.create('div','legend');d.innerHTML=
  '<span class="sw" style="background:#f2c400"></span>yellow: persistent alert region<br>'+
