@@ -78,18 +78,25 @@ def fetch_gefs(day):
 
 
 def parse_tcvitals(text):
+    """Parse NCEP TC vitals. Fields are located from the date onward rather than by position, because long names
+    can run into the date ('TWENTY-EI:20261012') and flag letters can join two numbers ('1009C0400')."""
+    import re
+    head = re.compile(r"^(\S+)\s+(\S+)\s+(.*?)[\s:]*(\d{8})\s+(\d{4})\s+(\d{2,3})([NS])\s+(\d{3,4})([EW])")
     systems = []
     for line in text.splitlines():
-        p = line.split()
-        if len(p) < 13:
+        m = head.match(line.strip())
+        if not m:
             continue
-        try:
-            lat = int(p[5][:-1]) / 10 * (1 if p[5][-1] == "N" else -1)
-            lon = int(p[6][:-1]) / 10 * (1 if p[6][-1] == "E" else -1)
-            kt = float(p[12]) / 0.514444
-        except ValueError:
+        g = m.groups()
+        nums = re.findall(r"-?\d+", line.strip()[m.end():])   # direction, speed, pmin, penv, radius, vmax, ...
+        if len(nums) < 6:
             continue
-        systems.append(dict(agency=p[0], id=p[1], name=p[2], lat=lat, lon=lon % 360, kt=kt))
+        lat = int(g[5]) / 10 * (1 if g[6] == "N" else -1)
+        lon = int(g[7]) / 10 * (1 if g[8] == "E" else -1)
+        kt = float(nums[5]) / 0.514444                      # maximum wind, m/s -> kt
+        if abs(lat) > 60 or not 0 <= kt <= 250:
+            continue
+        systems.append(dict(agency=g[0], id=g[1], name=g[2].strip() or g[1], lat=lat, lon=lon % 360, kt=kt))
     return systems
 
 
