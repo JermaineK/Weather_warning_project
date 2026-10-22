@@ -271,9 +271,11 @@ def geojson(day, regs, storms, p03_map, source):
         lv = level(r)
         if lv is None:
             continue
-        cells = [[[[lo - 1.25, la - 1.25], [lo + 1.25, la - 1.25], [lo + 1.25, la + 1.25], [lo - 1.25, la + 1.25], [lo - 1.25, la - 1.25]]]
-                 for la, lo in zip(r["lat"], r["lon"])]
-        cells = [[[(x - 360 if x > 180 else x), y] for x, y in c[0]] for c in cells]
+        # shift the cell centre to -180..180 first, then build corners, so a cell on the date line keeps its 2.5-degree width
+        cells = []
+        for la, lo in zip(r["lat"], r["lon"]):
+            c = lo - 360 if lo > 180 else lo
+            cells.append([[c - 1.25, la - 1.25], [c + 1.25, la - 1.25], [c + 1.25, la + 1.25], [c - 1.25, la + 1.25], [c - 1.25, la - 1.25]])
         feats.append(dict(type="Feature", geometry=dict(type="MultiPolygon", coordinates=[[c] for c in cells]),
                           properties=dict(kind="alert", level=lv, size=r["size"], age_days=r["age"],
                                           peak_chance_0_3d=round(r["peak03"], 3), peak_chance_3_5d=round(r["peak45"], 3))))
