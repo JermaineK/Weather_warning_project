@@ -38,6 +38,12 @@ Overall, in 2017–19 forecasts the outlook alerted **84.9% of storms at least a
 
 Every constant is in `config.json`. The method and its tests are documented in the parent project.
 
+## Explosive mid-latitude cyclones (purple layer)
+A second, separate outlook for **explosive deepening** of mid-latitude lows ("bombs": central pressure falling at least 24 hPa in 24 h, scaled by latitude), at 25–70° latitude worldwide, over the next 3 days.
+- Blind test on 2000–09 (1,826 events, pre-registered): ranking skill 0.952, against 0.907 for the forecast's own pressure falls; 82% of events had an alert within 5° 1–2 days ahead, against 60% for the pressure falls at the same alert rate.
+- Events are detected from the forecast's own short-range pressure maps, and the map marks each with a check (alerted) or a cross. Tropical cyclones that deepen this fast are labelled as such and not scored.
+- Code: `bomb.py`; model `model/bomb_trees.npz`. It adds about 15 MB of downloads a day. If it fails, the tropical outlook still runs.
+
 ## Does it learn from confirmed storms?
 Yes, through checking rather than silently retuning itself.
 - **Every day (automatic):** `verify.py` matches past outlooks with storms confirmed in IBTrACS. It scores hits, misses and false alarms, writes `verification.json` and `verification_storms.csv`, and shows a live scorecard on the map.
