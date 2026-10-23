@@ -42,10 +42,8 @@ def log(out, msg):
 
 def catch_up(out, start=None, retries=3):
     os.makedirs(out, exist_ok=True)
-    page = os.path.join(out, "index.html")
-    if not os.path.exists(page):
-        import shutil
-        shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site", "index.html"), page)
+    import shutil                                    # always refresh the map page, so app updates reach it
+    shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site", "index.html"), os.path.join(out, "index.html"))
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     done = last_done(out)
     day = done + timedelta(days=1) if done else (start or today - timedelta(days=4))
