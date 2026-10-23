@@ -38,6 +38,9 @@ Overall, in 2017–19 forecasts the outlook alerted **84.9% of storms at least a
 
 Every constant is in `config.json`. The method and its tests are documented in the parent project.
 
+## Animation
+`run_local.py` also writes `outlook_animation.gif` in the output folder: one frame per day in the folder (alerts, hits and misses, storm tracks, explosive lows). The map page links to it. To make it by hand: `python make_gif.py --out C:/storm_outlook_data` (add `--days 30` for only the last 30 days).
+
 ## Explosive mid-latitude cyclones (purple layer)
 A second, separate outlook for **explosive deepening** of mid-latitude lows ("bombs": central pressure falling at least 24 hPa in 24 h, scaled by latitude), at 25–70° latitude worldwide, over the next 3 days.
 - Blind test on 2000–09 (1,826 events, pre-registered): ranking skill 0.952, against 0.907 for the forecast's own pressure falls; 82% of events had an alert within 5° 1–2 days ahead, against 60% for the pressure falls at the same alert rate.
