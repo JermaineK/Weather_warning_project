@@ -232,7 +232,7 @@ def probabilities(feat, day, storms):
 
 
 # ---------------------------------------------------------------- regions and cluster rule
-_LAT_U = np.unique(PTS[:, 0])
+_LAT_U = np.arange(PTS[:, 0].min(), PTS[:, 0].max() + 0.01, 2.5)   # regular rows: the empty 10S-10N band separates hemispheres
 _LON_U = np.arange(0, 360, 2.5)
 
 
@@ -240,7 +240,7 @@ def regions(a03, a45, day, prev):
     """Connected alert regions for one day; age carried from yesterday's regions (prev) by 5-deg overlap."""
     ap = CFG["alert_point"]
     on = (a03 >= ap["p03"] * ap["scale"]) | (a45 >= ap["p45"] * ap["scale"])
-    gi, gj = np.searchsorted(_LAT_U, PTS[:, 0]), np.round(PTS[:, 1] / 2.5).astype(int)
+    gi, gj = np.round((PTS[:, 0] - _LAT_U[0]) / 2.5).astype(int), np.round(PTS[:, 1] / 2.5).astype(int)
     G = np.zeros((len(_LAT_U), len(_LON_U)), bool); G[gi, gj] = on
     P3 = np.zeros(G.shape); P4 = np.zeros(G.shape); P3[gi, gj] = a03; P4[gi, gj] = a45
     lab, n = label(G, structure=np.ones((3, 3)))
@@ -392,6 +392,13 @@ def run(day, outdir, feat=None, storms=None):
     dl = sorted(f[8:16] for f in os.listdir(outdir) if f.startswith("outlook_") and f.endswith(".geojson") and f[8:16].isdigit())
     _write_json(os.path.join(outdir, "days.json"), dl)              # lets the map page step through past days
     map_verification(outdir)
+    try:                                              # explosive mid-latitude cyclone layer (separate model; failures do not stop the outlook)
+        import bomb
+        nb, nl = bomb.run(day, outdir, get, CFG["sources"]["gefs"], _write_json, storms)
+        bomb.verify(outdir, _write_json)
+        print(f"{day:%Y-%m-%d}: explosive-cyclone alert points {nb}; lows {nl}")
+    except Exception as e:
+        print(f"{day:%Y-%m-%d}: explosive-cyclone layer skipped ({type(e).__name__}: {str(e)[:80]})")
     n = {lv: sum(level(r) == lv for r in regs) for lv in ("yellow", "orange", "red")}
     print(f"{day:%Y-%m-%d}: storms from {source} ({len(storms)}); alert regions {n}")
     return gj
