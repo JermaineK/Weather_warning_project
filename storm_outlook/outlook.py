@@ -96,7 +96,8 @@ def parse_tcvitals(text):
         kt = float(nums[5]) / 0.514444                      # maximum wind, m/s -> kt
         if abs(lat) > 60 or not 0 <= kt <= 250:
             continue
-        systems.append(dict(agency=g[0], id=g[1], name=g[2].strip() or g[1], lat=lat, lon=lon % 360, kt=kt))
+        systems.append(dict(agency=g[0], id=g[1], name=g[2].strip() or g[1], lat=lat, lon=lon % 360, kt=kt,
+                            motion_deg=float(nums[0]), motion_ms=float(nums[1]) / 10))
     return systems
 
 
@@ -288,7 +289,8 @@ def geojson(day, regs, storms, p03_map, source):
                                           peak_chance_0_3d=round(r["peak03"], 3), peak_chance_3_5d=round(r["peak45"], 3))))
     for s in storms:
         feats.append(dict(type="Feature", geometry=dict(type="Point", coordinates=[(s["lon"] - 360 if s["lon"] > 180 else s["lon"]), s["lat"]]),
-                          properties=dict(kind="active_storm", name=s["name"], id=s["id"], wind_kt=round(s["kt"]))))
+                          properties=dict(kind="active_storm", name=s["name"], id=s["id"], wind_kt=round(s["kt"]),
+                                          motion_deg=s.get("motion_deg"), motion_ms=s.get("motion_ms"))))
     for (la, lo), p in zip(PTS, p03_map):
         if p >= 0.01:
             feats.append(dict(type="Feature", geometry=dict(type="Point", coordinates=[(lo - 360 if lo > 180 else lo), la]),
@@ -296,6 +298,63 @@ def geojson(day, regs, storms, p03_map, source):
     return dict(type="FeatureCollection", issued=f"{day:%Y-%m-%d} 00 UTC", storm_source=source, model=CFG["version"],
                 note="Experimental research outlook. Not an official warning; follow your national meteorological service.",
                 features=feats)
+
+
+def map_verification(outdir, max_days=60):
+    """Hits, misses and false alarms for the map, from the dated outlook files in outdir.
+    Formation = first daily storm list with the system at >= 34 kt (needs an earlier day without it at that strength).
+    Region hit = a storm forms within 5 deg of any of its cells 1-5 days after the outlook day; false alarm = none by then."""
+    files = sorted(f for f in os.listdir(outdir) if f.startswith("outlook_") and f.endswith(".geojson") and f[8:16].isdigit())[-max_days:]
+    if not files:
+        return None
+    G = {f[8:16]: json.load(open(os.path.join(outdir, f))) for f in files}
+    D = sorted(G); dd = {d: datetime.strptime(d, "%Y%m%d") for d in D}
+    seen, strong, forms = {}, set(), []
+    for i, d in enumerate(D):
+        for f in G[d]["features"]:
+            p = f["properties"]
+            if p["kind"] != "active_storm":
+                continue
+            sid = p["id"]
+            if p["wind_kt"] >= 34 and sid not in strong:
+                strong.add(sid)
+                if i > 0 and seen.get(sid, 0) < 34:       # was absent or weaker on earlier days, so it formed today
+                    lo, la = f["geometry"]["coordinates"]
+                    forms.append(dict(id=sid, name=p["name"], day=d, lat=la, lon=lo))
+            seen[sid] = max(seen.get(sid, 0), p["wind_kt"])
+    latest = {}
+    for d in D:
+        for f in G[d]["features"]:
+            if f["properties"]["kind"] == "active_storm":
+                latest[f["properties"]["id"]] = f["properties"]["name"]
+    for fm in forms:
+        fm["name"] = latest.get(fm["id"], fm["name"])
+    regions = []
+    for d in D:
+        for k, f in enumerate(x for x in G[d]["features"] if x["properties"]["kind"] == "alert"):
+            cells = np.array([[np.mean([q[0][0][0], q[0][1][0]]), np.mean([q[0][0][1], q[0][2][1]])] for q in f["geometry"]["coordinates"]])
+            regions.append(dict(day=d, index=k, level=f["properties"]["level"], cells=cells))
+    last = dd[D[-1]]
+    for fm in forms:
+        t = dd[fm["day"]]; lead = []
+        for r in regions:
+            gap = (t - dd[r["day"]]).days
+            if 1 <= gap <= 5 and deg_dist(r["cells"][:, 1], r["cells"][:, 0] % 360, np.array([fm["lat"]]), np.array([fm["lon"] % 360])).min() <= 5:
+                lead.append((gap, r))
+        fm["covered"] = bool(10 <= abs(fm["lat"]) <= 35)   # the grid spans 10-35 deg
+        fm["hit"] = bool(lead)
+        fm["lead_days"] = max(g for g, _ in lead) if lead else 0
+        fm["first_alert_level"] = max(lead, key=lambda x: x[0])[1]["level"] if lead else None
+        for g, r in lead:
+            r.setdefault("became", []).append(dict(name=fm["name"], id=fm["id"], day=fm["day"], days_later=g))
+    out_regions = []
+    for r in regions:
+        age = (last - dd[r["day"]]).days
+        status = "hit" if r.get("became") else ("false_alarm" if age >= 5 else "pending")
+        out_regions.append(dict(day=r["day"], index=r["index"], status=status, became=r.get("became", [])))
+    res = dict(period=[D[0], D[-1]], formations=forms, regions=out_regions)
+    _write_json(os.path.join(outdir, "map_verification.json"), res)
+    return res
 
 
 def run(day, outdir, feat=None, storms=None):
@@ -330,6 +389,9 @@ def run(day, outdir, feat=None, storms=None):
                     os.remove(os.path.join(outdir, f))
             except ValueError:
                 pass
+    dl = sorted(f[8:16] for f in os.listdir(outdir) if f.startswith("outlook_") and f.endswith(".geojson") and f[8:16].isdigit())
+    _write_json(os.path.join(outdir, "days.json"), dl)              # lets the map page step through past days
+    map_verification(outdir)
     n = {lv: sum(level(r) == lv for r in regs) for lv in ("yellow", "orange", "red")}
     print(f"{day:%Y-%m-%d}: storms from {source} ({len(storms)}); alert regions {n}")
     return gj
