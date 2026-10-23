@@ -20,14 +20,14 @@
 <div id="map"></div>
 <div id="bar"><button id="prev" title="previous day">&#9664;</button><button id="play" title="play">&#9654;</button><button id="next" title="next day">&#9654;&#9654;</button>
 <span id="day"></span><input id="slider" type="range" min="0" max="0" value="0">
-<label><input id="trails" type="checkbox" checked> paths</label></div>
+<label><input id="trails" type="checkbox" checked> paths</label> <label><input id="bombs" type="checkbox" checked> explosive lows</label></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const map=L.map('map',{worldCopyJump:true}).setView([10,150],3);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:7,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
 const col={yellow:'#f2c400',orange:'#ef7d00',red:'#d62728'};
 const rate={yellow:'about 4 in 10',orange:'about 5 in 10',red:'about 8 in 10'};
-const MAXDAYS=30; let days=[], G={}, MV=null, layer=L.layerGroup().addTo(map), timer=null;
+const MAXDAYS=30; let days=[], G={}, BB={}, BV=null, MV=null, layer=L.layerGroup().addTo(map), timer=null;
 const GREEN='#2e7d32', GREY='#8a8a8a';
 const dnum=d=>Date.UTC(+d.slice(0,4),+d.slice(4,6)-1,+d.slice(6,8))/864e5;
 const dlon=(a,b)=>((a-b+540)%360)-180;
@@ -87,6 +87,18 @@ function draw(i){
       `<br>alert region-days: <span style="color:${GREEN}">became storms ${rh}</span>, <span style="color:${GREY}">no storm ${rf}</span>`+(rh+rf?` (${Math.round(100*rh/(rh+rf))}% hit; 2017–19 test: about 40%)`:'')+
       `<br><small>regions under 5 days old are not scored yet</small>`;
   }
+  let btxt='';
+  if(document.getElementById('bombs').checked&&view&&BB[view]){
+    const PUR='#6a1b9a';
+    BB[view].alerts.forEach(a=>{const [la,lo,p]=a, x=lo>180?lo-360:lo;
+      L.rectangle([[la-1.25,x-1.25],[la+1.25,x+1.25]],{color:PUR,weight:0.5,fillColor:PUR,fillOpacity:Math.min(0.55,0.15+p)}).bindTooltip(`explosive-deepening chance (3 days): ${Math.round(p*100)}%`).addTo(layer)});
+    if(BV){ const ev=BV.events.filter(e=>e.scorable&&!e.tropical_cyclone&&e.start<=view);
+      ev.filter(e=>dnum(view)-dnum(e.start)<=3).forEach(e=>{const ok=e.alerted_days_before>0, x=e.lon>180?e.lon-360:e.lon;
+        L.marker([e.lat,x],{icon:L.divIcon({className:'',html:`<div style="background:${ok?PUR:'#c62828'};color:#fff;border-radius:12px;padding:1px 7px;font-weight:700;white-space:nowrap;box-shadow:0 0 0 2px #fff">${ok?'&#10003;':'&#10007;'} explosive low −${e.fall_hpa} hPa/24 h${ok?`: alerted ${e.alerted_days_before} d ahead`:': no alert'}</div>`,iconAnchor:[-8,10]})}).addTo(layer)});
+      const hitb=ev.filter(e=>e.alerted_days_before>0).length;
+      btxt=`<br><b style="color:${PUR}">Explosive lows</b>: ${ev.length} detected, ${hitb} alerted 1–2 days ahead`+(ev.length?` (${Math.round(100*hitb/ev.length)}%; 2000–09 test: 82%)`:''); }
+  }
+  if(btxt){const t=document.getElementById('tally'); t.innerHTML=t.innerHTML.replace('<br><small>regions under','<br>'+btxt.slice(4)+'<br><small>regions under')}
   const trails=document.getElementById('trails').checked;
   if(trails){ regionPaths(i).forEach(r=>{ if(r.path.length>1){L.polyline(unwrap(r.path),{color:'#5a3d00',weight:2}).addTo(layer);
       const a=r.path[r.path.length-2], b=r.path[r.path.length-1], v=[dlon(b[0],a[0]),b[1]-a[1]];
@@ -102,12 +114,15 @@ async function load(){
   let dl=null; try{const r=await fetch('days.json',{cache:'no-store'}); if(r.ok) dl=await r.json()}catch(e){}
   days=(dl&&dl.length?dl:[null]).slice(-MAXDAYS);
   try{const r=await fetch('map_verification.json',{cache:'no-store'}); if(r.ok) MV=await r.json()}catch(e){}
+  try{const r=await fetch('bomb_verification.json',{cache:'no-store'}); if(r.ok) BV=await r.json()}catch(e){}
+  await Promise.all(days.filter(d=>d).map(async d=>{try{const r=await fetch(`bomb_${d}.json`,{cache:'no-store'}); if(r.ok) BB[d]=await r.json()}catch(e){}}));
   await Promise.all(days.map(async d=>{const r=await fetch(d?`outlook_${d}.geojson`:'outlook.geojson',{cache:'no-store'}); if(r.ok) G[d]=await r.json()}));
   const s=document.getElementById('slider'); s.max=days.length-1; const qd=new URLSearchParams(location.search).get('day'); draw(qd&&days.includes(qd)?days.indexOf(qd):days.length-1);
   s.oninput=()=>draw(+s.value);
   document.getElementById('prev').onclick=()=>draw(Math.max(0,+s.value-1));
   document.getElementById('next').onclick=()=>draw(Math.min(days.length-1,+s.value+1));
   document.getElementById('trails').onchange=()=>draw(+s.value);
+  document.getElementById('bombs').onchange=()=>draw(+s.value);
   document.getElementById('play').onclick=()=>{ if(timer){clearInterval(timer);timer=null;return}
     let i=(+s.value>=days.length-1)?0:+s.value; draw(i); timer=setInterval(()=>{i++; if(i>=days.length){clearInterval(timer);timer=null;return} draw(i)},900)};
 }
@@ -136,7 +151,8 @@ lg.onAdd=()=>{const d=L.DomUtil.create('div','legend');d.innerHTML=
  '<span class="sw" style="border-top:2px solid #5a3d00;height:0"></span>alert-region path (dashed: drift, extrapolated)<br>'+
  '<span class="sw" style="background:#2e7d32"></span>&#10003; alert came true (storm formed within 5° in 1–5 days)<br>'+
  '<span class="sw" style="background:#8a8a8a"></span>alert expired with no storm after 5 days<br>'+
- '<span class="sw" style="background:#c62828"></span>&#10007; storm formed without an alert';return d};
+ '<span class="sw" style="background:#c62828"></span>&#10007; storm formed without an alert<br>'+
+ '<span class="sw" style="background:#6a1b9a"></span>explosive-low chance (mid-latitudes, next 3 days)';return d};
 lg.addTo(map);
 </script>
 </body>
