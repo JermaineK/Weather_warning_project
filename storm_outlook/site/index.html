@@ -20,7 +20,7 @@
 <div id="map"></div>
 <div id="bar"><button id="prev" title="previous day">&#9664;</button><button id="play" title="play">&#9654;</button><button id="next" title="next day">&#9654;&#9654;</button>
 <span id="day"></span><input id="slider" type="range" min="0" max="0" value="0">
-<label><input id="trails" type="checkbox" checked> paths</label> <label><input id="bombs" type="checkbox" checked> explosive lows</label></div>
+<label><input id="trails" type="checkbox" checked> paths</label> <label><input id="bombs" type="checkbox" checked> explosive lows</label> <a id="giflink" href="outlook_animation.gif" target="_blank" style="font-weight:600">&#127902; animation (GIF, all days)</a></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const map=L.map('map',{worldCopyJump:true}).setView([10,150],3);
@@ -124,7 +124,7 @@ async function load(){
   document.getElementById('trails').onchange=()=>draw(+s.value);
   document.getElementById('bombs').onchange=()=>draw(+s.value);
   document.getElementById('play').onclick=()=>{ if(timer){clearInterval(timer);timer=null;return}
-    let i=(+s.value>=days.length-1)?0:+s.value; draw(i); timer=setInterval(()=>{i++; if(i>=days.length){clearInterval(timer);timer=null;return} draw(i)},900)};
+    let i=(+s.value>=days.length-1)?0:+s.value; draw(i); timer=setInterval(()=>{i=(i+1)%days.length; draw(i)},900)};   // loops until paused
 }
 load();
 const tc=L.control({position:'topright'});
