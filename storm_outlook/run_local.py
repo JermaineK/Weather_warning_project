@@ -86,6 +86,11 @@ def main():
     while True:
         try:
             catch_up(a.out, start)
+            try:                                      # animated GIF of every day in the folder
+                import make_gif
+                make_gif.make(a.out)
+            except Exception as e:
+                log(a.out, f"GIF skipped ({type(e).__name__}: {e})")
         except Exception:
             log(a.out, "unexpected error:\n" + traceback.format_exc())
         if not a.loop:
