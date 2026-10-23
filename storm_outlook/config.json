@@ -80,5 +80,15 @@
   "gefs": "https://noaa-gefs-pds.s3.amazonaws.com",
   "tcvitals": "https://noaa-gfs-bdp-pds.s3.amazonaws.com",
   "ibtracs_active": "https://www.ncei.noaa.gov/data/international-best-track-archive-for-climate-stewardship-ibtracs/v04r01/access/csv/ibtracs.ACTIVE.list.v04r01.csv"
+ },
+ "bomb": {
+  "threshold": 0.090372,
+  "version": "1.0 (frozen 2026-10-23; trained 2010-16, threshold 2017-19, blind-tested 2000-09)",
+  "verification_2000_2009": {
+   "events_alerted_24h": 0.82,
+   "auc": 0.952,
+   "reference_forecast_pressure_falls_alerted": 0.6,
+   "alert_point_rate": 0.0134
+  }
  }
 }
