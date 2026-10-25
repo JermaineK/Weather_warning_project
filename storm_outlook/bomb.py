@@ -100,6 +100,12 @@ def fetch_live(day, get, gefs_base):
 def run(day, outdir, get, gefs_base, write_json, storms=()):
     F = fetch_live(day, get, gefs_base)
     fx = features(F)
+    try:                                     # archive inputs (blind scoring and the yearly reviewed refit)
+        os.makedirs(os.path.join(outdir, "archive"), exist_ok=True)
+        fa = os.path.join(outdir, "archive", f"bomb_features_{day:%Y%m%d}")
+        np.savez_compressed(fa + ".tmp.npz", X=fx.astype(np.float16)); os.replace(fa + ".tmp.npz", fa + ".npz")
+    except Exception:
+        pass
     p = chance(fx, day)
     on = p >= BCFG["threshold"]
     tb = None
