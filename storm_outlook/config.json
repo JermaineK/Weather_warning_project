@@ -92,16 +92,16 @@
   }
  },
  "terms": {
-  "source": "TERMS_ROUND3_RESULT.md (fitted 2010-16; tropical AUC 0.910 on 2001-09, explosive 0.819 on 2000-09); BATHTUB_GATE_RESULT.md gate",
+  "source": "PLANETARY_SPIN_RESULT.md capped-spin tropical formula (fitted 2010-16, AUC 0.911 on 2001-09); TERMS_ROUND3_RESULT.md explosive-low formula (AUC 0.819 on 2000-09); BATHTUB_GATE_RESULT.md gate",
   "tropical": {
    "coef": {
-    "intercept": -5.303751920622046,
-    "spin": 2.9884152325283,
-    "humidity": 2.4531755637628785,
-    "shear": -1.9199382915249539,
-    "reach": 0.21045310726222266,
-    "sst": 0.4629658422873707,
-    "lat": -0.9795699766679453
+    "intercept": -5.572571756398819,
+    "spin": 3.044004112072488,
+    "humidity": 2.5321642616174036,
+    "shear": -2.549269531443199,
+    "reach": 0.16488321580156123,
+    "sst": 0.40460367096144034,
+    "lat": -0.5865618583875309
    },
    "gate": {
     "N_star": 1.17,
@@ -115,7 +115,8 @@
     "lR": -1.580525203476953,
     "E": 0.3667089641094208,
     "N": -0.2133450266228465
-   }
+   },
+   "spin_cap": 6.0
   },
   "bomb": {
    "coef": {
