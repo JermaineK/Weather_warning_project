@@ -41,6 +41,7 @@ Every constant is in `config.json`. The method and its tests are documented in t
 ## Dashboard: "Why here?"
 The map page now has a side panel with four tabs:
 - **Why here?** Click anywhere to see which ingredients raise or lower the chance of a storm forming there on the day shown: spin, latitude, humidity, wind shear, nearby instability and ocean heat for tropical storms; spin, temperature contrast, moisture, jet stream, an upper trough upstream and the surface low for explosive lows. Each bar is that ingredient's push on the odds compared with a typical point, as a multiplier. It also shows whether the shear brake is "locked out" by strong spin.
+- **Forecast:** a forecast-hour slider (+3 to +120 h). It shows the physical formula re-evaluated with each hour's ingredients, and which points are "locked in" (spin strong enough to switch off the shear brake). Green rings show how many of 10 ensemble members have spin above that threshold; these are computed for the latest day only, about 27 MB of extra download. Use `--members 0` to switch the rings off, or `--members 30` for the full ensemble (about 80 MB).
 - **Scorecard:** hits, misses and false alarms so far.
 - **Replay:** the animation of every day in the folder.
 - **About:** what the layers and terms mean.
