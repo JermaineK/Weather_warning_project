@@ -81,11 +81,17 @@ def main():
     ap.add_argument("--out", default="outlook_local")
     ap.add_argument("--start", help="first issue date on a fresh output folder (default: 4 days ago)")
     ap.add_argument("--loop", action="store_true", help="keep running and update daily")
+    ap.add_argument("--members", type=int, default=10, help="ensemble members for the agreement layer (0 = off)")
     a = ap.parse_args()
     start = datetime.strptime(a.start, "%Y-%m-%d").replace(tzinfo=timezone.utc) if a.start else None
     while True:
         try:
             catch_up(a.out, start)
+            try:                                      # dashboard: forecast-hour and ensemble views (display only)
+                import forecast_view
+                forecast_view.make(a.out, members=a.members, ensemble=a.members > 0)
+            except Exception as e:
+                log(a.out, f"forecast views skipped ({type(e).__name__}: {e})")
             try:                                      # animated GIF of every day in the folder
                 import make_gif
                 make_gif.make(a.out)
