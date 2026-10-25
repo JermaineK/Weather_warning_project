@@ -25,12 +25,18 @@
 <header><b>Storm formation outlook</b> <span id="issued"></span>
 <small>Experimental research product, not an official warning. Follow your national meteorological service. Where new tropical cyclones may form in the next 5 days.</small></header>
 <div id="map"></div>
-<div id="panel"><div id="tabs"><button data-t="why" class="on">Why here?</button><button data-t="score">Scorecard</button><button data-t="replay">Replay</button><button data-t="about">About</button></div>
+<div id="panel"><div id="tabs"><button data-t="why" class="on">Why here?</button><button data-t="fc">Forecast</button><button data-t="score">Scorecard</button><button data-t="replay">Replay</button><button data-t="about">About</button></div>
 <div class="pane on" id="p-why"><div class="muted">Click anywhere on the map to see which ingredients raise or lower the chance of a storm forming there, for the day shown.</div><div id="why"></div></div>
+<div class="pane" id="p-fc"><div class="muted">How the outlook issued on the day shown evolves through the forecast. Colour: chance from the physical formula using that hour's ingredients. Rings: ensemble members with spin above the lock-in threshold (latest day only).</div>
+<div style="display:flex;gap:6px;align-items:center;margin:8px 0"><b>Forecast hour</b><input id="lead" type="range" min="0" max="5" value="0" style="flex:1"><span id="leadlab" style="min-width:58px;font-weight:600">+3 h</span><button id="leadplay">&#9654;</button></div>
+<label class="muted"><input id="fcshow" type="checkbox" checked> show forecast layer on map</label>
+<div id="fcinfo" style="margin-top:8px;font-size:12.5px"></div>
+<div class="legend" style="margin-top:8px;border:1px solid #e3e7eb"><span class="sw" style="background:#7b3294;border-radius:6px"></span>formula chance (darker = higher)<br><span class="sw" style="border:2px solid #1b7837;border-radius:6px;background:#fff"></span>ensemble members locked in (bigger = more)<br><span class="sw" style="border:2px solid #000;border-radius:6px;background:#7b3294"></span>locked in (shear switched off)</div></div>
 <div class="pane" id="p-score"><div id="tally" class="kv-block">Scorecard: loading</div><hr><div id="score">Live scorecard: not enough verified days yet</div></div>
 <div class="pane" id="p-replay"><div class="muted">All days in this folder, one frame per day (made by make_gif.py after each run).</div><img src="outlook_animation.gif" style="width:100%;margin-top:6px" alt="animation of all outlook days" onerror="this.replaceWith('No animation yet: it appears after the next run.')"></div>
 <div class="pane" id="p-about">
 <p><b>Two layers.</b> Tropical-storm formation (10–35° latitude, next 0–5 days) and explosive mid-latitude lows (25–70°, next 3 days). The alerts come from boosted-tree models that were blind-tested before release.</p>
+<p><b>Forecast tab:</b> the physical formula re-evaluated with each forecast hour's ingredients, at fixed grid points. A disturbance that moves away makes the chance at its old position fall, so follow the colour across the map, not one point. The green rings count how many of 10 ensemble members have spin above the lock-in threshold. They are computed for the latest day only, about 27 MB of extra download. Known limit: an existing storm masked at issue time can move into unmasked points later in the forecast, where its spin also shows as rings.</p>
 <p><b>"Why here?"</b> uses simpler physical formulas, fitted on 2010–16 and tested on unseen years. Each bar is that ingredient's push on the odds compared with a typical point, shown as a multiplier.</p>
 <p><b>Shared structure of the vortices:</b> a seed of spin, an energy source that has to switch on, and a feedback loop that locks the vortex in once it is strong.</p>
 <p><b>What differs:</b> vertical wind shear brakes tropical storms, but fuels mid-latitude lows through the temperature contrast. Strong net spin switches the tropical shear brake off ("lock-in").</p>
@@ -187,16 +193,49 @@ async function why(){
       <h4 style="margin:10px 0 4px">What pushes it up or down <span class="muted">(vs a typical tropical ocean point)</span></h4>${bars(c)}
       <div class="kv"><span>net spin</span><span>${r('spin_1e5')} ×10⁻⁵ s⁻¹</span><span>wind shear</span><span>${r('shear_ms')} m/s</span><span>humidity (700 hPa)</span><span>${r('humidity_gkg')} g/kg</span>
       <span>area with strong instability</span><span>${Math.round(100*r('instability_share'))}%</span><span>sea temperature</span><span>${r('sst_c')==null?'n/a':r('sst_c')+' °C'}</span></div>
-      <p style="font-size:12.5px">${T.lock_in[i]>=0.5?`<b>Locked in:</b> spin is strong enough that shear is ${Math.round(100*T.lock_in[i])}% switched off.`:`Shear brake fully active (lock-in ${Math.round(100*T.lock_in[i])}%). It switches off above about 1.2 ×10⁻⁵ s⁻¹ net spin.`}</p>`; } }
+      <p style="font-size:12.5px">${T.lock_in[i]>=0.5?`<b>Locked in:</b> spin is strong enough that shear is ${Math.round(100*T.lock_in[i])}% switched off.`:`Shear brake active: only ${Math.round(100*T.lock_in[i])}% switched off. It switches off above about 1.2 ×10⁻⁵ s⁻¹ net spin.`}</p>`; } }
   const Bd=BB[d]; if(Bd&&Bd.terms&&Bd.alerts.length){ const la=Bd.alerts.map(a=>a[0]), lo=Bd.alerts.map(a=>a[1]); const [i,dd]=near(la,lo);
     if(dd<=2.6){ const c={}; for(const k in Bd.terms.contrib) c[k]=Bd.terms.contrib[k][i];
       html+=`<h3 style="margin:12px 0 2px;color:#6a1b9a">Explosive low (next 3 days)</h3><div class="kv"><span>chance (forecast model)</span><span class="big">${Math.round(100*Bd.alerts[i][2])}%</span></div>
       <h4 style="margin:10px 0 4px">What pushes it up or down</h4>${bars(c)}`; } }
+  if(html) html+=await whyLeads(lat,lon,d);
   el.innerHTML=html||'<p class="muted">No tropical grid point or explosive-low alert within about 2.5° of here on this day. The tropical layer covers ocean at 10–35° latitude.</p>';
 }
 map.on('click',e=>{clickLL=e.latlng; if(clickMark) map.removeLayer(clickMark); clickMark=L.circleMarker(e.latlng,{radius:5,color:'#111',weight:2,fill:false}).addTo(map);
   document.querySelector('#tabs button[data-t=why]').click(); why()});
 document.getElementById('slider').addEventListener('input',()=>{if(clickLL) setTimeout(why,50)});
+
+// ---------- forecast-hour view and ensemble agreement
+const LEADS=[3,24,48,72,96,120]; const LV={}, EV={}; const fl=L.layerGroup().addTo(map); let fcOn=false, fcTimer=null;
+async function getj(cache,key,url){ if(cache[key]!==undefined) return cache[key]; try{const r=await fetch(url,{cache:'no-store'}); cache[key]=r.ok?await r.json():null}catch(e){cache[key]=null} return cache[key]}
+async function drawFC(){
+  fl.clearLayers(); const d=days[+document.getElementById('slider').value]; const li=+document.getElementById('lead').value, h=LEADS[li];
+  document.getElementById('leadlab').textContent='+'+h+' h'; if(!d) return;
+  const Lv=await getj(LV,d,`leads_${d}.json`), Ev=await getj(EV,d,`ensemble_${d}.json`); let info=[];
+  if(fcOn&&document.getElementById('fcshow').checked){
+    if(Lv){ const k=Lv.leads.indexOf(h); if(k>=0){ let n=0; Lv.chance[k].forEach((p,i)=>{ if(p<0.01) return; n++;
+        L.circleMarker([Lv.lat[i],Lv.lon[i]>180?Lv.lon[i]-360:Lv.lon[i]],{radius:4,stroke:Lv.lock_in[k][i]>=0.5,color:'#000',weight:1.2,fillColor:'#7b3294',fillOpacity:Math.min(0.95,0.15+p*4)}).addTo(fl)});
+        info.push(`${n} points with formula chance ≥ 1% at +${h} h`)} else info.push(`no control-run ingredients archived at +${h} h`) }
+    if(Ev){ const k=Ev.leads.indexOf(h); if(k>=0){ let n=0; Ev.share[k].forEach((s,i)=>{ if(s<0.2) return; n++;
+        L.circleMarker([Ev.lat[i],Ev.lon[i]>180?Ev.lon[i]-360:Ev.lon[i]],{radius:3+9*s,color:'#1b7837',weight:1.4,fill:false,opacity:0.85}).addTo(fl)});
+        info.push(`${n} points where ≥ 20% of ${Ev.members} members are locked in`)} }
+    else info.push('ensemble agreement is computed for the latest day only');
+  }
+  document.getElementById('fcinfo').innerHTML=info.join('<br>');
+}
+document.getElementById('lead').addEventListener('input',()=>{drawFC(); if(clickLL) why()});
+document.getElementById('fcshow').addEventListener('change',drawFC);
+document.getElementById('leadplay').onclick=()=>{ if(fcTimer){clearInterval(fcTimer);fcTimer=null;return}
+  fcTimer=setInterval(()=>{const s=document.getElementById('lead'); s.value=(+s.value+1)%LEADS.length; drawFC()},1100)};
+document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',()=>{fcOn=b.dataset.t==='fc'; drawFC()}));
+document.getElementById('slider').addEventListener('input',()=>setTimeout(drawFC,60));
+async function whyLeads(lat,lon,d){
+  const Lv=await getj(LV,d,`leads_${d}.json`), Ev=await getj(EV,d,`ensemble_${d}.json`); let s='';
+  const nearest=(la,lo)=>{let bi=-1,bd=1e9; for(let i=0;i<la.length;i++){const dl=((lo[i]-lon+540)%360)-180,dd=Math.hypot(la[i]-lat,dl*Math.cos(lat*Math.PI/180)); if(dd<bd){bd=dd;bi=i}} return bd<=2.6?bi:-1};
+  if(Lv){const i=nearest(Lv.lat,Lv.lon); if(i>=0) s+='<h4 style="margin:10px 0 4px">Through the forecast</h4><div class="kv">'+Lv.leads.map((h,k)=>`<span>+${h} h: formula chance, spin, shear</span><span>${(100*Lv.chance[k][i]).toFixed(1)}% · ${Lv.spin[k][i]} · ${Lv.shear[k][i]} m/s${Lv.lock_in[k][i]>=0.5?' · locked in':''}</span>`).join('')+'</div>'}
+  if(Ev){const i=nearest(Ev.lat,Ev.lon); s+='<h4 style="margin:10px 0 4px">Ensemble members locked in</h4><div class="kv">'+Ev.leads.map((h,k)=>`<span>+${h} h</span><span>${i>=0?Math.round(100*Ev.share[k][i]):0}% of ${Ev.members}</span>`).join('')+'</div>'}
+  return s;
+}
 </script>
 </body>
 </html>
