@@ -1,0 +1,147 @@
+{
+ "version": "1.0.0 (frozen 2026-10-20)",
+ "platt": {
+  "y03": [
+   -0.25326804220870597,
+   0.8904674128092487
+  ],
+  "y45": [
+   -0.5888666090079945,
+   0.8594624074070486
+  ]
+ },
+ "gate_reach": 1e-06,
+ "storm_mask_deg": 5.0,
+ "storm_min_kt": 34.0,
+ "neighbour_offsets": {
+  "bands": [
+   [
+    5,
+    6
+   ],
+   [
+    6,
+    7
+   ],
+   [
+    7,
+    8
+   ],
+   [
+    8,
+    10
+   ]
+  ],
+  "logodds": [
+   -1.9987221107288367,
+   -1.3312033930383713,
+   -0.9423433662943215,
+   -0.5877986761721508
+  ]
+ },
+ "alert_mask_deg": 10.0,
+ "west_poleward": {
+  "min_kt": 50.0,
+  "r_min_km": 800.0,
+  "r_max_km": 2500.0
+ },
+ "alert_point": {
+  "p03": 0.05,
+  "p45": 0.02,
+  "scale": 1.0
+ },
+ "cluster": {
+  "min_points": 6,
+  "min_age_days": 3,
+  "link_deg": 5.0
+ },
+ "levels": {
+  "orange": {
+   "min_points": 12,
+   "min_age_days": 5
+  },
+  "red": {
+   "min_points": 25,
+   "min_age_days": 8,
+   "min_peak_p03": 0.35
+  }
+ },
+ "verification_2017_2019": {
+  "storms_alerted_24h": 0.849,
+  "false_alarm_regions_per_season": 328,
+  "became_storm": {
+   "yellow": 0.4,
+   "orange": 0.52,
+   "red": 0.82
+  },
+  "note": "Operating point s=1 is the closest scanned value to the pre-registered target (>=85% of storms alerted >=24 h ahead); it reaches 84.9%, just below the target, and no scanned value met it (see OPERATING_POINT_PREREG.md)."
+ },
+ "sources": {
+  "gefs": "https://noaa-gefs-pds.s3.amazonaws.com",
+  "tcvitals": "https://noaa-gfs-bdp-pds.s3.amazonaws.com",
+  "ibtracs_active": "https://www.ncei.noaa.gov/data/international-best-track-archive-for-climate-stewardship-ibtracs/v04r01/access/csv/ibtracs.ACTIVE.list.v04r01.csv"
+ },
+ "bomb": {
+  "threshold": 0.090372,
+  "version": "1.0 (frozen 2026-10-23; trained 2010-16, threshold 2017-19, blind-tested 2000-09)",
+  "verification_2000_2009": {
+   "events_alerted_24h": 0.82,
+   "auc": 0.952,
+   "reference_forecast_pressure_falls_alerted": 0.6,
+   "alert_point_rate": 0.0134
+  }
+ },
+ "terms": {
+  "source": "PLANETARY_SPIN_RESULT.md capped-spin tropical formula (fitted 2010-16, AUC 0.911 on 2001-09); TERMS_ROUND3_RESULT.md explosive-low formula (AUC 0.819 on 2000-09); BATHTUB_GATE_RESULT.md gate",
+  "tropical": {
+   "coef": {
+    "intercept": -5.572571756398819,
+    "spin": 3.044004112072488,
+    "humidity": 2.5321642616174036,
+    "shear": -2.549269531443199,
+    "reach": 0.16488321580156123,
+    "sst": 0.40460367096144034,
+    "lat": -0.5865618583875309
+   },
+   "gate": {
+    "N_star": 1.17,
+    "width": 0.89
+   },
+   "reference": {
+    "le": 1.5216745985056375,
+    "alat": 2.0,
+    "lH": -0.6989084910784936,
+    "S": 0.9500513790512257,
+    "lR": -1.580525203476953,
+    "E": 0.3667089641094208,
+    "N": -0.2133450266228465
+   },
+   "spin_cap": 6.0
+  },
+  "bomb": {
+   "coef": {
+    "intercept": -12.214080017900915,
+    "spin": 1.0737185754802654,
+    "baroclinicity": 0.7588732178432823,
+    "moisture": 0.06870038974200325,
+    "jet": 0.9918594262513225,
+    "up": [
+     0.507112321919347,
+     0.42519145080826737,
+     0.6544275758042514,
+     0.439724524406266
+    ],
+    "low": -0.31136325085585165,
+    "low_x_trough": -0.28522915478440364
+   },
+   "reference": {
+    "le": 2.2819617514177275,
+    "lB": 0.07793712710918378,
+    "lPW": 2.5851761029516753,
+    "lJ": 3.8441455830250604,
+    "up": -0.0728447998046875,
+    "low": -0.13140694580078124
+   }
+  }
+ }
+}

@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storm formation outlook (experimental)</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+ body{margin:0;font:14px/1.4 system-ui,sans-serif} #map{position:absolute;top:64px;bottom:44px;left:0;right:380px}
+ header{height:64px;padding:6px 12px;box-sizing:border-box;background:#1f2d3d;color:#fff}
+ header b{font-size:16px} header small{display:block;opacity:.85}
+ #bar{position:absolute;bottom:0;height:44px;width:100%;box-sizing:border-box;padding:8px 12px;background:#eef1f4;display:flex;gap:10px;align-items:center}
+ #bar input[type=range]{flex:1} #bar button{min-width:34px} #day{min-width:120px;font-weight:600}
+ .legend{background:#fff;padding:6px 8px;border-radius:4px;line-height:1.5}
+ #panel{position:absolute;top:64px;bottom:44px;right:0;width:380px;box-sizing:border-box;border-left:1px solid #d5dbe1;background:#fafbfc;display:flex;flex-direction:column}
+ #tabs{display:flex;border-bottom:1px solid #d5dbe1} #tabs button{flex:1;border:0;background:none;padding:9px 4px;font:600 13px system-ui;color:#4a5560;cursor:pointer;border-bottom:3px solid transparent}
+ #tabs button.on{color:#1f2d3d;border-bottom-color:#1f4e79} .pane{display:none;padding:10px 12px;overflow:auto;flex:1} .pane.on{display:block}
+ .term{display:grid;grid-template-columns:110px 1fr 54px;align-items:center;gap:6px;margin:4px 0;font-size:12.5px}
+ .track{position:relative;height:12px;background:#eef1f4;border-radius:2px} .track i{position:absolute;top:0;bottom:0} .track:after{content:'';position:absolute;left:50%;top:-2px;bottom:-2px;border-left:1px solid #9aa4ad}
+ .muted{color:#6b7580;font-size:12px} .big{font-size:20px;font-weight:700} .kv{display:grid;grid-template-columns:1fr auto;gap:2px 10px;font-size:12.5px;margin-top:6px}
+ @media (max-width:900px){#map{right:0;bottom:44%} #panel{top:auto;height:calc(44% - 44px);width:100%;bottom:44px}}
+ .sw{display:inline-block;width:12px;height:12px;margin-right:6px;vertical-align:-1px}
+</style>
+</head>
+<body>
+<header><b>Storm formation outlook</b> <span id="issued"></span>
+<small>Experimental research product, not an official warning. Follow your national meteorological service. Where new tropical cyclones may form in the next 5 days.</small></header>
+<div id="map"></div>
+<div id="panel"><div id="tabs"><button data-t="why" class="on">Why here?</button><button data-t="fc">Forecast</button><button data-t="score">Scorecard</button><button data-t="replay">Replay</button><button data-t="about">About</button></div>
+<div class="pane on" id="p-why"><div class="muted">Click anywhere on the map to see which ingredients raise or lower the chance of a storm forming there, for the day shown.</div><div id="why"></div></div>
+<div class="pane" id="p-fc"><div class="muted">How the outlook issued on the day shown evolves through the forecast. Colour: chance from the physical formula using that hour's ingredients. Rings: ensemble members with spin above the lock-in threshold (latest day only).</div>
+<div style="display:flex;gap:6px;align-items:center;margin:8px 0"><b>Forecast hour</b><input id="lead" type="range" min="0" max="5" value="0" style="flex:1"><span id="leadlab" style="min-width:58px;font-weight:600">+3 h</span><button id="leadplay">&#9654;</button></div>
+<label class="muted"><input id="fcshow" type="checkbox" checked> show forecast layer on map</label>
+<div id="fcinfo" style="margin-top:8px;font-size:12.5px"></div>
+<div class="legend" style="margin-top:8px;border:1px solid #e3e7eb"><span class="sw" style="background:#7b3294;border-radius:6px"></span>formula chance (darker = higher)<br><span class="sw" style="border:2px solid #1b7837;border-radius:6px;background:#fff"></span>ensemble members locked in (bigger = more)<br><span class="sw" style="border:2px solid #000;border-radius:6px;background:#7b3294"></span>locked in (shear switched off)</div></div>
+<div class="pane" id="p-score"><div id="tally" class="kv-block">Scorecard: loading</div><hr><div id="score">Live scorecard: not enough verified days yet</div></div>
+<div class="pane" id="p-replay"><div class="muted">All days in this folder, one frame per day (made by make_gif.py after each run).</div><img src="outlook_animation.gif" style="width:100%;margin-top:6px" alt="animation of all outlook days" onerror="this.replaceWith('No animation yet: it appears after the next run.')"></div>
+<div class="pane" id="p-about">
+<p><b>Two layers.</b> Tropical-storm formation (10–35° latitude, next 0–5 days) and explosive mid-latitude lows (25–70°, next 3 days). The alerts come from boosted-tree models that were blind-tested before release.</p>
+<p><b>Forecast tab:</b> the physical formula re-evaluated with each forecast hour's ingredients, at fixed grid points. A disturbance that moves away makes the chance at its old position fall, so follow the colour across the map, not one point. The green rings count how many of 10 ensemble members have spin above the lock-in threshold. They are computed for the latest day only, about 27 MB of extra download. Known limit: an existing storm masked at issue time can move into unmasked points later in the forecast, where its spin also shows as rings.</p>
+<p><b>"Why here?"</b> uses simpler physical formulas, fitted on 2010–16 and tested on unseen years. Each bar is that ingredient's push on the odds compared with a typical point, shown as a multiplier.</p>
+<p><b>Shared structure of the vortices:</b> a seed of spin, an energy source that has to switch on, and a feedback loop that locks the vortex in once it is strong.</p>
+<p><b>What differs:</b> vertical wind shear brakes tropical storms, but fuels mid-latitude lows through the temperature contrast. Strong net spin switches the tropical shear brake off ("lock-in").</p>
+<p class="muted">Experimental research tool, free for non-commercial use (PolyForm Noncommercial 1.0.0). Not an official warning.</p></div></div>
+
+<div id="bar"><button id="prev" title="previous day">&#9664;</button><button id="play" title="play">&#9654;</button><button id="next" title="next day">&#9654;&#9654;</button>
+<span id="day"></span><input id="slider" type="range" min="0" max="0" value="0">
+<label><input id="trails" type="checkbox" checked> paths</label> <label><input id="bombs" type="checkbox" checked> explosive lows</label> <a id="giflink" href="outlook_animation.gif" target="_blank" style="font-weight:600">&#127902; animation (GIF, all days)</a></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map=L.map('map',{worldCopyJump:true}).setView([10,150],3);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:7,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+const col={yellow:'#f2c400',orange:'#ef7d00',red:'#d62728'};
+const rate={yellow:'about 4 in 10',orange:'about 5 in 10',red:'about 8 in 10'};
+const MAXDAYS=30; let days=[], G={}, BB={}, BV=null, MV=null, layer=L.layerGroup().addTo(map), timer=null;
+const GREEN='#2e7d32', GREY='#8a8a8a';
+const dnum=d=>Date.UTC(+d.slice(0,4),+d.slice(4,6)-1,+d.slice(6,8))/864e5;
+const dlon=(a,b)=>((a-b+540)%360)-180;
+const dist=(a,b)=>Math.hypot(dlon(a[0],b[0])*Math.cos(b[1]*Math.PI/180),a[1]-b[1]);
+// unwrap a path so it does not jump across the date line
+const unwrap=pts=>{const o=[];pts.forEach((p,i)=>{if(!i){o.push([p[1],p[0]]);return}const lon=o[i-1][1]+dlon(p[0],o[i-1][1]);o.push([p[1],lon])});return o};
+function centroid(f){const c=f.geometry.coordinates.map(q=>[(q[0][0][0]+q[0][1][0])/2,(q[0][0][1]+q[0][2][1])/2]);
+  let x=0,y=0,la=0;c.forEach(p=>{x+=Math.cos(p[0]*Math.PI/180);y+=Math.sin(p[0]*Math.PI/180);la+=p[1]});return [Math.atan2(y,x)*180/Math.PI,la/c.length]}
+function regionPaths(i){ // link each region to the nearest region of the previous day (<= 8 deg)
+  let prev=[];for(let k=Math.max(0,i-MAXDAYS);k<=i;k++){const g=G[days[k]];if(!g)continue;
+    const cur=g.features.filter(f=>f.properties.kind==='alert').map(f=>({f,c:centroid(f)}));
+    cur.forEach(r=>{let best=null,bd=8;prev.forEach(q=>{const d=dist(r.c,q.c);if(d<=bd){bd=d;best=q}});r.path=best?best.path.concat([r.c]):[r.c]});prev=cur}
+  return prev}
+function stormTracks(i){const T={};for(let k=Math.max(0,i-MAXDAYS);k<=i;k++){const g=G[days[k]];if(!g)continue;
+  g.features.filter(f=>f.properties.kind==='active_storm').forEach(f=>{(T[f.properties.id]=T[f.properties.id]||[]).push(f.geometry.coordinates)})}return T}
+function statusAsOf(day,idx,view){ // what was known by the viewed day: hit once the storm has formed, grey once 5 days pass
+  if(!MV) return null; const r=MV.regions.find(q=>q.day===day&&q.index===idx); if(!r) return null;
+  const b=r.became.filter(x=>x.day<=view); if(b.length) return {s:'hit',b};
+  if(dnum(view)-dnum(day)>=5) return {s:'false_alarm'}; return {s:'pending'}}
+function draw(i){
+  if(typeof why==='function'&&clickLL) setTimeout(why,50);
+  layer.clearLayers(); const g=G[days[i]]; if(!g) return;
+  document.getElementById('day').textContent=g.issued; document.getElementById('slider').value=i;
+  document.getElementById('issued').textContent='— issued '+g.issued+' (storm positions: '+g.storm_source+')';
+  L.geoJSON(g,{filter:f=>f.properties.kind==='chance_0_3d',
+    pointToLayer:(f,ll)=>L.circleMarker(ll,{radius:3,stroke:false,fillColor:'#3b6ea8',fillOpacity:Math.min(0.9,f.properties.value*3)})}).addTo(layer);
+  const view=days[i];
+  L.geoJSON(g,{filter:f=>f.properties.kind==='alert',style:f=>({color:col[f.properties.level],weight:1,fillOpacity:0.35}),
+    onEachFeature:(f,l)=>{const p=f.properties;l.bindPopup(`<b>${p.level} region</b><br>${p.size} grid points, tracked ${p.age_days} days<br>peak chance 0–3 days: ${Math.round(p.peak_chance_0_3d*100)}%<br>peak chance 3–5 days: ${Math.round(p.peak_chance_3_5d*100)}%<br>regions like this became storms ${rate[p.level]} times (2017–19 test)`)}}).addTo(layer);
+  if(MV&&view){
+    // formations up to the viewed day: green check (alerted beforehand) or red cross (no alert)
+    const placed=[];
+    MV.formations.filter(f=>f.day<=view&&dnum(view)-dnum(f.day)<=7).forEach(f=>{
+      const fresh=f.day===view, ll=[f.lat,f.lon];
+      const k=placed.filter(q=>Math.abs(dlon(q[1],f.lon))<35&&Math.abs(q[0]-f.lat)<6).length; placed.push(ll); const ay=10-24*k;
+      if(f.hit){
+        // keep the alert region that predicted it on screen, in green, for 5 days after formation
+        if(dnum(view)-dnum(f.day)<=5){ const prevs=MV.regions.filter(r=>r.status==='hit'&&r.became.some(b=>b.id===f.id)).sort((a,b)=>a.day<b.day?1:-1);
+          const rr=prevs[0]; if(rr&&G[rr.day]){const feat=G[rr.day].features.filter(x=>x.properties.kind==='alert')[rr.index];
+            L.geoJSON(feat,{style:{color:GREEN,weight:2,fillColor:GREEN,fillOpacity:fresh?0.45:0.25,dashArray:fresh?null:'4 4'}}).bindTooltip(`alert region that preceded ${f.name}`).addTo(layer)}}
+        L.marker(ll,{icon:L.divIcon({className:'',html:`<div style="background:${GREEN};color:#fff;border-radius:12px;padding:1px 7px;font-weight:700;white-space:nowrap;box-shadow:0 0 0 2px #fff">&#10003; ${f.name}${fresh?' formed':''}: alerted ${f.lead_days} d ahead</div>`,iconAnchor:[-8,ay]})}).addTo(layer);
+      } else {
+        L.marker(ll,{icon:L.divIcon({className:'',html:`<div style="background:#c62828;color:#fff;border-radius:12px;padding:1px 7px;font-weight:700;white-space:nowrap;box-shadow:0 0 0 2px #fff">&#10007; ${f.name}: formed without an alert${f.covered?'':' (outside coverage)'}</div>`,iconAnchor:[-8,ay]})}).addTo(layer);
+      }});
+    // alerts whose 5-day window closed today with no storm, where nothing is alerted now: grey outline
+    const cur=g.features.filter(x=>x.properties.kind==='alert').map(centroid);
+    MV.regions.filter(r=>r.status==='false_alarm'&&dnum(view)-dnum(r.day)===5&&G[r.day]).forEach(r=>{
+      const feat=G[r.day].features.filter(x=>x.properties.kind==='alert')[r.index]; if(!feat) return; const c=centroid(feat);
+      if(cur.some(q=>dist(q,c)<=8)) return;
+      L.geoJSON(feat,{style:{color:GREY,weight:1.5,fillColor:GREY,fillOpacity:0.15,dashArray:'3 3'}}).bindTooltip(`alert from ${r.day.slice(6,8)}/${r.day.slice(4,6)}: no storm within 5 days`).addTo(layer)});
+    // tally for the period shown, using only what was known by the viewed day
+    const F=MV.formations.filter(f=>f.day<=view), hits=F.filter(f=>f.hit), miss=F.filter(f=>!f.hit);
+    let rh=0,rf=0; days.slice(0,i+1).forEach(d=>{const g2=G[d]; if(!g2) return; g2.features.filter(x=>x.properties.kind==='alert').forEach((x,k)=>{const st=statusAsOf(d,k,view); if(!st) return; if(st.s==='hit')rh++; else if(st.s==='false_alarm')rf++})});
+    const L_=hits.map(f=>f.lead_days).sort((a,b)=>a-b), med=L_.length?L_[Math.floor((L_.length-1)/2)]:null;
+    document.getElementById('tally').innerHTML=`<b>Scorecard, ${days[0].slice(6,8)}/${days[0].slice(4,6)} to ${view.slice(6,8)}/${view.slice(4,6)}</b><br>`+
+      `storms formed: ${F.length} &nbsp; <span style="color:${GREEN}">&#10003; alerted ahead ${hits.length}</span> &nbsp; <span style="color:#c62828">&#10007; missed ${miss.length}</span>`+
+      (med!=null?`<br>median warning: ${med} days`:'')+
+      `<br>alert region-days: <span style="color:${GREEN}">became storms ${rh}</span>, <span style="color:${GREY}">no storm ${rf}</span>`+(rh+rf?` (${Math.round(100*rh/(rh+rf))}% hit; 2017–19 test: about 40%)`:'')+
+      `<br><small>regions under 5 days old are not scored yet</small>`;
+  }
+  let btxt='';
+  if(document.getElementById('bombs').checked&&view&&BB[view]){
+    const PUR='#6a1b9a';
+    BB[view].alerts.forEach(a=>{const [la,lo,p]=a, x=lo>180?lo-360:lo;
+      L.rectangle([[la-1.25,x-1.25],[la+1.25,x+1.25]],{color:PUR,weight:0.5,fillColor:PUR,fillOpacity:Math.min(0.55,0.15+p)}).bindTooltip(`explosive-deepening chance (3 days): ${Math.round(p*100)}%`).addTo(layer)});
+    if(BV){ const ev=BV.events.filter(e=>e.scorable&&!e.tropical_cyclone&&e.start<=view);
+      ev.filter(e=>dnum(view)-dnum(e.start)<=3).forEach(e=>{const ok=e.alerted_days_before>0, x=e.lon>180?e.lon-360:e.lon;
+        L.marker([e.lat,x],{icon:L.divIcon({className:'',html:`<div style="background:${ok?PUR:'#c62828'};color:#fff;border-radius:12px;padding:1px 7px;font-weight:700;white-space:nowrap;box-shadow:0 0 0 2px #fff">${ok?'&#10003;':'&#10007;'} explosive low −${e.fall_hpa} hPa/24 h${ok?`: alerted ${e.alerted_days_before} d ahead`:': no alert'}</div>`,iconAnchor:[-8,10]})}).addTo(layer)});
+      const hitb=ev.filter(e=>e.alerted_days_before>0).length;
+      btxt=`<br><b style="color:${PUR}">Explosive lows</b>: ${ev.length} detected, ${hitb} alerted 1–2 days ahead`+(ev.length?` (${Math.round(100*hitb/ev.length)}%; 2000–09 test: 82%)`:''); }
+  }
+  if(btxt){const t=document.getElementById('tally'); t.innerHTML=t.innerHTML.replace('<br><small>regions under','<br>'+btxt.slice(4)+'<br><small>regions under')}
+  const trails=document.getElementById('trails').checked;
+  if(trails){ regionPaths(i).forEach(r=>{ if(r.path.length>1){L.polyline(unwrap(r.path),{color:'#5a3d00',weight:2}).addTo(layer);
+      const a=r.path[r.path.length-2], b=r.path[r.path.length-1], v=[dlon(b[0],a[0]),b[1]-a[1]];
+      if(Math.hypot(v[0],v[1])>0.3) L.polyline([[b[1],b[0]],[b[1]+v[1],b[0]+v[0]]],{color:'#5a3d00',weight:2,dashArray:'5 5'}).bindTooltip('region drift over the last day, extended 1 day (extrapolation, not a forecast)').addTo(layer)}});
+    Object.values(stormTracks(i)).forEach(t=>{if(t.length>1)L.polyline(unwrap(t),{color:'#222',weight:2}).addTo(layer)}); }
+  L.geoJSON(g,{filter:f=>f.properties.kind==='active_storm',
+    pointToLayer:(f,ll)=>L.circleMarker(ll,{radius:6,color:'#000',weight:2,fillColor:'#fff',fillOpacity:1}),
+    onEachFeature:(f,l)=>{const p=f.properties;l.bindPopup(`<b>${p.name}</b> (${p.id})<br>${p.wind_kt} kt`+(p.motion_ms!=null?`<br>moving toward ${Math.round(p.motion_deg)}° at ${Math.round(p.motion_ms*3.6)} km/h`:''));
+      if(trails&&p.motion_ms!=null){const [lo,la]=f.geometry.coordinates, Lk=p.motion_ms*86.4/111, r=p.motion_deg*Math.PI/180;
+        L.polyline([[la,lo],[la+Lk*Math.cos(r),lo+Lk*Math.sin(r)/Math.max(Math.cos(la*Math.PI/180),0.3)]],{color:'#000',weight:2,dashArray:'2 4'}).bindTooltip('agency motion, next 24 h if unchanged').addTo(layer)}}}).addTo(layer);
+}
+async function load(){
+  let dl=null; try{const r=await fetch('days.json',{cache:'no-store'}); if(r.ok) dl=await r.json()}catch(e){}
+  days=(dl&&dl.length?dl:[null]).slice(-MAXDAYS);
+  try{const r=await fetch('map_verification.json',{cache:'no-store'}); if(r.ok) MV=await r.json()}catch(e){}
+  try{const r=await fetch('bomb_verification.json',{cache:'no-store'}); if(r.ok) BV=await r.json()}catch(e){}
+  await Promise.all(days.filter(d=>d).map(async d=>{try{const r=await fetch(`bomb_${d}.json`,{cache:'no-store'}); if(r.ok) BB[d]=await r.json()}catch(e){}}));
+  await Promise.all(days.map(async d=>{const r=await fetch(d?`outlook_${d}.geojson`:'outlook.geojson',{cache:'no-store'}); if(r.ok) G[d]=await r.json()}));
+  const s=document.getElementById('slider'); s.max=days.length-1; const qd=new URLSearchParams(location.search).get('day'); draw(qd&&days.includes(qd)?days.indexOf(qd):days.length-1);
+  s.oninput=()=>draw(+s.value);
+  document.getElementById('prev').onclick=()=>draw(Math.max(0,+s.value-1));
+  document.getElementById('next').onclick=()=>draw(Math.min(days.length-1,+s.value+1));
+  document.getElementById('trails').onchange=()=>draw(+s.value);
+  document.getElementById('bombs').onchange=()=>draw(+s.value);
+  document.getElementById('play').onclick=()=>{ if(timer){clearInterval(timer);timer=null;return}
+    let i=(+s.value>=days.length-1)?0:+s.value; draw(i); timer=setInterval(()=>{i=(i+1)%days.length; draw(i)},900)};   // loops until paused
+}
+load();
+fetch('verification.json',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(v=>{
+  if(!v||!v.storms_scored) return;
+  const pc=x=>x==null?'–':Math.round(x*100)+'%', ref=v.reference_2017_2019;
+  document.getElementById('score').innerHTML=`<b>Live scorecard</b> (${v.period})<br>`+
+   `storms alerted ≥ 24 h ahead: ${pc(v.storms_alerted_24h)} of ${v.storms_scored} (2017–19: ${pc(ref.storms_alerted_24h)})<br>`+
+   `alert regions that became storms: ${pc(v.became_storm.yellow)} (2017–19: ${pc(ref.became_storm.yellow)})`+
+   (v.drift_flags.length?`<br><b style="color:#c0504d">Check: ${v.drift_flags.join('; ')}</b>`:'');
+});
+const lg=L.control({position:'bottomleft'});
+lg.onAdd=()=>{const d=L.DomUtil.create('div','legend');d.innerHTML=
+ '<span class="sw" style="background:#f2c400"></span>yellow: persistent alert region<br>'+
+ '<span class="sw" style="background:#ef7d00"></span>orange: large, ≥ 5 days<br>'+
+ '<span class="sw" style="background:#d62728"></span>red: very large, ≥ 8 days, strong<br>'+
+ '<span class="sw" style="background:#3b6ea8;border-radius:6px"></span>chance of formation, 0–3 days<br>'+
+ '<span class="sw" style="background:#fff;border:2px solid #000;border-radius:6px"></span>active storm (line: track so far; dotted: next 24 h)<br>'+
+ '<span class="sw" style="border-top:2px solid #5a3d00;height:0"></span>alert-region path (dashed: drift, extrapolated)<br>'+
+ '<span class="sw" style="background:#2e7d32"></span>&#10003; alert came true (storm formed within 5° in 1–5 days)<br>'+
+ '<span class="sw" style="background:#8a8a8a"></span>alert expired with no storm after 5 days<br>'+
+ '<span class="sw" style="background:#c62828"></span>&#10007; storm formed without an alert<br>'+
+ '<span class="sw" style="background:#6a1b9a"></span>explosive-low chance (mid-latitudes, next 3 days)';return d};
+lg.addTo(map);
+
+// ---------- dashboard panel
+document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#tabs button,.pane').forEach(x=>x.classList.remove('on'));b.classList.add('on');document.getElementById('p-'+b.dataset.t).classList.add('on')});
+const TM={}; let clickLL=null, clickMark=null;
+async function terms(d){ if(TM[d]!==undefined) return TM[d]; try{const r=await fetch(`terms_${d}.json`,{cache:'no-store'}); TM[d]=r.ok?await r.json():null}catch(e){TM[d]=null} return TM[d]}
+const NAMES={spin:'spin',latitude:'latitude',humidity:'mid-level humidity',shear:'wind shear',instability:'instability nearby',ocean_heat:'ocean heat',
+  temperature_contrast:'temperature contrast',moisture:'moisture',jet:'jet stream',upstream_trough:'upper trough upstream',surface_low:'surface low'};
+function bars(c){ return Object.entries(c).map(([k,v])=>{ if(v==null) return ''; const w=Math.min(50,Math.abs(v)*12), up=v>=0;
+  return `<div class="term"><span>${NAMES[k]||k}</span><span class="track"><i style="${up?'left:50%':'right:50%'};width:${w}%;background:${up?'#1f4e79':'#e08214'}"></i></span><span style="text-align:right">×${Math.exp(v).toFixed(v>2.3||v<-2.3?0:1)}</span></div>`}).join('')}
+async function why(){
+  const el=document.getElementById('why'); if(!clickLL) return; const d=days[+document.getElementById('slider').value]; if(!d) return;
+  const T=await terms(d), lat=clickLL.lat, lon=((clickLL.lng%360)+360)%360; let html='';
+  const near=(la,lo)=>{let bi=-1,bd=1e9; for(let i=0;i<la.length;i++){const dl=((lo[i]-lon+540)%360)-180, dd=Math.hypot(la[i]-lat,dl*Math.cos(lat*Math.PI/180)); if(dd<bd){bd=dd;bi=i}} return [bi,bd]};
+  if(T&&T.lat.length){ const [i,dd]=near(T.lat,T.lon);
+    if(dd<=2.6){ const c={}; for(const k in T.contrib) c[k]=T.contrib[k][i]; const r=k=>T.raw[k][i];
+      html+=`<h3 style="margin:8px 0 2px">Tropical-storm formation</h3><div class="muted">grid point ${T.lat[i]}°, ${T.lon[i]>180?(T.lon[i]-360):T.lon[i]}° — issued ${T.issued}</div>
+      <div class="kv"><span>chance in 0–3 days (forecast model)</span><span class="big">${(100*T.tree_chance[i]).toFixed(1)}%</span><span>simple physical formula (less sharp)</span><span>${(100*T.formula_chance[i]).toFixed(1)}%</span></div>
+      <h4 style="margin:10px 0 4px">What pushes it up or down <span class="muted">(vs a typical tropical ocean point)</span></h4>${bars(c)}
+      <div class="kv"><span>net spin</span><span>${r('spin_1e5')} ×10⁻⁵ s⁻¹</span><span>wind shear</span><span>${r('shear_ms')} m/s</span><span>humidity (700 hPa)</span><span>${r('humidity_gkg')} g/kg</span>
+      <span>area with strong instability</span><span>${Math.round(100*r('instability_share'))}%</span><span>sea temperature</span><span>${r('sst_c')==null?'n/a':r('sst_c')+' °C'}</span></div>
+      <p style="font-size:12.5px">${T.lock_in[i]>=0.5?`<b>Locked in:</b> spin is strong enough that shear is ${Math.round(100*T.lock_in[i])}% switched off.`:`Shear brake active: only ${Math.round(100*T.lock_in[i])}% switched off. It switches off above about 1.2 ×10⁻⁵ s⁻¹ net spin.`}</p>`; } }
+  const Bd=BB[d]; if(Bd&&Bd.terms&&Bd.alerts.length){ const la=Bd.alerts.map(a=>a[0]), lo=Bd.alerts.map(a=>a[1]); const [i,dd]=near(la,lo);
+    if(dd<=2.6){ const c={}; for(const k in Bd.terms.contrib) c[k]=Bd.terms.contrib[k][i];
+      html+=`<h3 style="margin:12px 0 2px;color:#6a1b9a">Explosive low (next 3 days)</h3><div class="kv"><span>chance (forecast model)</span><span class="big">${Math.round(100*Bd.alerts[i][2])}%</span></div>
+      <h4 style="margin:10px 0 4px">What pushes it up or down</h4>${bars(c)}`; } }
+  if(html) html+=await whyLeads(lat,lon,d);
+  el.innerHTML=html||'<p class="muted">No tropical grid point or explosive-low alert within about 2.5° of here on this day. The tropical layer covers ocean at 10–35° latitude.</p>';
+}
+map.on('click',e=>{clickLL=e.latlng; if(clickMark) map.removeLayer(clickMark); clickMark=L.circleMarker(e.latlng,{radius:5,color:'#111',weight:2,fill:false}).addTo(map);
+  document.querySelector('#tabs button[data-t=why]').click(); why()});
+document.getElementById('slider').addEventListener('input',()=>{if(clickLL) setTimeout(why,50)});
+
+// ---------- forecast-hour view and ensemble agreement
+const LEADS=[3,24,48,72,96,120]; const LV={}, EV={}; const fl=L.layerGroup().addTo(map); let fcOn=false, fcTimer=null;
+async function getj(cache,key,url){ if(cache[key]!==undefined) return cache[key]; try{const r=await fetch(url,{cache:'no-store'}); cache[key]=r.ok?await r.json():null}catch(e){cache[key]=null} return cache[key]}
+async function drawFC(){
+  fl.clearLayers(); const d=days[+document.getElementById('slider').value]; const li=+document.getElementById('lead').value, h=LEADS[li];
+  document.getElementById('leadlab').textContent='+'+h+' h'; if(!d) return;
+  const Lv=await getj(LV,d,`leads_${d}.json`), Ev=await getj(EV,d,`ensemble_${d}.json`); let info=[];
+  if(fcOn&&document.getElementById('fcshow').checked){
+    if(Lv){ const k=Lv.leads.indexOf(h); if(k>=0){ let n=0; Lv.chance[k].forEach((p,i)=>{ if(p<0.01) return; n++;
+        L.circleMarker([Lv.lat[i],Lv.lon[i]>180?Lv.lon[i]-360:Lv.lon[i]],{radius:4,stroke:Lv.lock_in[k][i]>=0.5,color:'#000',weight:1.2,fillColor:'#7b3294',fillOpacity:Math.min(0.95,0.15+p*4)}).addTo(fl)});
+        info.push(`${n} points with formula chance ≥ 1% at +${h} h`)} else info.push(`no control-run ingredients archived at +${h} h`) }
+    if(Ev){ const k=Ev.leads.indexOf(h); if(k>=0){ let n=0; Ev.share[k].forEach((s,i)=>{ if(s<0.2) return; n++;
+        L.circleMarker([Ev.lat[i],Ev.lon[i]>180?Ev.lon[i]-360:Ev.lon[i]],{radius:3+9*s,color:'#1b7837',weight:1.4,fill:false,opacity:0.85}).addTo(fl)});
+        info.push(`${n} points where ≥ 20% of ${Ev.members} members are locked in`)} }
+    else info.push('ensemble agreement is computed for the latest day only');
+  }
+  document.getElementById('fcinfo').innerHTML=info.join('<br>');
+}
+document.getElementById('lead').addEventListener('input',()=>{drawFC(); if(clickLL) why()});
+document.getElementById('fcshow').addEventListener('change',drawFC);
+document.getElementById('leadplay').onclick=()=>{ if(fcTimer){clearInterval(fcTimer);fcTimer=null;return}
+  fcTimer=setInterval(()=>{const s=document.getElementById('lead'); s.value=(+s.value+1)%LEADS.length; drawFC()},1100)};
+document.querySelectorAll('#tabs button').forEach(b=>b.addEventListener('click',()=>{fcOn=b.dataset.t==='fc'; drawFC()}));
+document.getElementById('slider').addEventListener('input',()=>setTimeout(drawFC,60));
+async function whyLeads(lat,lon,d){
+  const Lv=await getj(LV,d,`leads_${d}.json`), Ev=await getj(EV,d,`ensemble_${d}.json`); let s='';
+  const nearest=(la,lo)=>{let bi=-1,bd=1e9; for(let i=0;i<la.length;i++){const dl=((lo[i]-lon+540)%360)-180,dd=Math.hypot(la[i]-lat,dl*Math.cos(lat*Math.PI/180)); if(dd<bd){bd=dd;bi=i}} return bd<=2.6?bi:-1};
+  if(Lv){const i=nearest(Lv.lat,Lv.lon); if(i>=0) s+='<h4 style="margin:10px 0 4px">Through the forecast</h4><div class="kv">'+Lv.leads.map((h,k)=>`<span>+${h} h: formula chance, spin, shear</span><span>${(100*Lv.chance[k][i]).toFixed(1)}% · ${Lv.spin[k][i]} · ${Lv.shear[k][i]} m/s${Lv.lock_in[k][i]>=0.5?' · locked in':''}</span>`).join('')+'</div>'}
+  if(Ev){const i=nearest(Ev.lat,Ev.lon); s+='<h4 style="margin:10px 0 4px">Ensemble members locked in</h4><div class="kv">'+Ev.leads.map((h,k)=>`<span>+${h} h</span><span>${i>=0?Math.round(100*Ev.share[k][i]):0}% of ${Ev.members}</span>`).join('')+'</div>'}
+  return s;
+}
+</script>
+</body>
+</html>
