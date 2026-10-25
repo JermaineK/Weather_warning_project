@@ -74,6 +74,11 @@ def fetch_gefs(day):
             prod = "pgrb2ap5" if prod_key == "a" else "pgrb2bp5"
             stem = f"{base}/gefs.{day:%Y%m%d}/00/atmos/{prod}/gec00.t00z.{prod[:6]}.0p50.f{h:03d}"
             out[(name, h)] = grib_field(stem, var, lev, h)
+    stem = f"{base}/gefs.{day:%Y%m%d}/00/atmos/pgrb2bp5/gec00.t00z.pgrb2b.0p50.f003"
+    try:                                                   # surface temperature, for the dashboard's ocean-heat term only
+        out[("tsfc", 3)] = grib_field(stem, "TMP", "surface", 3)
+    except Exception:
+        pass
     return out
 
 
@@ -368,9 +373,18 @@ def run(day, outdir, feat=None, storms=None):
         storms, source = fetch_storms(day)
     else:
         source = "supplied"
+    sst5 = None
     if feat is None:
-        feat = features(fetch_gefs(day))
+        F = fetch_gefs(day)
+        feat = features(F)
+        if ("tsfc", 3) in F:
+            sst5 = (_wconv(F[("tsfc", 3)], _K5) / _DEN5)[_PJ, _PK]
     p03_map, a03, a45 = probabilities(feat, day, storms)
+    try:                                                   # dashboard: physical term breakdown (does not affect alerts)
+        import terms
+        terms.write(day, outdir, feat, PTS, p03_map, p03_map > 0, sst5, _write_json)
+    except Exception as e:
+        print(f"{day:%Y-%m-%d}: term breakdown skipped ({type(e).__name__}: {str(e)[:80]})")
     regs = regions(a03, a45, day, prev)
     gj = geojson(day, regs, storms, p03_map, source)
     for name in (f"outlook_{day:%Y%m%d}.geojson", "outlook.geojson"):
