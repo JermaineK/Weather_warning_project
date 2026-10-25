@@ -23,7 +23,7 @@ def tropical(feat, pts, sst5=None):
     z5, sh, reach, q7 = feat[0].astype(float), feat[2].astype(float), feat[3].astype(float), feat[5].astype(float)
     fabs = 2 * 7.292e-5 * np.abs(np.sin(np.deg2rad(pts[:, 0])))
     N = z5 * 1e5
-    v = dict(le=np.log(np.maximum(z5 + fabs, 1e-6) * 1e5), alat=np.abs(pts[:, 0]) / 10, lH=np.log(np.maximum(q7 * 100, 1e-3)),
+    v = dict(le=np.log(np.minimum(np.maximum((z5 + fabs) * 1e5, 0.1), T["tropical"].get("spin_cap", 1e9))), alat=np.abs(pts[:, 0]) / 10, lH=np.log(np.maximum(q7 * 100, 1e-3)),
              S=np.log1p(sh / 10), lR=np.log(np.clip(reach, 1e-6, 1)))
     lock = _sig((N - g["N_star"]) / g["width"])                     # 0 = shear fully felt, 1 = shear switched off
     have_sst = sst5 is not None
