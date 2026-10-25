@@ -38,6 +38,15 @@ Overall, in 2017–19 forecasts the outlook alerted **84.9% of storms at least a
 
 Every constant is in `config.json`. The method and its tests are documented in the parent project.
 
+## Dashboard: "Why here?"
+The map page now has a side panel with four tabs:
+- **Why here?** Click anywhere to see which ingredients raise or lower the chance of a storm forming there on the day shown: spin, latitude, humidity, wind shear, nearby instability and ocean heat for tropical storms; spin, temperature contrast, moisture, jet stream, an upper trough upstream and the surface low for explosive lows. Each bar is that ingredient's push on the odds compared with a typical point, as a multiplier. It also shows whether the shear brake is "locked out" by strong spin.
+- **Scorecard:** hits, misses and false alarms so far.
+- **Replay:** the animation of every day in the folder.
+- **About:** what the layers and terms mean.
+
+The breakdown uses the simpler physical formulas from the pre-registered term tests (`terms.py`, fitted 2010–16 and tested on unseen years). The alerts still come from the tree models, so the formula's chance is shown alongside the forecast model's chance and is less sharp.
+
 ## Animation
 `run_local.py` also writes `outlook_animation.gif` in the output folder: one frame per day in the folder (alerts, hits and misses, storm tracks, explosive lows). The map page links to it. To make it by hand: `python make_gif.py --out C:/storm_outlook_data` (add `--days 30` for only the last 30 days).
 
