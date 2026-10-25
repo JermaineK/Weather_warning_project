@@ -99,14 +99,22 @@ def fetch_live(day, get, gefs_base):
 
 def run(day, outdir, get, gefs_base, write_json, storms=()):
     F = fetch_live(day, get, gefs_base)
-    p = chance(features(F), day)
+    fx = features(F)
+    p = chance(fx, day)
     on = p >= BCFG["threshold"]
+    tb = None
+    try:
+        import terms
+        con, pf = terms.bomb(fx, BP)
+        tb = dict(formula_chance=[round(float(x), 4) for x in pf[on]], contrib={k: [round(float(x), 2) for x in v[on]] for k, v in con.items()})
+    except Exception:
+        pass
     L = lows(F[("mslp", 3)])
     write_json(os.path.join(outdir, f"bomb_{day:%Y%m%d}.json"),
                dict(issued=f"{day:%Y-%m-%d} 00 UTC", threshold=BCFG["threshold"],
                     alerts=[[float(a), float(b), round(float(c), 3)] for (a, b), c in zip(BP[on], p[on])],
                     lows=[[float(a), float(b), round(float(c), 1)] for a, b, c in L],
-                    tropical=[[float(s["lat"]), float(s["lon"])] for s in storms if s["kt"] >= 34]), separators=(",", ":"))
+                    tropical=[[float(s["lat"]), float(s["lon"])] for s in storms if s["kt"] >= 34], terms=tb), separators=(",", ":"))
     return int(on.sum()), len(L)
 
 
