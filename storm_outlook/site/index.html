@@ -5,12 +5,19 @@
 <title>Storm formation outlook (experimental)</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
- body{margin:0;font:14px/1.4 system-ui,sans-serif} #map{position:absolute;top:64px;bottom:44px;width:100%}
+ body{margin:0;font:14px/1.4 system-ui,sans-serif} #map{position:absolute;top:64px;bottom:44px;left:0;right:380px}
  header{height:64px;padding:6px 12px;box-sizing:border-box;background:#1f2d3d;color:#fff}
  header b{font-size:16px} header small{display:block;opacity:.85}
  #bar{position:absolute;bottom:0;height:44px;width:100%;box-sizing:border-box;padding:8px 12px;background:#eef1f4;display:flex;gap:10px;align-items:center}
  #bar input[type=range]{flex:1} #bar button{min-width:34px} #day{min-width:120px;font-weight:600}
  .legend{background:#fff;padding:6px 8px;border-radius:4px;line-height:1.5}
+ #panel{position:absolute;top:64px;bottom:44px;right:0;width:380px;box-sizing:border-box;border-left:1px solid #d5dbe1;background:#fafbfc;display:flex;flex-direction:column}
+ #tabs{display:flex;border-bottom:1px solid #d5dbe1} #tabs button{flex:1;border:0;background:none;padding:9px 4px;font:600 13px system-ui;color:#4a5560;cursor:pointer;border-bottom:3px solid transparent}
+ #tabs button.on{color:#1f2d3d;border-bottom-color:#1f4e79} .pane{display:none;padding:10px 12px;overflow:auto;flex:1} .pane.on{display:block}
+ .term{display:grid;grid-template-columns:110px 1fr 54px;align-items:center;gap:6px;margin:4px 0;font-size:12.5px}
+ .track{position:relative;height:12px;background:#eef1f4;border-radius:2px} .track i{position:absolute;top:0;bottom:0} .track:after{content:'';position:absolute;left:50%;top:-2px;bottom:-2px;border-left:1px solid #9aa4ad}
+ .muted{color:#6b7580;font-size:12px} .big{font-size:20px;font-weight:700} .kv{display:grid;grid-template-columns:1fr auto;gap:2px 10px;font-size:12.5px;margin-top:6px}
+ @media (max-width:900px){#map{right:0;bottom:44%} #panel{top:auto;height:calc(44% - 44px);width:100%;bottom:44px}}
  .sw{display:inline-block;width:12px;height:12px;margin-right:6px;vertical-align:-1px}
 </style>
 </head>
@@ -18,6 +25,17 @@
 <header><b>Storm formation outlook</b> <span id="issued"></span>
 <small>Experimental research product, not an official warning. Follow your national meteorological service. Where new tropical cyclones may form in the next 5 days.</small></header>
 <div id="map"></div>
+<div id="panel"><div id="tabs"><button data-t="why" class="on">Why here?</button><button data-t="score">Scorecard</button><button data-t="replay">Replay</button><button data-t="about">About</button></div>
+<div class="pane on" id="p-why"><div class="muted">Click anywhere on the map to see which ingredients raise or lower the chance of a storm forming there, for the day shown.</div><div id="why"></div></div>
+<div class="pane" id="p-score"><div id="tally" class="kv-block">Scorecard: loading</div><hr><div id="score">Live scorecard: not enough verified days yet</div></div>
+<div class="pane" id="p-replay"><div class="muted">All days in this folder, one frame per day (made by make_gif.py after each run).</div><img src="outlook_animation.gif" style="width:100%;margin-top:6px" alt="animation of all outlook days" onerror="this.replaceWith('No animation yet: it appears after the next run.')"></div>
+<div class="pane" id="p-about">
+<p><b>Two layers.</b> Tropical-storm formation (10–35° latitude, next 0–5 days) and explosive mid-latitude lows (25–70°, next 3 days). The alerts come from boosted-tree models that were blind-tested before release.</p>
+<p><b>"Why here?"</b> uses simpler physical formulas, fitted on 2010–16 and tested on unseen years. Each bar is that ingredient's push on the odds compared with a typical point, shown as a multiplier.</p>
+<p><b>Shared structure of the vortices:</b> a seed of spin, an energy source that has to switch on, and a feedback loop that locks the vortex in once it is strong.</p>
+<p><b>What differs:</b> vertical wind shear brakes tropical storms, but fuels mid-latitude lows through the temperature contrast. Strong net spin switches the tropical shear brake off ("lock-in").</p>
+<p class="muted">Experimental research tool, free for non-commercial use (PolyForm Noncommercial 1.0.0). Not an official warning.</p></div></div>
+
 <div id="bar"><button id="prev" title="previous day">&#9664;</button><button id="play" title="play">&#9654;</button><button id="next" title="next day">&#9654;&#9654;</button>
 <span id="day"></span><input id="slider" type="range" min="0" max="0" value="0">
 <label><input id="trails" type="checkbox" checked> paths</label> <label><input id="bombs" type="checkbox" checked> explosive lows</label> <a id="giflink" href="outlook_animation.gif" target="_blank" style="font-weight:600">&#127902; animation (GIF, all days)</a></div>
@@ -48,6 +66,7 @@ function statusAsOf(day,idx,view){ // what was known by the viewed day: hit once
   const b=r.became.filter(x=>x.day<=view); if(b.length) return {s:'hit',b};
   if(dnum(view)-dnum(day)>=5) return {s:'false_alarm'}; return {s:'pending'}}
 function draw(i){
+  if(typeof why==='function'&&clickLL) setTimeout(why,50);
   layer.clearLayers(); const g=G[days[i]]; if(!g) return;
   document.getElementById('day').textContent=g.issued; document.getElementById('slider').value=i;
   document.getElementById('issued').textContent='— issued '+g.issued+' (storm positions: '+g.storm_source+')';
@@ -127,12 +146,6 @@ async function load(){
     let i=(+s.value>=days.length-1)?0:+s.value; draw(i); timer=setInterval(()=>{i=(i+1)%days.length; draw(i)},900)};   // loops until paused
 }
 load();
-const tc=L.control({position:'topright'});
-tc.onAdd=()=>{const d=L.DomUtil.create('div','legend');d.id='tally';d.innerHTML='Scorecard: loading';return d};
-tc.addTo(map);
-const sc=L.control({position:'topright'});
-sc.onAdd=()=>{const d=L.DomUtil.create('div','legend');d.id='score';d.innerHTML='Live scorecard: not enough verified days yet';return d};
-sc.addTo(map);
 fetch('verification.json',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(v=>{
   if(!v||!v.storms_scored) return;
   const pc=x=>x==null?'–':Math.round(x*100)+'%', ref=v.reference_2017_2019;
@@ -154,6 +167,36 @@ lg.onAdd=()=>{const d=L.DomUtil.create('div','legend');d.innerHTML=
  '<span class="sw" style="background:#c62828"></span>&#10007; storm formed without an alert<br>'+
  '<span class="sw" style="background:#6a1b9a"></span>explosive-low chance (mid-latitudes, next 3 days)';return d};
 lg.addTo(map);
+
+// ---------- dashboard panel
+document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#tabs button,.pane').forEach(x=>x.classList.remove('on'));b.classList.add('on');document.getElementById('p-'+b.dataset.t).classList.add('on')});
+const TM={}; let clickLL=null, clickMark=null;
+async function terms(d){ if(TM[d]!==undefined) return TM[d]; try{const r=await fetch(`terms_${d}.json`,{cache:'no-store'}); TM[d]=r.ok?await r.json():null}catch(e){TM[d]=null} return TM[d]}
+const NAMES={spin:'spin',latitude:'latitude',humidity:'mid-level humidity',shear:'wind shear',instability:'instability nearby',ocean_heat:'ocean heat',
+  temperature_contrast:'temperature contrast',moisture:'moisture',jet:'jet stream',upstream_trough:'upper trough upstream',surface_low:'surface low'};
+function bars(c){ return Object.entries(c).map(([k,v])=>{ if(v==null) return ''; const w=Math.min(50,Math.abs(v)*12), up=v>=0;
+  return `<div class="term"><span>${NAMES[k]||k}</span><span class="track"><i style="${up?'left:50%':'right:50%'};width:${w}%;background:${up?'#1f4e79':'#e08214'}"></i></span><span style="text-align:right">×${Math.exp(v).toFixed(v>2.3||v<-2.3?0:1)}</span></div>`}).join('')}
+async function why(){
+  const el=document.getElementById('why'); if(!clickLL) return; const d=days[+document.getElementById('slider').value]; if(!d) return;
+  const T=await terms(d), lat=clickLL.lat, lon=((clickLL.lng%360)+360)%360; let html='';
+  const near=(la,lo)=>{let bi=-1,bd=1e9; for(let i=0;i<la.length;i++){const dl=((lo[i]-lon+540)%360)-180, dd=Math.hypot(la[i]-lat,dl*Math.cos(lat*Math.PI/180)); if(dd<bd){bd=dd;bi=i}} return [bi,bd]};
+  if(T&&T.lat.length){ const [i,dd]=near(T.lat,T.lon);
+    if(dd<=2.6){ const c={}; for(const k in T.contrib) c[k]=T.contrib[k][i]; const r=k=>T.raw[k][i];
+      html+=`<h3 style="margin:8px 0 2px">Tropical-storm formation</h3><div class="muted">grid point ${T.lat[i]}°, ${T.lon[i]>180?(T.lon[i]-360):T.lon[i]}° — issued ${T.issued}</div>
+      <div class="kv"><span>chance in 0–3 days (forecast model)</span><span class="big">${(100*T.tree_chance[i]).toFixed(1)}%</span><span>simple physical formula (less sharp)</span><span>${(100*T.formula_chance[i]).toFixed(1)}%</span></div>
+      <h4 style="margin:10px 0 4px">What pushes it up or down <span class="muted">(vs a typical tropical ocean point)</span></h4>${bars(c)}
+      <div class="kv"><span>net spin</span><span>${r('spin_1e5')} ×10⁻⁵ s⁻¹</span><span>wind shear</span><span>${r('shear_ms')} m/s</span><span>humidity (700 hPa)</span><span>${r('humidity_gkg')} g/kg</span>
+      <span>area with strong instability</span><span>${Math.round(100*r('instability_share'))}%</span><span>sea temperature</span><span>${r('sst_c')==null?'n/a':r('sst_c')+' °C'}</span></div>
+      <p style="font-size:12.5px">${T.lock_in[i]>=0.5?`<b>Locked in:</b> spin is strong enough that shear is ${Math.round(100*T.lock_in[i])}% switched off.`:`Shear brake fully active (lock-in ${Math.round(100*T.lock_in[i])}%). It switches off above about 1.2 ×10⁻⁵ s⁻¹ net spin.`}</p>`; } }
+  const Bd=BB[d]; if(Bd&&Bd.terms&&Bd.alerts.length){ const la=Bd.alerts.map(a=>a[0]), lo=Bd.alerts.map(a=>a[1]); const [i,dd]=near(la,lo);
+    if(dd<=2.6){ const c={}; for(const k in Bd.terms.contrib) c[k]=Bd.terms.contrib[k][i];
+      html+=`<h3 style="margin:12px 0 2px;color:#6a1b9a">Explosive low (next 3 days)</h3><div class="kv"><span>chance (forecast model)</span><span class="big">${Math.round(100*Bd.alerts[i][2])}%</span></div>
+      <h4 style="margin:10px 0 4px">What pushes it up or down</h4>${bars(c)}`; } }
+  el.innerHTML=html||'<p class="muted">No tropical grid point or explosive-low alert within about 2.5° of here on this day. The tropical layer covers ocean at 10–35° latitude.</p>';
+}
+map.on('click',e=>{clickLL=e.latlng; if(clickMark) map.removeLayer(clickMark); clickMark=L.circleMarker(e.latlng,{radius:5,color:'#111',weight:2,fill:false}).addTo(map);
+  document.querySelector('#tabs button[data-t=why]').click(); why()});
+document.getElementById('slider').addEventListener('input',()=>{if(clickLL) setTimeout(why,50)});
 </script>
 </body>
 </html>
