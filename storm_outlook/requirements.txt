@@ -4,3 +4,4 @@ requests>=2.28
 eccodes>=1.6
 matplotlib>=3.6
 pillow>=9.1
+tcpyPI>=1.3
