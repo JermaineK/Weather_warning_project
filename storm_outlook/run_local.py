@@ -1,8 +1,10 @@
-"""Run the outlook on your own computer, resuming after any shutdown from where it left off.
+"""BETA channel. Run the outlook on your own computer, resuming after any shutdown from where it left off.
 
-    python run_local.py --out C:/storm_outlook_data            # catch up to the latest forecast, verify, exit
-    python run_local.py --out C:/storm_outlook_data --loop     # stay running; wake daily after the 00 UTC forecast
-    python run_local.py --out C:/storm_outlook_data --start 2026-10-01   # first run: begin from a chosen date
+Use a SEPARATE output folder from the main app (for example C:/storm_outlook_beta_data): the beta writes extra files.
+
+    python run_local.py --out C:/storm_outlook_beta_data            # catch up to the latest forecast, verify, exit
+    python run_local.py --out C:/storm_outlook_beta_data --loop     # stay running; wake daily after the 00 UTC forecast
+    python run_local.py --out C:/storm_outlook_beta_data --start 2026-10-01   # first run: begin from a chosen date
 
 How resuming works: state.json is written last for each day, and its date is the only record of progress.
 On start the runner processes every day after that date, in order, up to the newest complete forecast.
@@ -43,7 +45,7 @@ def log(out, msg):
 def catch_up(out, start=None, retries=3):
     os.makedirs(out, exist_ok=True)
     import shutil                                    # always refresh the map page, so app updates reach it
-    shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site", "index.html"), os.path.join(out, "index.html"))
+    shutil.copytree(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site"), out, dirs_exist_ok=True)   # page + bundled map library
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     done = last_done(out)
     day = done + timedelta(days=1) if done else (start or today - timedelta(days=4))
@@ -60,6 +62,11 @@ def catch_up(out, start=None, retries=3):
             try:
                 outlook.run(day, out)
                 n += 1
+                try:                                  # BETA: storms' room to grow (display only, never blocks the outlook)
+                    import ceiling
+                    ceiling.write(day, out)
+                except Exception as e:
+                    log(out, f"{day:%Y-%m-%d}: room-to-grow readout skipped ({type(e).__name__}: {str(e)[:80]})")
                 break
             except Exception as e:
                 log(out, f"{day:%Y-%m-%d}: attempt {k + 1} failed: {type(e).__name__}: {str(e)[:120]}")
@@ -78,7 +85,7 @@ def catch_up(out, start=None, retries=3):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="outlook_local")
+    ap.add_argument("--out", default="outlook_beta_local")
     ap.add_argument("--start", help="first issue date on a fresh output folder (default: 4 days ago)")
     ap.add_argument("--loop", action="store_true", help="keep running and update daily")
     ap.add_argument("--members", type=int, default=10, help="ensemble members for the agreement layer (0 = off)")
