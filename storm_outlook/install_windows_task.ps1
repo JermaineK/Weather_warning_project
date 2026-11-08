@@ -20,4 +20,4 @@ $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopIfGoingOnB
 Register-ScheduledTask -TaskName "StormOutlookBeta" -Action $action -Trigger $daily,$logon -Settings $settings `
   -Description "Daily storm formation outlook (resumes after shutdown)" -Force | Out-Null
 Write-Host "Registered task 'StormOutlookBeta': daily at $($local.ToString('HH:mm')) local time and at log-on. Output: $Out"
-Write-Host "View the map:  python -m http.server 8766 -d `"$Out`"   then open http://127.0.0.1:8766"
+Write-Host "View the map:  python -m http.server 8766 --bind 127.0.0.1 -d `"$Out`"   then open http://127.0.0.1:8766"

@@ -1,0 +1,4 @@
+# local secrets: never commit
+carto_key.txt
+local_settings.json
+__pycache__/

@@ -1,4 +1,32 @@
-# Storm formation outlook
+# Storm formation outlook — BETA channel
+
+> **This is the beta branch (`storm-outlook-beta`, version 0.1.0-beta, 2026-11-08).** The alerts, models and verification are byte-identical to the main app (model 1.0.0, frozen 2026-10-20). The beta changes the map interface and adds one experimental, display-only readout. Run it **alongside** the main app, in its own folder:
+>
+> ```
+> python -m pip install -r requirements.txt          # adds tcpyPI
+> python run_local.py --out C:\storm_outlook_beta_data --start 2026-11-01
+> python -m http.server 8766 --bind 127.0.0.1 -d C:\storm_outlook_beta_data      # then open http://127.0.0.1:8766
+> powershell -ExecutionPolicy Bypass -File install_windows_task.ps1 -Out "C:\storm_outlook_beta_data"   # task "StormOutlookBeta", 07:15 UTC
+> ```
+> Keep the main app's task and folder as they are: the frozen live tests score the main app.
+
+## Map backgrounds and the CARTO key
+CARTO's Light and Dark basemaps need a free key (carto.com/basemaps/apikey); without one they show an "API KEY REQUIRED" watermark, so the beta falls back to OpenStreetMap. Two ways to add yours — **never commit it to the repository**:
+1. **Recommended:** save the key as a single line in `carto_key.txt` next to `run_local.py` (git-ignored). Each run copies it into the output folder as `local_settings.json` (also git-ignored), and the page picks it up.
+   Alternatively set the environment variable `CARTO_BASEMAPS_KEY`.
+2. **Browser only:** open **Layers → CARTO key**, paste it and press Save. It is kept in that browser's local storage.
+
+The key is visible to anyone who can open the map page (tile keys always travel with the tile requests), so serve the folder only on your own computer (`--bind 127.0.0.1`, as above) and don't publish `local_settings.json`. The free tier covers 5 million tiles a month for non-commercial use, far above this app's needs.
+
+## What's new in the beta
+- **Overview tab:** the day at a glance (counts by level, regions new today), clickable lists of alert regions (sorted by level and chance), active storms, and storms that formed in the last 7 days. Clicking zooms to it and opens its details.
+- **Room to grow (experimental):** a ring around each active storm and a gauge in its popup showing wind ÷ potential intensity (the most the local sea and air can sustain). In a pre-registered test on unseen years (PI_RATIO, 2015–24) storms far below their ceiling mostly strengthened the next day, and storms near or above it mostly weakened. The app computes it from GEFS (`ceiling.py`), which agreed with the tested ERA5 version (rank correlation 0.97, same band for 25 of 30 storms; CEILING_PORT_CHECK). Least reliable poleward of about 35°. It never changes alerts.
+- **Interface:** layer menu (each overlay can be switched off), light / dark theme, Light / Dark / OpenStreetMap basemaps, wind in kt, km/h or m/s, a data-freshness indicator (warns when the daily task has stopped), timeline ticks coloured by each day's highest alert level, a **Share** button that copies a link to the current day and view, collapsible legend and side panel, and a phone layout.
+- **Keyboard:** ← → day, Space play/pause, End latest day, L legend, P panel, ? help.
+- **Works without the Leaflet CDN:** the map library is bundled in `site/vendor/leaflet` (BSD-2 licence included).
+- Fixed: verification badges now size to their text.
+
+---
 
 A free, lightweight daily outlook of **where new tropical cyclones may form in the next 5 days**, over tropical and subtropical oceans worldwide (10–35° latitude). It runs once a day from public NOAA forecast data, needs no server, and can be hosted for free on GitHub.
 

@@ -46,6 +46,16 @@ def catch_up(out, start=None, retries=3):
     os.makedirs(out, exist_ok=True)
     import shutil                                    # always refresh the map page, so app updates reach it
     shutil.copytree(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site"), out, dirs_exist_ok=True)   # page + bundled map library
+    try:                                             # optional CARTO basemap key: carto_key.txt next to this script, or env CARTO_BASEMAPS_KEY
+        kp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "carto_key.txt")   # both are git-ignored; never commit a key
+        key = os.environ.get("CARTO_BASEMAPS_KEY") or (open(kp, encoding="utf-8-sig").read().strip() if os.path.exists(kp) else "")
+        if key:
+            tmp = os.path.join(out, "local_settings.json.tmp")
+            with open(tmp, "w") as f:
+                json.dump({"carto_key": key}, f)
+            os.replace(tmp, os.path.join(out, "local_settings.json"))
+    except Exception as e:
+        log(out, f"basemap key not applied ({type(e).__name__})")
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     done = last_done(out)
     day = done + timedelta(days=1) if done else (start or today - timedelta(days=4))

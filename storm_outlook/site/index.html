@@ -114,11 +114,23 @@ const ddmm=d=>`${d.slice(6,8)}/${d.slice(4,6)}`;
 const view0=(hashP.get('ll')||'').split(',').map(Number);
 const map=L.map('map',{worldCopyJump:true,zoomControl:true}).setView(view0.length===3&&view0.every(isFinite)?[view0[0],view0[1]]:[12,150],view0.length===3&&isFinite(view0[2])?view0[2]:3);
 const ATTR='&copy; OpenStreetMap contributors', CARTO=' &copy; CARTO';
-const BASE={'Light':L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{maxZoom:8,attribution:ATTR+CARTO}),
- 'Dark':L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:8,attribution:ATTR+CARTO}),
- 'OpenStreetMap':L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:8,attribution:ATTR})};
-let baseName=LS.get('base',null)||(THEME==='dark'?'Dark':'Light'); BASE[baseName].addTo(map);
-function setBase(n){map.removeLayer(BASE[baseName]);baseName=n;BASE[n].addTo(map);LS.set('base',n);document.querySelectorAll('input[name=base]').forEach(r=>r.checked=r.value===n)}
+let CKEY=LS.get('carto_key','');   // CARTO key: from local_settings.json (written by run_local.py) or pasted in the Layers menu; never stored in the repo
+let BASE={}, baseName=null;
+function buildBase(){
+  if(baseName&&BASE[baseName]) map.removeLayer(BASE[baseName]);
+  const ck=encodeURIComponent(CKEY);
+  BASE={'OpenStreetMap':L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:8,attribution:ATTR})};
+  if(CKEY){BASE['Light']=L.tileLayer(`https://basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}{r}.png?key=${ck}`,{maxZoom:8,attribution:ATTR+CARTO});
+           BASE['Dark']=L.tileLayer(`https://basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}{r}.png?key=${ck}`,{maxZoom:8,attribution:ATTR+CARTO})}
+  const want=LS.get('base',null); baseName=(want&&BASE[want])?want:(CKEY?(THEME==='dark'?'Dark':'Light'):'OpenStreetMap');
+  BASE[baseName].addTo(map); renderBaseOpts()}
+function setBase(n){if(!BASE[n]) return; map.removeLayer(BASE[baseName]); baseName=n; BASE[n].addTo(map); LS.set('base',n); renderBaseOpts()}
+function renderBaseOpts(){const el=document.getElementById('baseopts'); if(!el) return;
+  el.innerHTML=['Light','Dark','OpenStreetMap'].map(n=>BASE[n]?`<label><input type="radio" name="base" value="${n}" ${n===baseName?'checked':''}> ${n}${n==='OpenStreetMap'?'':' (CARTO)'}</label>`:`<label style="opacity:.55" title="add a CARTO key below"><input type="radio" disabled> ${n} (CARTO, needs key)</label>`).join('')+
+   `<details style="margin-top:4px"${CKEY?'':' open'}><summary style="cursor:pointer">CARTO key${CKEY?' ✓':''}</summary><input id="ckey" type="password" autocomplete="off" placeholder="paste key" style="width:140px"> <button class="ctlbtn" id="ckeysave">Save</button>${CKEY?' <button class="ctlbtn" id="ckeyclear">Clear</button>':''}<div class="muted" style="max-width:240px;white-space:normal">Kept only in this browser (or in local_settings.json in this folder). Free key: carto.com/basemaps/apikey</div></details>`;
+  el.querySelectorAll('input[name=base]').forEach(x=>x.onchange=()=>setBase(x.value));
+  el.querySelector('#ckeysave').onclick=()=>{const v=el.querySelector('#ckey').value.trim(); if(v){CKEY=v; LS.set('carto_key',v); LS.set('base',null); buildBase()}};
+  const c=el.querySelector('#ckeyclear'); if(c) c.onclick=()=>{CKEY=''; LS.set('carto_key',''); buildBase()}}
 const col={yellow:'#f2c400',orange:'#ef7d00',red:'#d62728'}, RANK={red:3,orange:2,yellow:1};
 const rate={yellow:'about 4 in 10',orange:'about 5 in 10',red:'about 8 in 10'};
 const BANDCOL={'lots of room':'#2e7d32','some room':'#7cb342','near its ceiling':'#ef8f00','above its ceiling':'#c62828'};
@@ -241,10 +253,10 @@ map.on('moveend',saveHash);
 // ---------- controls
 const lyr=L.control({position:'topright'}); lyr.onAdd=()=>{const d=L.DomUtil.create('div'); L.DomEvent.disableClickPropagation(d);
   const items=[['chance','Chance of formation (0–3 d)'],['alerts','Alert regions'],['paths','Paths and motion'],['storms','Active storms'],['room','Room to grow (beta)'],['bombs','Explosive lows'],['verif','Hit / miss markings']];
-  d.innerHTML=`<button class="ctlbtn" id="lyrbtn">Layers</button><div class="lyr" id="lyrbox" style="display:none;margin-top:4px"><b>Overlays</b>${items.map(([k,t])=>`<label><input type="checkbox" data-k="${k}" ${OV[k]?'checked':''}> ${t}</label>`).join('')}<b>Basemap</b>${Object.keys(BASE).map(n=>`<label><input type="radio" name="base" value="${n}" ${n===baseName?'checked':''}> ${n}</label>`).join('')}</div>`;
+  d.innerHTML=`<button class="ctlbtn" id="lyrbtn">Layers</button><div class="lyr" id="lyrbox" style="display:none;margin-top:4px"><b>Overlays</b>${items.map(([k,t])=>`<label><input type="checkbox" data-k="${k}" ${OV[k]?'checked':''}> ${t}</label>`).join('')}<b>Basemap</b><div id="baseopts"></div></div>`;
   d.querySelector('#lyrbtn').onclick=()=>{const b=d.querySelector('#lyrbox'); b.style.display=b.style.display==='none'?'block':'none'};
   d.querySelectorAll('input[data-k]').forEach(x=>x.onchange=()=>{OV[x.dataset.k]=x.checked; LS.set('ov',OV); draw(cur)});
-  d.querySelectorAll('input[name=base]').forEach(x=>x.onchange=()=>setBase(x.value)); return d}; lyr.addTo(map);
+  L.DomEvent.disableScrollPropagation(d); return d}; lyr.addTo(map); buildBase();
 const lg=L.control({position:'bottomleft'});
 lg.onAdd=()=>{const d=L.DomUtil.create('div'); L.DomEvent.disableClickPropagation(d); const open=LS.get('legend',innerWidth>900);
  d.innerHTML=`<button class="ctlbtn" id="lgbtn">Legend</button><div class="legend" id="lgbox" style="margin-top:4px;display:${open?'block':'none'}">`+
@@ -277,6 +289,7 @@ document.addEventListener('keydown',e=>{ if(/INPUT|SELECT|TEXTAREA/.test(e.targe
 // ---------- loading
 async function getJSON(u){try{const r=await fetch(u,{cache:'no-store'}); return r.ok?await r.json():null}catch(e){return null}}
 async function load(){
+  const lset=await getJSON('local_settings.json'); if(lset&&lset.carto_key&&lset.carto_key!==CKEY){CKEY=lset.carto_key; buildBase()}
   const dl=await getJSON('days.json');
   days=(dl&&dl.length?dl:[null]).slice(-MAXDAYS);
   [MV,BV]=await Promise.all([getJSON('map_verification.json'),getJSON('bomb_verification.json')]);
