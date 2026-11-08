@@ -371,7 +371,7 @@ async function whyLeads(lat,lon,d){
   if(Ev){const i=nearest(Ev.lat,Ev.lon); s+='<div class="card"><h3>Ensemble members locked in</h3><div class="kv">'+Ev.leads.map((h,k)=>`<span>+${h} h</span><span>${i>=0?Math.round(100*Ev.share[k][i]):0}% of ${Ev.members}</span>`).join('')+'</div></div>'}
   return s;
 }
-document.getElementById('ver').textContent='Version 0.1.0-beta (2026-11-08); alerts from model 1.0.0 (frozen 2026-10-20).';
+document.getElementById('ver').textContent='Version 0.1.1-beta (2026-11-08); alerts from model 1.0.0 (frozen 2026-10-20).';
 </script>
 </body>
 </html>
