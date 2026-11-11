@@ -77,6 +77,12 @@ def catch_up(out, start=None, retries=3):
                     ceiling.write(day, out)
                 except Exception as e:
                     log(out, f"{day:%Y-%m-%d}: room-to-grow readout skipped ({type(e).__name__}: {str(e)[:80]})")
+                try:                                  # BETA: catch-all watch layer (display only)
+                    import catchall, numpy as _np
+                    _z = _np.load(os.path.join(out, "archive", f"features_{day:%Y%m%d}.npz"))
+                    catchall.write(day, out, _z["X"], [dict(lat=float(a), lon=float(b), kt=float(c)) for a, b, c in _z["storms"]])
+                except Exception as e:
+                    log(out, f"{day:%Y-%m-%d}: catch-all layer skipped ({type(e).__name__}: {str(e)[:80]})")
                 break
             except Exception as e:
                 log(out, f"{day:%Y-%m-%d}: attempt {k + 1} failed: {type(e).__name__}: {str(e)[:120]}")

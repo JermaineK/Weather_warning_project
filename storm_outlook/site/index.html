@@ -103,7 +103,7 @@ body{overflow:hidden}
 window.onerror=(m,s,l)=>{const e=document.getElementById('jserr');e.textContent+=`[${l}] ${m}\n`};
 // ---------- preferences and state
 const LS={get:(k,d)=>{try{const v=localStorage.getItem('so_'+k);return v==null?d:JSON.parse(v)}catch(e){return d}},set:(k,v)=>{try{localStorage.setItem('so_'+k,JSON.stringify(v))}catch(e){}}};
-const OV=Object.assign({chance:true,alerts:true,paths:true,storms:true,room:true,bombs:true,verif:true},LS.get('ov',{}));
+const OV=Object.assign({chance:true,alerts:true,paths:true,storms:true,room:true,bombs:true,verif:true,catchall:true},LS.get('ov',{}));
 const hashP=new URLSearchParams(location.hash.slice(1));
 let UNITS=LS.get('units','kt'), THEME=hashP.get('theme')||LS.get('theme',matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
 document.documentElement.dataset.theme=THEME; document.getElementById('units').value=UNITS;
@@ -134,7 +134,7 @@ function renderBaseOpts(){const el=document.getElementById('baseopts'); if(!el) 
 const col={yellow:'#f2c400',orange:'#ef7d00',red:'#d62728'}, RANK={red:3,orange:2,yellow:1};
 const rate={yellow:'about 4 in 10',orange:'about 5 in 10',red:'about 8 in 10'};
 const BANDCOL={'lots of room':'#2e7d32','some room':'#7cb342','near its ceiling':'#ef8f00','above its ceiling':'#c62828'};
-const MAXDAYS=30; let days=[], G={}, BB={}, CE={}, BV=null, MV=null, VER=null, layer=L.layerGroup().addTo(map), timer=null, cur=0;
+const MAXDAYS=30; let days=[], G={}, BB={}, CE={}, CW={}, BV=null, MV=null, VER=null, layer=L.layerGroup().addTo(map), timer=null, cur=0;
 let regionLayers=[], stormLayers={};
 const GREEN='#2e7d32', GREY='#8a8a8a';
 const dnum=d=>Date.UTC(+d.slice(0,4),+d.slice(4,6)-1,+d.slice(6,8))/864e5;
@@ -166,6 +166,10 @@ function draw(i){
   const view=days[i];
   if(OV.chance) L.geoJSON(g,{filter:f=>f.properties.kind==='chance_0_3d',
     pointToLayer:(f,ll)=>L.circleMarker(ll,{radius:3,stroke:false,fillColor:'#3b6ea8',fillOpacity:Math.min(0.9,f.properties.value*3)})}).addTo(layer);
+  if(OV.catchall&&CW[view]){ const w=CW[view], op=[0,0.10,0.20,0.32], lab=['','catch-all (100% level)','99% level','95% level'];
+    w.lat.forEach((la,q)=>{ const lo=w.lon[q]>180?w.lon[q]-360:w.lon[q], t=w.tier[q];
+      L.rectangle([[la-1.25,lo-1.25],[la+1.25,lo+1.25]],{stroke:false,fillColor:'#7b3fa0',fillOpacity:op[t],interactive:true})
+       .bindPopup(`<b>Catch-all watch</b> <span class="pill" style="background:#e8a33d;color:#1b1300">beta</span><br>${lab[t]} · ${fmtLL(la,lo)}<br><small>A high-sensitivity layer set on 2017–19 to flag every storm. On unseen years 2021–23 it flagged 264 of 266 storms ≥ 24 h ahead, and its points saw a storm or ≥ 100 mm/day rain 1.4× as often as chance (95% level: 2.4×). It has about 15× the false alarms of the alert regions, so treat it as a watch, not a warning.</small>`).addTo(layer)})}
   if(OV.alerts){ let k=0; L.geoJSON(g,{filter:f=>f.properties.kind==='alert',style:f=>({color:col[f.properties.level],weight:1.2,fillOpacity:0.35}),
     onEachFeature:(f,l)=>{const p=f.properties, c=centroid(f);regionLayers[k++]=l;
       l.bindPopup(`<b style="color:${col[p.level]}">${p.level[0].toUpperCase()+p.level.slice(1)} region</b> · ${fmtLL(c[1],c[0])}<br>${p.size} grid points, tracked ${p.age_days} day${p.age_days===1?'':'s'}<br>peak chance 0–3 days: <b>${Math.round(p.peak_chance_0_3d*100)}%</b><br>peak chance 3–5 days: ${Math.round(p.peak_chance_3_5d*100)}%<br><small>regions like this became storms ${rate[p.level]} times (2017–19 test)</small>`)}}).addTo(layer);}
@@ -252,7 +256,7 @@ let hashT=null; function saveHash(){clearTimeout(hashT); hashT=setTimeout(()=>{c
 map.on('moveend',saveHash);
 // ---------- controls
 const lyr=L.control({position:'topright'}); lyr.onAdd=()=>{const d=L.DomUtil.create('div'); L.DomEvent.disableClickPropagation(d);
-  const items=[['chance','Chance of formation (0–3 d)'],['alerts','Alert regions'],['paths','Paths and motion'],['storms','Active storms'],['room','Room to grow (beta)'],['bombs','Explosive lows'],['verif','Hit / miss markings']];
+  const items=[['chance','Chance of formation (0–3 d)'],['alerts','Alert regions'],['paths','Paths and motion'],['storms','Active storms'],['room','Room to grow (beta)'],['catchall','Catch-all watch (beta)'],['bombs','Explosive lows'],['verif','Hit / miss markings']];
   d.innerHTML=`<button class="ctlbtn" id="lyrbtn">Layers</button><div class="lyr" id="lyrbox" style="display:none;margin-top:4px"><b>Overlays</b>${items.map(([k,t])=>`<label><input type="checkbox" data-k="${k}" ${OV[k]?'checked':''}> ${t}</label>`).join('')}<b>Basemap</b><div id="baseopts"></div></div>`;
   d.querySelector('#lyrbtn').onclick=()=>{const b=d.querySelector('#lyrbox'); b.style.display=b.style.display==='none'?'block':'none'};
   d.querySelectorAll('input[data-k]').forEach(x=>x.onchange=()=>{OV[x.dataset.k]=x.checked; LS.set('ov',OV); draw(cur)});
@@ -263,6 +267,7 @@ lg.onAdd=()=>{const d=L.DomUtil.create('div'); L.DomEvent.disableClickPropagatio
  '<span class="sw" style="background:#f2c400"></span>yellow: persistent alert region<br><span class="sw" style="background:#ef7d00"></span>orange: large, ≥ 5 days<br><span class="sw" style="background:#d62728"></span>red: very large, ≥ 8 days, strong<br>'+
  '<span class="sw" style="background:#3b6ea8;border-radius:6px"></span>chance of formation, 0–3 days<br><span class="sw" style="background:#fff;border:2px solid #000;border-radius:6px"></span>active storm (line: track; dotted: next 24 h)<br>'+
  '<span class="sw" style="border:3px solid #2e7d32;border-radius:7px"></span>ring: room to grow (beta) — <span style="color:#2e7d32">lots</span>, <span style="color:#7cb342">some</span>, <span style="color:#ef8f00">near ceiling</span>, <span style="color:#c62828">above</span><br>'+
+ '<span class="sw" style="background:#7b3fa0;opacity:.45"></span>catch-all watch (beta): high sensitivity, many false alarms; darker = stricter level<br>'+
  '<span class="sw" style="border-top:2px solid #5a3d00;height:0"></span>alert-region path (dashed: drift, extrapolated)<br><span class="sw" style="background:#2e7d32"></span>&#10003; alert came true &nbsp;<span class="sw" style="background:#c62828"></span>&#10007; missed<br>'+
  '<span class="sw" style="background:#8a8a8a"></span>alert expired with no storm<br><span class="sw" style="background:#6a1b9a"></span>explosive-low chance (next 3 days)</div>';
  d.querySelector('#lgbtn').onclick=toggleLegend; return d}; lg.addTo(map);
@@ -294,8 +299,8 @@ async function load(){
   days=(dl&&dl.length?dl:[null]).slice(-MAXDAYS);
   [MV,BV]=await Promise.all([getJSON('map_verification.json'),getJSON('bomb_verification.json')]);
   await Promise.all(days.map(async d=>{
-    const [g,b,c]=await Promise.all([getJSON(d?`outlook_${d}.geojson`:'outlook.geojson'),d?getJSON(`bomb_${d}.json`):null,d?getJSON(`ceiling_${d}.json`):null]);
-    if(g) G[d]=g; if(b) BB[d]=b; if(c) CE[d]=c}));
+    const [g,b,c,w]=await Promise.all([getJSON(d?`outlook_${d}.geojson`:'outlook.geojson'),d?getJSON(`bomb_${d}.json`):null,d?getJSON(`ceiling_${d}.json`):null,d?getJSON(`catchall_${d}.json`):null]);
+    if(g) G[d]=g; if(b) BB[d]=b; if(c) CE[d]=c; if(w) CW[d]=w}));
   const ov=document.getElementById('overlay');
   if(!Object.keys(G).length){ov.innerHTML='<div class="card" style="max-width:420px">No outlook data in this folder yet.<br><span class="muted">Run <code>python run_local.py --out &lt;this folder&gt;</code>, then reload.</span></div>';return}
   ov.style.display='none';
@@ -371,7 +376,7 @@ async function whyLeads(lat,lon,d){
   if(Ev){const i=nearest(Ev.lat,Ev.lon); s+='<div class="card"><h3>Ensemble members locked in</h3><div class="kv">'+Ev.leads.map((h,k)=>`<span>+${h} h</span><span>${i>=0?Math.round(100*Ev.share[k][i]):0}% of ${Ev.members}</span>`).join('')+'</div></div>'}
   return s;
 }
-document.getElementById('ver').textContent='Version 0.1.1-beta (2026-11-08); alerts from model 1.0.0 (frozen 2026-10-20).';
+document.getElementById('ver').textContent='Version 0.2.0-beta (2026-11-11); alerts from model 1.0.0 (frozen 2026-10-20).';
 </script>
 </body>
 </html>
