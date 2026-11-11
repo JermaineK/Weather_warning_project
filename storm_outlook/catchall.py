@@ -2,7 +2,7 @@
 
 Points where the calibrated days 0-3 chance (same trees and calibration as the alerts, gate open, >5 deg from an active
 storm) reaches a level set on 2017-19 to catch every storm (DESTRUCTIVE_CATCHALL_PREREG.md). On unseen years 2021-23 the
-100% level flagged 264 of 266 storms >= 24 h ahead and its points saw a storm or >= 100 mm/day rain 1.4x as often as chance,
+100% level flagged 269 of 271 storms >= 24 h ahead and its points saw a storm or >= 100 mm/day rain 1.4x as often as chance,
 at about 15x the app's false alarms. It never changes alerts.
     import catchall; catchall.write(day, outdir, feat, storms)
 Licence: PolyForm Noncommercial 1.0.0.
