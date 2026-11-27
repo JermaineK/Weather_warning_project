@@ -3,11 +3,11 @@
 The storm-formation formula tested in LEAD_TIME_RESULT.md and ENSEMBLE_RESULT.md, run on today's GEFS:
   - now, +1 day, +2 days: full formula (moisture, spin, shear, warm water, humidity, wave/trough factors, two shape steps,
     small-scale spin in the blind spot), GEFS control run;
-  - +3 days: steps-only formula (no small-scale spin), averaged over 5 GEFS members (control + 4 perturbed).
+  - +3 days: steps-only formula (no small-scale spin), averaged over 10 GEFS members (control + 9 perturbed).
 Each value is the chance that a storm (>= 34 kt) forms within 556 km of the point in the 72 h after the map's valid time.
 Points within 556 km of an active storm at issue time are left out, as in the tests.
 
-Tested on 966 unseen days (2021-25): AUC 0.956 now, 0.954 / 0.952 at +1 / +2 days, 0.952 at +3 days with the ensemble.
+Tested on 966 unseen days (2021-25): AUC 0.956 now, 0.954 / 0.952 at +1 / +2 days, 0.953 at +3 days with the 10-member ensemble.
 Absolute chances carry about +-20% year-to-year uncertainty (ENSEMBLE_RECAL_RESULT.md), so the page shows risk bands.
 It never changes alerts.
     import formula; formula.run(day, outdir, storms)
@@ -20,10 +20,10 @@ import pandas as pd
 from scipy.special import expit
 
 HERE = os.path.dirname(os.path.abspath(__file__)); TD = os.path.join(HERE, "formula_terms")
-FZ = json.load(open(os.path.join(HERE, "model", "formula_frozen.json")))
+FZ = json.load(open(os.path.join(HERE, "model", "formula_frozen.json"))); FZ["version"] = "formula 1.0.0 (beta 0.3.1)"
 PLAT = np.r_[-np.arange(35, 2.4, -2.5), np.arange(2.5, 35.1, 2.5)]; PLON = np.arange(0, 360, 2.5); NLON = 144
 PL = np.repeat(PLAT, NLON); PO = np.tile(PLON, len(PLAT))
-MEMBERS = ("gec00", "gep01", "gep02", "gep03", "gep04")
+MEMBERS = ("gec00",) + tuple(f"gep{k:02d}" for k in range(1, 10))   # 10 members (ENSEMBLE_SIZE_RESULT.md)
 LEADS = {0: (("gec00",), "FULL"), 24: (("gec00",), "FULL"), 48: (("gec00",), "FULL"), 72: (MEMBERS, "F12")}
 BANDS = ((0.20, 4, "very high"), (0.05, 3, "high"), (0.01, 2, "raised"))   # chance of a storm within 556 km in 72 h; below 1% = low
 
