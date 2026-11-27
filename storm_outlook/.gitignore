@@ -2,3 +2,6 @@
 carto_key.txt
 local_settings.json
 __pycache__/
+formula_cache/
+formula_terms/*_days/
+formula_terms/feed_terms/

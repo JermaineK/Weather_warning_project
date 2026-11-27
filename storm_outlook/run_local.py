@@ -83,6 +83,12 @@ def catch_up(out, start=None, retries=3):
                     catchall.write(day, out, _z["X"], [dict(lat=float(a), lon=float(b), kt=float(c)) for a, b, c in _z["storms"]])
                 except Exception as e:
                     log(out, f"{day:%Y-%m-%d}: catch-all layer skipped ({type(e).__name__}: {str(e)[:80]})")
+                try:                                  # BETA: formula outlook layer (display only; ~3-4 min of extra GEFS downloads)
+                    import formula, numpy as _np
+                    _z = _np.load(os.path.join(out, "archive", f"features_{day:%Y%m%d}.npz"))
+                    formula.run(day, out, [dict(lat=float(a), lon=float(b), kt=float(c)) for a, b, c in _z["storms"]], log=lambda m: log(out, m))
+                except Exception as e:
+                    log(out, f"{day:%Y-%m-%d}: formula layer skipped ({type(e).__name__}: {str(e)[:80]})")
                 break
             except Exception as e:
                 log(out, f"{day:%Y-%m-%d}: attempt {k + 1} failed: {type(e).__name__}: {str(e)[:120]}")
