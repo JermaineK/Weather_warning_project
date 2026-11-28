@@ -173,7 +173,7 @@ function draw(i){
   if(OV.formula&&FO[view]){ const F=FO[view], f=F.leads[FLEAD], col=['','','#80cdc1','#01857a','#003c30'], op=[0,0,0.45,0.65,0.80];
     if(f&&f.lat) f.lat.forEach((la,q)=>{ const b=f.band[q]; if(b<2) return; const lo=f.lon[q]>180?f.lon[q]-360:f.lon[q], sp=f.spin[q]===1;
       L.rectangle([[la-1.25,lo-1.25],[la+1.25,lo+1.25]],{stroke:sp,color:'#e8a33d',weight:1.5,fillColor:col[b],fillOpacity:op[b],interactive:true})
-       .bindPopup(`<b>Formula outlook</b> <span class="pill" style="background:#e8a33d;color:#1b1300">beta</span><br>${F.bands[b]} · ${fmtLL(la,lo)}<br>chance of a storm forming within 556 km in the 72 h after ${f.valid}: about ${(100*f.p[q]).toFixed(1)}% (±20% from year to year)${sp?'<br><span style="color:#e8a33d">small-scale spin at least doubled this chance</span>':''}<br><small>${f.model}. Tested on 966 unseen days (2021–25): ranking skill (AUC) 0.956 now, 0.954 at +1 day, 0.952 at +2 days, 0.953 at +3 days (10-member ensemble). Bands: low < 1%, raised 1–5%, high 5–20%, very high ≥ 20%. Display only; it never changes alerts.</small>`).addTo(layer)});
+       .bindPopup(`<b>Formula outlook</b> <span class="pill" style="background:#e8a33d;color:#1b1300">beta</span><br>${F.bands[b]} · ${fmtLL(la,lo)}<br>chance of a storm forming within 556 km in the 72 h after ${f.valid}: about ${(100*f.p[q]).toFixed(1)}% (±20% from year to year)${sp?'<br><span style="color:#e8a33d">small-scale spin at least doubled this chance</span>':''}<br><small>${f.model}. Tested on 966 unseen days (2021–25): ranking skill (AUC) 0.956 now, 0.955 at +1 day and 0.954 at +2 days (5-member ensemble), 0.953 at +3 days (10-member ensemble). Bands: low < 1%, raised 1–5%, high 5–20%, very high ≥ 20%. Display only; it never changes alerts.</small>`).addTo(layer)});
     else if(f&&f.error) console.warn('formula lead '+FLEAD+': '+f.error)}
   if(OV.alerts){ let k=0; L.geoJSON(g,{filter:f=>f.properties.kind==='alert',style:f=>({color:col[f.properties.level],weight:1.2,fillOpacity:0.35}),
     onEachFeature:(f,l)=>{const p=f.properties, c=centroid(f);regionLayers[k++]=l;
@@ -383,7 +383,7 @@ async function whyLeads(lat,lon,d){
   if(Ev){const i=nearest(Ev.lat,Ev.lon); s+='<div class="card"><h3>Ensemble members locked in</h3><div class="kv">'+Ev.leads.map((h,k)=>`<span>+${h} h</span><span>${i>=0?Math.round(100*Ev.share[k][i]):0}% of ${Ev.members}</span>`).join('')+'</div></div>'}
   return s;
 }
-document.getElementById('ver').textContent='Version 0.3.1-beta (2026-11-27); alerts from model 1.0.0 (frozen 2026-10-20); formula outlook from formula 1.0.0.';
+document.getElementById('ver').textContent='Version 0.3.2-beta (2026-11-28); alerts from model 1.0.0 (frozen 2026-10-20); formula outlook from formula 1.0.0.';
 </script>
 </body>
 </html>

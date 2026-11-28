@@ -1,13 +1,14 @@
 """BETA, display only: formula outlook layer (formula 1.0.0).
 
 The storm-formation formula tested in LEAD_TIME_RESULT.md and ENSEMBLE_RESULT.md, run on today's GEFS:
-  - now, +1 day, +2 days: full formula (moisture, spin, shear, warm water, humidity, wave/trough factors, two shape steps,
+  - now: full formula (moisture, spin, shear, warm water, humidity, wave/trough factors, two shape steps,
     small-scale spin in the blind spot), GEFS control run;
+  - +1, +2 days: full formula, averaged over 5 GEFS members (control + 4 perturbed);
   - +3 days: steps-only formula (no small-scale spin), averaged over 10 GEFS members (control + 9 perturbed).
 Each value is the chance that a storm (>= 34 kt) forms within 556 km of the point in the 72 h after the map's valid time.
 Points within 556 km of an active storm at issue time are left out, as in the tests.
 
-Tested on 966 unseen days (2021-25): AUC 0.956 now, 0.954 / 0.952 at +1 / +2 days, 0.953 at +3 days with the 10-member ensemble.
+Tested on 966 unseen days (2021-25): AUC 0.956 now, 0.955 / 0.954 at +1 / +2 days (5-member ensemble), 0.953 at +3 days with the 10-member ensemble.
 Absolute chances carry about +-20% year-to-year uncertainty (ENSEMBLE_RECAL_RESULT.md), so the page shows risk bands.
 It never changes alerts.
     import formula; formula.run(day, outdir, storms)
@@ -20,11 +21,12 @@ import pandas as pd
 from scipy.special import expit
 
 HERE = os.path.dirname(os.path.abspath(__file__)); TD = os.path.join(HERE, "formula_terms")
-FZ = json.load(open(os.path.join(HERE, "model", "formula_frozen.json"))); FZ["version"] = "formula 1.0.0 (beta 0.3.1)"
+FZ = json.load(open(os.path.join(HERE, "model", "formula_frozen.json"))); FZ["version"] = "formula 1.0.0 (beta 0.3.2)"
 PLAT = np.r_[-np.arange(35, 2.4, -2.5), np.arange(2.5, 35.1, 2.5)]; PLON = np.arange(0, 360, 2.5); NLON = 144
 PL = np.repeat(PLAT, NLON); PO = np.tile(PLON, len(PLAT))
 MEMBERS = ("gec00",) + tuple(f"gep{k:02d}" for k in range(1, 10))   # 10 members (ENSEMBLE_SIZE_RESULT.md)
-LEADS = {0: (("gec00",), "FULL"), 24: (("gec00",), "FULL"), 48: (("gec00",), "FULL"), 72: (MEMBERS, "F12")}
+MEMBERS5 = MEMBERS[:5]   # 5 members at +1/+2 d (ENSEMBLE_SHORT_LEAD_RESULT.md)
+LEADS = {0: (("gec00",), "FULL"), 24: (MEMBERS5, "FULL"), 48: (MEMBERS5, "FULL"), 72: (MEMBERS, "F12")}
 BANDS = ((0.20, 4, "very high"), (0.05, 3, "high"), (0.01, 2, "raised"))   # chance of a storm within 556 km in 72 h; below 1% = low
 
 
@@ -139,9 +141,9 @@ def run(day, outdir, storms, log=print, keep_cache_days=2):
                 s = pd.Series(r[model], index=key.values).reindex(kref.values); P.append(s.values); F12.append(pd.Series(r["F12"], index=key.values).reindex(kref.values).values)
             p = np.nanmean(np.vstack(P), 0) if len(P) > 1 else P[0]; nmem = np.isfinite(np.vstack(P)).sum(0)
             ok = np.isfinite(p) & (nmem == len(mems)); D = Dref[ok]; p = p[ok]; f12 = np.nanmean(np.vstack(F12), 0)[ok]
-            spin = (model == "FULL") & (p >= 0.01) & (p >= 2 * f12)          # small-scale spin at least doubled the chance (descriptive)
+            spin = (model == "FULL") & (p >= 0.01) & (p >= 2 * f12)          # small-scale spin at least doubled the chance (FULL vs F12, same members; descriptive)
             sel = np.where(p >= 0.001)[0]
-            out["leads"][str(L // 24)] = dict(valid=f"{valid:%Y-%m-%d}", model="full formula, GEFS control" if model == "FULL" else f"steps-only formula, mean of {len(mems)} GEFS members",
+            out["leads"][str(L // 24)] = dict(valid=f"{valid:%Y-%m-%d}", model=(("full formula" if model == "FULL" else "steps-only formula") + (", GEFS control" if len(mems) == 1 else f", mean of {len(mems)} GEFS members")),
                                               n_points=int(len(p)), lat=D.lat.values[sel].round(2).tolist(), lon=D.lon.values[sel].round(2).tolist(),
                                               p=np.round(p[sel], 4).tolist(), band=[band(x) for x in p[sel]], spin=spin[sel].astype(int).tolist())
             log(f"{day:%Y-%m-%d}: formula +{L // 24} d done ({len(sel)} points >= 0.1%)")
